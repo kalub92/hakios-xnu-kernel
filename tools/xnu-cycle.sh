@@ -17,8 +17,10 @@ CORES=${XNU_CORES:-$(expr "$XNU_ARGS" : '.*cpus=\([0-9]*\)' || echo 1)}
 WATCH=${XNU_WATCH:-$((SECS + 240))}
 # No MENU_DEFAULT_XNU: the image boots Android, and XNU is asked for once (tools/boot-xnu.sh), so
 # a kernel that hangs costs a power cycle and not a rescue through BROM.
-TEST_FLAGS=(-DXNU_WDT_SECONDS=0 -DXNU_CORES=$CORES -DXNU_WATCH_SECONDS=$WATCH
-	"-DXNU_RETURN_AFTER=\"$SECS\"" "-DXNU_EXTRA_ARGS=\"$XNU_ARGS epoch=$(date +%s)\"")
+EPOCH=$(date +%s)
+RUN_ID=$(( EPOCH & 0x7fffffff ))   # r1: tags the loader marker (expdb restores old ones)
+TEST_FLAGS=(-DRUN_ID=${RUN_ID}u -DXNU_WDT_SECONDS=0 -DXNU_CORES=$CORES -DXNU_WATCH_SECONDS=$WATCH
+	"-DXNU_RETURN_AFTER=\"$SECS\"" "-DXNU_EXTRA_ARGS=\"$XNU_ARGS epoch=$EPOCH\"")
 for tool in adb fastboot python3; do
 	command -v $tool >/dev/null || { echo "xnu-cycle.sh: $tool is not in PATH"; exit 1; }
 done
@@ -35,19 +37,24 @@ fastboot -s $S flash boot_a "$ROOT/xnu-flashed-slot_a.img" >/dev/null 2>&1
 fastboot -s $S reboot >/dev/null 2>&1
 echo "waiting for Android, to ask it for one XNU boot..."
 for i in $(seq 1 100); do [ "$(adb -s $S get-state 2>/dev/null)" = device ] && break; sleep 3; done
+adb -s $S root >/dev/null 2>&1; sleep 2; adb -s $S wait-for-device  # r1: userdebug adb root instead of su
 sleep 4
 "$ROOT/tools/boot-xnu.sh"
 echo "XNU is running; Android comes back by itself"
-WAIT_ITERS=$(( (SECS + 300) / 3 ))
+WAIT_ITERS=$(( (SECS + ${XNU_WATCH:-300} + 120) / 3 ))
 for i in $(seq 1 $WAIT_ITERS); do [ "$(adb -s $S get-state 2>/dev/null)" = device ] && break; sleep 3; done
+adb -s $S root >/dev/null 2>&1; sleep 2; adb -s $S wait-for-device  # r1: userdebug adb root instead of su
 sleep 3
-for i in $(seq 1 10); do adb -s $S shell 'su -c "cat /sys/fs/pstore/console-ramoops-0"' > "$OUT" 2>/dev/null && [ -s "$OUT" ] && break; sleep 2; done
+# r1: Android is back: clear the one-shot request in dtbo_b so the next boot is Android
+adb -s $S shell 'head -c 512 /dev/zero | dd of=/dev/block/by-name/dtbo_b bs=512 count=1 conv=fsync 2>/dev/null; sync'
+for i in $(seq 1 10); do adb -s $S shell 'sh -c "cat /sys/fs/pstore/console-ramoops-0"' > "$OUT" 2>/dev/null && [ -s "$OUT" ] && break; sleep 2; done
 # what the kernel kept for the host (kern.redwood.host_keep: the pipeline recipes, whole however long the run was),
 # which mtkloader put into the pmsg zone: appended to the log, when it is this run's and not Android's own
-adb -s $S shell 'su -c "cat /sys/fs/pstore/pmsg-ramoops-0"' > "$OUT.keep" 2>/dev/null || true
+adb -s $S shell 'sh -c "cat /sys/fs/pstore/pmsg-ramoops-0"' > "$OUT.keep" 2>/dev/null || true
 if head -c 64 "$OUT.keep" | grep -q 'kept for the host by the kernel'; then
 	{ echo; cat "$OUT.keep"; } >> "$OUT"
 	echo "kept for the host: $(head -1 "$OUT.keep" | sed 's/^=== kept for the host by the kernel: //; s/ ===$//')"
 fi
 rm -f "$OUT.keep"
+grep -q "epoch=$EPOCH" "$OUT" && echo "log is this run's (epoch $EPOCH)" || echo "WARNING: log is NOT this run's (no epoch=$EPOCH): stale ramoops copy"
 echo "log: $OUT ($(wc -c < "$OUT") bytes)"

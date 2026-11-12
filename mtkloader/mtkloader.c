@@ -29,8 +29,17 @@
 
 /* XNU's view of memory: one contiguous range that nothing else (LK, Android, TEE, ATF, the
  * framebuffer) uses; 0xc0000000-0xfe000000 is free DRAM on this board. */
+#ifndef BOARD_R1
+#define BOARD_R1            1   /* rabbit r1 (MT6765, 4 GB): this branch's board. 0 = Infinix X6826B */
+#endif
 #define XNU_PHYS_BASE       0xc0000000ULL
+#if BOARD_R1
+/* r1: 0xc0000000..0xfeff5fff is the largest DRAM range clear of what keeps running under XNU (modem,
+ * SCP/SSPM shares, ATF/TEE/GZ, the framebuffer, ramoops); 16 KB aligned. */
+#define XNU_MEM_SIZE        0x3e000000ULL   /* rounded down to 32 MB: arm_vm_init hung on 0x3eff4000 */
+#else
 #define XNU_MEM_SIZE        0xfe000000ULL       /* up to dramc-rk1 at 0x1bffff000; room for the system image */
+#endif
 /* Where the system image is put, clear of the kernel, as xnuloader does it (RESIDENT_RD_OFFSET). */
 #define SYSTEM_PA           (XNU_PHYS_BASE + 0x08000000ULL)
 #define SYSTEM_PART         "xnusys"
@@ -71,7 +80,14 @@ _Static_assert(XNU_CORES >= 1 && XNU_CORES <= 7, "one core at least, and one lef
  * leaves us on core 0), then the two Cortex-A75s, which are about twice the Cortex-A55s, then
  * the rest of the A55s. So "cpus=3" already gives iOS both fast cores.
  */
+#if BOARD_R1
+/* r1: eight Cortex-A53s in two clusters of four; MPIDR is cluster << 8 | core (no DynamIQ). */
+static const uint8_t core_order[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+#define CORE_MPIDR(c)       ((uint32_t)((((c) >> 2) << 8) | ((c) & 3)))
+#else
 static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
+#define CORE_MPIDR(c)       ((uint32_t)((c) << 8))
+#endif
 #define WATCH_CORE          core_order[XNU_CORES]
 /* Checkpoint for XNU to return at (osfmk/arm/arm_init.c LOADER_CHECKPOINT), 0 = none. */
 #ifndef XNU_CHECKPOINT
@@ -146,7 +162,11 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #define CHAIN_STUB_PA       0x4a000000ULL
 
 /* Run state, kept in DRAM across the watchdog reset (three copies: a bit may flip). */
+#if BOARD_R1
+#define MARKER_PA           0x47d5f000ULL   /* r1: ramoops ftrace zone; plain DRAM decays across the reset */
+#else
 #define MARKER_PA           0x80000000ULL
+#endif
 #define MARK_RUNNING        0x4e52584eu /* "NXRN" */
 #define MARK_DONE           0x4e44584eu /* "NXDN" */
 
@@ -388,17 +408,29 @@ static void out_dec(uint64_t v)
 
 /* ---- run state ---- */
 
+#ifndef RUN_ID
+#define RUN_ID 0u
+#endif
+/*
+ * r1: MediaTek's boot chain saves the ramoops area to expdb at a watchdog reset and puts that copy
+ * back on later boots, so a marker can come back from an older run. Each marker carries the
+ * build's RUN_ID (xnu-cycle.sh: a new one per run); one from another build counts as none.
+ */
 static void marker_set(uint32_t v)
 {
 	for (int i = 0; i < 3; i++) {
 		wr32(MARKER_PA + 64 * i, v);
+		wr32(MARKER_PA + 64 * i + 4, RUN_ID);
 	}
 }
 
 static uint32_t marker_get(void)
 {
 	uint32_t a = rd32(MARKER_PA), b = rd32(MARKER_PA + 64), c = rd32(MARKER_PA + 128);
-	return (a == b || a == c) ? a : (b == c ? b : 0);
+	uint32_t v = (a == b || a == c) ? a : (b == c ? b : 0);
+	uint32_t ra = rd32(MARKER_PA + 4), rb = rd32(MARKER_PA + 68), rc = rd32(MARKER_PA + 132);
+	uint32_t run = (ra == rb || ra == rc) ? ra : (rb == rc ? rb : 0);
+	return run == RUN_ID ? v : 0;
 }
 
 /* ---- the display ---- */
@@ -807,8 +839,13 @@ static void build_nvram_image(uint8_t *image)
 }
 
 /* Panic log region (the device tree's "pram"): DRAM outside XNU's window, kept across a reset. */
+#if BOARD_R1
+#define PANIC_LOG_BASE 0x47d70000ULL   /* r1: minirdump zone, kept like ramoops */
+#define PANIC_LOG_SIZE 0x10000u
+#else
 #define PANIC_LOG_BASE 0x80100000ULL
 #define PANIC_LOG_SIZE 0x80000u
+#endif
 
 /* As xnuloader/loader.c builds it for x6826b, minus what needs UEFI. */
 static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_size,
@@ -916,7 +953,7 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 		dt_begin(&w, name);
 		dt_prop_str(&w, "device_type", "cpu");
 		dt_prop_str(&w, "state", i == 0 ? "running" : "waiting");
-		dt_prop_u32(&w, "reg", (uint32_t)(core << 8));
+		dt_prop_u32(&w, "reg", CORE_MPIDR(core));
 		dt_prop_u32(&w, "cpu-id", (uint32_t)i);
 		dt_prop_u64(&w, "timebase-frequency", cntfrq);
 		dt_prop_u64(&w, "fixed-frequency", cntfrq);
@@ -924,7 +961,7 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 		dt_prop_u64(&w, "bus-frequency", 100000000ULL);
 		dt_prop_u64(&w, "memory-frequency", 100000000ULL);
 		dt_prop_u64(&w, "peripheral-frequency", 24000000ULL);
-		if (core < 6) { /* cores 0-5 are the Cortex-A55s, 6 and 7 the A75s */
+		if (!BOARD_R1 && core < 6) { /* X6826B: cores 0-5 are the Cortex-A55s, 6 and 7 the A75s */
 			dt_prop_u32(&w, "small-core", 1);
 		}
 		dt_end(&w);
@@ -941,7 +978,11 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 	dt_begin(&w, "gic");
 	dt_prop_str(&w, "device_type", "interrupt-controller");
 	dt_prop_str(&w, "compatible", "arm,gic-v3");
+	#if BOARD_R1
+	uint64_t gic_reg[4] = { 0x0c000000 - 0x0c000000, 0x10000, 0x0c100000 - 0x0c000000, 0x200000 }; /* r1: GICR at 0x0c100000 */
+#else
 	uint64_t gic_reg[4] = { 0x0c000000 - 0x0c000000, 0x10000, 0x0c040000 - 0x0c000000, 0x100000 };
+#endif
 	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
 	dt_end(&w);
 
@@ -963,6 +1004,16 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 
 static void __attribute__((noreturn)) reset_board(void)
 {
+#if BOARD_R1
+	/* r1: only a TOPRGU reset in DDR-reserve mode keeps ramoops (the marker, the log); PSCI's and
+	 * a plain software reset do not. One second of watchdog, as fbdiag proved. */
+	wr32(TOPRGU_LENGTH, ((1u * 32768u / 512u) << 5) | 0x8u);
+	wr32(TOPRGU_RESTART, TOPRGU_RESTART_KEY);
+	wr32(TOPRGU_MODE, TOPRGU_MODE_KEY | 0x80u | 0x1u);   /* DDR_RESERVE | EN */
+	for (;;) {
+		__asm__ volatile("wfe");
+	}
+#endif
 	psci_system_reset();
 	wdt_reset();
 }
@@ -1602,7 +1653,11 @@ static void rescue_log(void)
  * Set up the GIC as XNU does, arm each timer in turn and see which one is taken.
  */
 #define GICD_BASE   0x0c000000ULL
+#if BOARD_R1
+#define GICR_SGI    (0x0c100000ULL + 0x10000)
+#else
 #define GICR_SGI    (0x0c040000ULL + 0x10000)
+#endif
 
 #if TIMER_PROBE
 static void gic_cpu_prepare(void)
@@ -1914,8 +1969,7 @@ void watcher_main(void)
 	save_host_keep(&xsyms);
 	dbg_puts("=== end of watcher snapshot ===\n");
 	plog_flush();
-	psci_system_reset();
-	wdt_reset();
+	reset_board();
 }
 
 static void watcher_start(void)
@@ -1924,7 +1978,7 @@ static void watcher_start(void)
 		return;
 	}
 	watcher_started = 0;
-	int64_t r = psci_cpu_on((uint64_t)WATCH_CORE << 8, (uint64_t)watcher_entry, 0);
+	int64_t r = psci_cpu_on((uint64_t)CORE_MPIDR(WATCH_CORE), (uint64_t)watcher_entry, 0);
 	out("watcher on cpu");
 	out_dec(WATCH_CORE);
 	out(": PSCI CPU_ON ");
@@ -2385,8 +2439,10 @@ static void __attribute__((noreturn)) run_xnu(void)
 	 * place to do it from: it would have to carry those hundred kilobytes itself, and it comes
 	 * up long after the chip has forgotten them.
 	 */
+#if !BOARD_R1   /* X6826B hardware: TD4160 over SPI, ARMPLL at APMIXED+0x20c (another PLL on MT6765) */
 	touch_bring_up();
 	big_cores_clock();
+#endif
 	/*
 	 * Nothing of ours is left on the panel: iOS paints only what it draws, and where it does not
 	 * reach, what LK wrote there stays -- its "Orange State: your device has been unlocked"
@@ -2491,7 +2547,15 @@ static void msdc1_probe(void)
 static void msdc_self_test(void)
 {
 	static uint8_t buf[4096] __attribute__((aligned(16)));
-	const uint64_t boot_a_lba = 0xf5000; /* from LK's partition table */
+	uint64_t boot_a_lba = 0, boot_a_blocks = 0;  /* by name: the same GPT walk that finds SYSTEM_PART */
+	if (!gpt_find("boot_a", &boot_a_lba, &boot_a_blocks)) {
+		out("GPT: no boot_a\n");
+	}
+	out("GPT: boot_a at lba ");
+	out_hex(boot_a_lba);
+	out(", ");
+	out_dec(boot_a_blocks);
+	out(" blocks\n");
 	int ok;
 
 	/* a hang in here must not keep the phone: the watchdog brings Android back */
@@ -2979,11 +3043,11 @@ static const char boot_xnu_flag[] = "DARWIN-REDWOOD:BOOT-XNU";
  * Whether Android left `flag` in the pmsg zone before rebooting, and if so wipe it, so it is taken
  * once: a run that hangs costs one reboot, after which the loader finds nothing and starts Android.
  */
-static int pmsg_take(const char *flag, uint32_t n)
+static int zone_take(uint64_t zone, uint32_t zone_size, const char *flag, uint32_t n)
 {
-	volatile struct ramoops_hdr *h = (volatile struct ramoops_hdr *)RAMOOPS_PMSG;
-	volatile char *d = (volatile char *)(RAMOOPS_PMSG + sizeof(struct ramoops_hdr));
-	uint32_t cap = RAMOOPS_PMSG_SIZE - sizeof(struct ramoops_hdr);
+	volatile struct ramoops_hdr *h = (volatile struct ramoops_hdr *)zone;
+	volatile char *d = (volatile char *)(zone + sizeof(struct ramoops_hdr));
+	uint32_t cap = zone_size - sizeof(struct ramoops_hdr);
 	int found = 0;
 
 	if (h->sig != RAMOOPS_SIG || h->size > cap) {
@@ -3004,9 +3068,42 @@ static int pmsg_take(const char *flag, uint32_t n)
 	return found;
 }
 
+static int pmsg_take(const char *flag, uint32_t n)
+{
+	return zone_take(RAMOOPS_PMSG, RAMOOPS_PMSG_SIZE, flag, n);
+}
+
 static int xnu_requested(void)
 {
-	return pmsg_take(boot_xnu_flag, sizeof(boot_xnu_flag) - 1);
+	static int asked = -1;   /* looked for once, before plog_reset() reuses the console zone */
+	if (asked >= 0) {
+		return asked;
+	}
+	asked = 0;
+#if BOARD_R1
+	/* r1: a normal reboot keeps no DRAM (ramoops included) and Android's kernel has no pmsg, so
+	 * the request comes through the flash: tools/boot-xnu.sh writes the flag into the first sector
+	 * of dtbo_b (slot b is dead on this board) and the host clears it once Android is back. Read
+	 * only: the run's own reset back to Android is recognised by the marker, not by this. */
+	{
+		static uint8_t sec[512] __attribute__((aligned(4)));
+		uint64_t lba = 0, blocks = 0;
+		const uint32_t n = sizeof(boot_xnu_flag) - 1;
+		if (gpt_find("dtbo_b", &lba, &blocks) && msdc_read(lba, 1, sec)) {
+			uint32_t k = 0;
+			while (k < n && sec[k] == (uint8_t)boot_xnu_flag[k]) {
+				k++;
+			}
+			if (k == n) {
+				return asked = 1;
+			}
+		}
+	}
+#endif
+	if (pmsg_take(boot_xnu_flag, sizeof(boot_xnu_flag) - 1)) {
+		return asked = 1;
+	}
+	return 0;
 }
 
 static int boot_choice(void)
@@ -3394,6 +3491,7 @@ void mtkloader_main(uint64_t dtb)
 		chain_android();
 	}
 
+	xnu_requested();         /* before plog_reset(): the request may be in the console zone */
 	plog_reset();
 #if TOUCH_PROBE
 	fb_rect(0, 0, PANEL_W, PANEL_H, 0xff000000u);
@@ -3443,11 +3541,13 @@ void mtkloader_main(uint64_t dtb)
 	fbc.x = 0;
 	fbc.y = fbc.top = 0;
 	fbc.fg = 0xff40ff40u;
-	out("== mtkloader: Darwin/XNU on X6826B (MT6768) ==\n");
+	out(BOARD_R1 ? "== mtkloader: Darwin/XNU on rabbit r1 (MT6765) ==\n" : "== mtkloader: Darwin/XNU on X6826B (MT6768) ==\n");
 	fbc.fg = 0xffffffffu;
 	out("LK dtb ");
 	out_hex(dtb);
 	out("\n");
-	connsys_dt_report(dtb);         /* Wi-Fi step 1: what Android's tree says of CONNSYS (mtkconnsys.h) */
+#if !BOARD_R1
+	connsys_dt_report(dtb);
+#endif         /* Wi-Fi step 1: what Android's tree says of CONNSYS (mtkconnsys.h) */
 	run_xnu();
 }

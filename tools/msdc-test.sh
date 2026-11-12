@@ -13,6 +13,7 @@ fastboot devices | grep -q $S || { echo "the phone did not come up in fastboot";
 fastboot -s $S flash boot_a "$ROOT/xnu-flashed-slot_a.img" >/dev/null 2>&1
 fastboot -s $S reboot >/dev/null 2>&1
 for i in $(seq 1 90); do [ "$(adb -s $S get-state 2>/dev/null)" = device ] && break; sleep 3; done
+adb -s $S root >/dev/null 2>&1; sleep 2; adb -s $S wait-for-device  # r1: userdebug adb root instead of su
 sleep 3
-adb -s $S shell 'su -c "cat /sys/fs/pstore/console-ramoops-0"' > "$ROOT/logs/msdc-last.log" 2>/dev/null
+adb -s $S shell 'sh -c "cat /sys/fs/pstore/console-ramoops-0"' > "$ROOT/logs/msdc-last.log" 2>/dev/null
 sed -n '/eMMC read test/,/^$/p' "$ROOT/logs/msdc-last.log"

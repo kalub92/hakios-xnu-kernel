@@ -125,11 +125,11 @@ void fbdiag_fault(uint64_t vec, uint64_t esr, uint64_t elr, uint64_t far)
  * whether DRAM survives the reset that will end XNU runs, and then starts Android.
  * The marker is the header word of ramoops' ftrace zone: Android's ramoops rewrites it.
  */
-#define MARKER_PA     0x4d0df000ULL
+#define MARKER_PA     0x47d5f000ULL /* r1: ramoops ftrace zone header */
 #define MARKER_PHASE2 0x32474946u /* "FIG2" */
 #define WDT_SECONDS   10
 
-static const uint64_t probe_pa[] = { 0x42000000ULL, 0x47b1c9c0ULL, 0x80000000ULL, 0xc0000000ULL, 0xc7b1c9c0ULL, 0xd0000000ULL, 0x140000000ULL };
+static const uint64_t probe_pa[] = { 0x42000000ULL, 0x47b1c9c0ULL, 0x80000000ULL, 0xc0000000ULL, 0xc7b1c9c0ULL, 0xd0000000ULL, 0x100000000ULL }; /* r1: DRAM ends at 0x13fffffff */
 #define PROBE_WORDS 256
 
 static uint32_t pattern(uint64_t pa, uint32_t i)
@@ -203,21 +203,21 @@ void fbdiag_main(uint64_t dtb)
 	}
 
 	/* Leave the logo's top part; the report goes below a band of test bars. */
-	fbcon_init(fb, pitch, 560, 1);
-	fb_rect(0, 0, PANEL_W, 560, 0xff000000u);
+	fbcon_init(fb, pitch, 392, 1);
+	fb_rect(0, 0, PANEL_W, 392, 0xff000000u);
 	bar(0, 0xffff0000u, "A: red   alpha=ff");
 	bar(56, 0xff00ff00u, "B: green alpha=ff");
 	bar(112, 0xff0000ffu, "C: blue  alpha=ff");
-	bar(168, 0x00ffffffu, "D: white alpha=00 (invisible if per-pixel alpha)");
+	bar(168, 0x00ffffffu, "D: white a=00 (gone if per-px alpha)");
 	bar(224, 0x80ffffffu, "E: white alpha=80");
 	bar(280, 0xffffffffu, "F: white alpha=ff");
 	fbc.scale = 2;
-	fbc.y = 360;
+	fbc.y = 340;
 	fbc.x = 0;
 	fbc.fg = 0xff40ff40u;
 	dbg_puts(second ? "fbdiag: phase 2\n" : "fbdiag: phase 1\n");
 	fbc.scale = 1;
-	fbc.y = 560;
+	fbc.y = 392;
 	fbc.x = 0;
 	fbc.fg = 0xffffffffu;
 
@@ -232,7 +232,7 @@ void fbdiag_main(uint64_t dtb)
 		chain_android();
 	}
 
-	dbg_puts("== fbdiag v3 phase 1 (X6826B MT6768) ==\nx0(dtb)=");
+	dbg_puts("== fbdiag v3 phase 1 (rabbit r1 MT6765) ==\nx0(dtb)=");
 	dbg_hex(dtb, 10);
 	dbg_putc('\n');
 	report_sysregs();

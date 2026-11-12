@@ -18,12 +18,12 @@
 #include <stdint.h>
 #include "font8x16.h"
 
-#define RAMOOPS_CONSOLE      0x4d09f000ULL
+#define RAMOOPS_CONSOLE      0x47d1f000ULL   /* r1: ramoops 0x47c90000+0xe0000, record 4K, ftrace 4K -> +0x8f000 */
 #define RAMOOPS_CONSOLE_SIZE 0x40000u
 #define RAMOOPS_SIG          0x43474244u
 /* the pmsg zone: Android's request for one XNU boot comes in it (boot-xnu.sh), the kernel's lines for the
  * host go out in it (kern.redwood.host_keep) */
-#define RAMOOPS_PMSG         0x4d0e0000ULL
+#define RAMOOPS_PMSG         0x47d60000ULL   /* r1: +0xd0000 */
 #define RAMOOPS_PMSG_SIZE    0x10000u
 
 #define TOPRGU_BASE          0x10007000ULL
@@ -36,11 +36,11 @@
 #define TOPRGU_SWRST_KEY     0x1209u
 
 /* LK's framebuffer (mblock "framebuffer"), the layer LK shows the logo on. */
-#define LK_FB_BASE           0x787b0000ULL
-#define LK_FB_SIZE           0x1050000ULL
-#define LK_FB_PITCH          2944u      /* 736 pixels: LK aligns the width to 32 */
-#define PANEL_W              720u
-#define PANEL_H              1640u
+#define LK_FB_BASE           0x7efe0000ULL   /* r1: reserved-memory mblock-14-framebuffer */
+#define LK_FB_SIZE           0x420000ULL
+#define LK_FB_PITCH          1920u      /* r1: 480 pixels, already a multiple of 32 (fbdiag reads the real one) */
+#define PANEL_W              480u
+#define PANEL_H              640u
 
 #define DISP_MUTEX_EN        0x14001020ULL
 #define DISP_MUTEX_RUN       0x14001024ULL
