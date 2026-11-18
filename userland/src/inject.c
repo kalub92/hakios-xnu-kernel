@@ -3276,8 +3276,10 @@ bluetool_serves(void)
 
 static struct bbprof_sample_t {
 	uint64_t tid;
+	unsigned state;                 /* THREAD_BASIC_INFO's run_state when sampled (1 running, 3 waiting) */
 	uintptr_t frame[BBPROF_DEPTH];
 } bbprof_samples[BBPROF_MAX];
+static int bbprof_all;                  /* boot-arg bb_prof_all=1: the render thread only, in every state (see bbprof_thread) */
 static unsigned bbprof_n, bbprof_sec[16];
 static struct { uint64_t tid; char name[24]; } bbprof_names[64];
 static struct { uintptr_t lo, hi, header; const char *name; unsigned used; } bbprof_imgs[BBPROF_IMGS];
@@ -3293,7 +3295,7 @@ bbprof_sample(thread_t thread, unsigned *running)
 	uintptr_t frame[BBPROF_DEPTH] = { 0 }, fp;
 
 	if (thread_info(thread, THREAD_BASIC_INFO, (thread_info_t)&info, &count) != KERN_SUCCESS ||
-	    info.run_state != TH_STATE_RUNNING || bbprof_n >= BBPROF_MAX || thread_suspend(thread) != KERN_SUCCESS) {
+	    (info.run_state != TH_STATE_RUNNING && !bbprof_all) || bbprof_n >= BBPROF_MAX || thread_suspend(thread) != KERN_SUCCESS) {
 		return;
 	}
 	count = ARM_THREAD_STATE64_COUNT;
@@ -3318,6 +3320,7 @@ bbprof_sample(thread_t thread, unsigned *running)
 	}
 	(*running)++;
 	bbprof_samples[bbprof_n].tid = ident.thread_id;
+	bbprof_samples[bbprof_n].state = (unsigned)info.run_state;
 	memcpy(bbprof_samples[bbprof_n].frame, frame, sizeof(frame));
 	bbprof_n++;
 	for (unsigned i = 0; i < 64; i++) {
@@ -3396,6 +3399,145 @@ bbprof_same(const struct bbprof_sample_t *a, const struct bbprof_sample_t *b)
 	return memcmp(a->frame, b->frame, sizeof(a->frame)) == 0;
 }
 
+/*
+ * (bb_prof_all=1) The render thread's samples by symbol, from dladdr() in this process: "bbprof state" = samples by run state (1 running, 3 waiting);
+ * "bbprof leaf" / "bbprof incl" = the top symbols as the innermost frame / anywhere in the stack, with the share of all samples and of the
+ * running ones. dladdr names only exported symbols (the shared cache has no local ones), so a frame is the nearest one before it: "sym+off".
+ * Idea after prof.py of Open Mapple's mapple_gpu_mali (periodic stack samples, top-N by symbol); written here.
+ */
+static struct { uintptr_t key, base; const char *image; const char *name; unsigned all, run; } bbprof_syms[3][4096];
+static unsigned bbprof_nsyms[3];
+static struct { uintptr_t pc, key, base; const char *image, *name; } bbprof_memo[8192];
+
+static void
+bbprof_symbol_of(uintptr_t pc, uintptr_t *key, const char **image, const char **name, uintptr_t *base)
+{
+	unsigned slot = (unsigned)(pc >> 2) % 8192;
+	Dl_info info;
+
+	if (bbprof_memo[slot].pc != pc) {
+		bbprof_memo[slot].pc = pc;
+		if (dladdr((void *)pc, &info) != 0 && info.dli_sname != NULL && strcmp(info.dli_sname, "<redacted>") != 0) {
+			const char *base = info.dli_fname != NULL ? strrchr(info.dli_fname, '/') : NULL;
+
+			bbprof_memo[slot].key = (uintptr_t)info.dli_saddr;
+			bbprof_memo[slot].image = base != NULL ? base + 1 : info.dli_fname;
+			bbprof_memo[slot].name = info.dli_sname;
+			bbprof_memo[slot].base = 0;
+		} else {
+			bbprof_memo[slot].key = pc & ~(uintptr_t)0xfff;     /* (no symbol: the page) */
+			bbprof_memo[slot].image = dladdr((void *)pc, &info) != 0 && info.dli_fname != NULL && strrchr(info.dli_fname, '/') != NULL ?
+			    strrchr(info.dli_fname, '/') + 1 : "?";
+			bbprof_memo[slot].base = (uintptr_t)info.dli_fbase;       /* (a stripped symbol: image and page offset are printed) */
+			bbprof_memo[slot].name = NULL;
+		}
+	}
+	*key = bbprof_memo[slot].key;
+	*image = bbprof_memo[slot].image;
+	*name = bbprof_memo[slot].name;
+	*base = bbprof_memo[slot].base;
+}
+
+static void
+bbprof_symbols(uint64_t tid)
+{
+	unsigned total = 0, running = 0, states[8] = { 0 };
+
+	bbprof_nsyms[0] = bbprof_nsyms[1] = bbprof_nsyms[2] = 0;
+
+	for (unsigned i = 0; i < bbprof_n; i++) {
+		struct bbprof_sample_t *sample = &bbprof_samples[i];
+
+		if (sample->tid != tid) {
+			continue;
+		}
+		total++;
+		running += sample->state == TH_STATE_RUNNING;
+		states[sample->state < 8 ? sample->state : 0]++;
+		for (unsigned which = 0; which < 3; which++) {
+			uintptr_t seen[BBPROF_DEPTH];
+			unsigned nseen = 0;
+
+			for (unsigned f = 0; f < (which == 0 ? 1u : BBPROF_DEPTH) && sample->frame[f] != 0; f++) {
+				uintptr_t key;
+				const char *image, *name;
+				uintptr_t base;
+				unsigned j;
+				bool again = false;
+
+				bbprof_symbol_of(sample->frame[f], &key, &image, &name, &base);
+				if (which == 2) {
+					/* (the GL stack's own images, by exact address: tools/swprof.py names them from the unstripped libraries) */
+					if (image == NULL || (strncmp(image, "libvulkan_powervr", 17) != 0 && strncmp(image, "libgallium", 10) != 0 &&
+					    strncmp(image, "libredwood", 10) != 0 && strncmp(image, "libEGL", 6) != 0 && strncmp(image, "libGLES", 7) != 0)) {
+						continue;
+					}
+					if (base == 0) {
+						Dl_info where;
+
+						base = dladdr((void *)sample->frame[f], &where) != 0 ? (uintptr_t)where.dli_fbase : 0;
+					}
+					key = sample->frame[f];
+					name = NULL;
+				}
+				for (unsigned k = 0; k < nseen; k++) {
+					again |= seen[k] == key;
+				}
+				if (again) {
+					continue;               /* (once for a sample, however deep it recurses) */
+				}
+				seen[nseen++] = key;
+				for (j = 0; j < bbprof_nsyms[which] && bbprof_syms[which][j].key != key; j++) {
+				}
+				if (j == bbprof_nsyms[which]) {
+					if (j == 4096) {
+						continue;
+					}
+					bbprof_syms[which][j].key = key;
+					bbprof_syms[which][j].image = image;
+					bbprof_syms[which][j].name = name;
+					bbprof_syms[which][j].base = base;
+					bbprof_syms[which][j].all = bbprof_syms[which][j].run = 0;
+					bbprof_nsyms[which]++;
+				}
+				bbprof_syms[which][j].all++;
+				bbprof_syms[which][j].run += sample->state == TH_STATE_RUNNING;
+			}
+		}
+	}
+	keep_line("bbprof state: %u samples of thread %llx: running %u, waiting %u, other %u", total, (unsigned long long)tid, states[TH_STATE_RUNNING],
+	    states[TH_STATE_WAITING], total - states[TH_STATE_RUNNING] - states[TH_STATE_WAITING]);
+	for (unsigned which = 0; which < 3; which++) {
+		if (which == 2 && running < 500) {
+			break;
+		}
+		for (unsigned top = 0; top < (which == 2 ? 160u : 30u) && top < bbprof_nsyms[which]; top++) {
+			unsigned best = top;
+
+			for (unsigned j = top + 1; j < bbprof_nsyms[which]; j++) {
+				if (bbprof_syms[which][j].all > bbprof_syms[which][best].all) {
+					best = j;
+				}
+			}
+			__typeof__(bbprof_syms[0][0]) swap = bbprof_syms[which][best];
+
+			bbprof_syms[which][best] = bbprof_syms[which][top];
+			bbprof_syms[which][top] = swap;
+			char where[40] = "";
+
+			if (swap.name == NULL) {
+				snprintf(where, sizeof(where), "(no symbol) +%#lx", (unsigned long)(swap.key - swap.base));
+			}
+			if (which == 2) {
+				keep_line("bbprof pc %u (run %u) tid %llx %s+%#lx", swap.all, swap.run, (unsigned long long)tid, swap.image, (unsigned long)(swap.key - swap.base));
+				continue;
+			}
+			keep_line("bbprof %s %u of %u (run %u) tid %llx %s`%s", which == 0 ? "leaf" : "incl", swap.all, total, swap.run, (unsigned long long)tid,
+			    swap.image != NULL ? swap.image : "?", swap.name != NULL ? swap.name : where);
+		}
+	}
+}
+
 static void *
 bbprof_thread(void *argument)
 {
@@ -3406,8 +3548,32 @@ bbprof_thread(void *argument)
 	static unsigned done[BBPROF_MAX];
 	static unsigned rank_n[BBPROF_MAX], rank_i[BBPROF_MAX];
 
+	thread_act_t targets[8];
+	unsigned ntargets = 0;
+
 	pthread_setname_np("redwood bb profiler");
 	sleep(delay);
+	if (bbprof_all) {
+		/* the render thread (QuartzCore's "com.apple.coreanimation..." thread) is found once and sampled in every state: running, and waiting (where) */
+		thread_act_array_t all;
+		mach_msg_type_number_t count;
+
+		if (task_threads(mach_task_self(), &all, &count) == KERN_SUCCESS) {
+			for (mach_msg_type_number_t i = 0; i < count; i++) {
+				thread_extended_info_data_t ext;
+				mach_msg_type_number_t size = THREAD_EXTENDED_INFO_COUNT;
+
+				if (all[i] != me && ntargets < 8 && thread_info(all[i], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &size) == KERN_SUCCESS &&
+				    strncmp(ext.pth_name, "com.apple.coreanimation", 23) == 0) {
+					targets[ntargets++] = all[i];
+				} else {
+					mach_port_deallocate(mach_task_self(), all[i]);
+				}
+			}
+			vm_deallocate(mach_task_self(), (vm_address_t)all, count * sizeof(all[0]));
+		}
+		keep_line("bbprof: %u render thread(s) found", ntargets);
+	}
 	mach_timebase_info(&base);
 	begin = mach_absolute_time();
 	end = begin + 10ULL * NSEC_PER_SEC * base.denom / base.numer;
@@ -3415,7 +3581,10 @@ bbprof_thread(void *argument)
 		thread_act_array_t threads;
 		mach_msg_type_number_t n;
 
-		if (task_threads(mach_task_self(), &threads, &n) != KERN_SUCCESS) {
+		if (bbprof_all) {
+			threads = targets;
+			n = ntargets;
+		} else if (task_threads(mach_task_self(), &threads, &n) != KERN_SUCCESS) {
 			break;
 		}
 		for (unsigned round = 0; round < 20; round++, rounds++) {
@@ -3431,10 +3600,12 @@ bbprof_thread(void *argument)
 			bbprof_sec[sec < 15 ? sec : 15] += running - before;
 			usleep(200);
 		}
-		for (mach_msg_type_number_t i = 0; i < n; i++) {
-			mach_port_deallocate(mach_task_self(), threads[i]);
+		if (!bbprof_all) {
+			for (mach_msg_type_number_t i = 0; i < n; i++) {
+				mach_port_deallocate(mach_task_self(), threads[i]);
+			}
+			vm_deallocate(mach_task_self(), (vm_address_t)threads, n * sizeof(threads[0]));
 		}
-		vm_deallocate(mach_task_self(), (vm_address_t)threads, n * sizeof(threads[0]));
 	}
 	double secs = (double)(mach_absolute_time() - begin) * base.numer / base.denom / 1e9;
 
@@ -3458,6 +3629,11 @@ bbprof_thread(void *argument)
 		}
 	}
 	keep_line("bbprof busiest thread %llx: %u samples", (unsigned long long)best_tid, best_count);
+	for (unsigned t = 0; bbprof_all && t < 64 && bbprof_names[t].tid; t++) {
+		if (strncmp(bbprof_names[t].name, "com.apple.coreanimation", 23) == 0) {
+			bbprof_symbols(bbprof_names[t].tid);
+		}
+	}
 	/* group the busiest thread's samples: leaf frame (rank by pc) and whole stack */
 	for (int pass = 0; pass < 2; pass++) {
 		unsigned groups = 0;
@@ -3530,6 +3706,7 @@ bbprof_if_asked(void)
 	    (arg != args && arg[-1] != ' ') || atoi(arg + 8) <= 0) {
 		return;
 	}
+	bbprof_all = strstr(args, "bb_prof_all=1") != NULL;
 	pthread_create(&thread, NULL, bbprof_thread, (void *)(uintptr_t)atoi(arg + 8));
 	pthread_detach(thread);
 }

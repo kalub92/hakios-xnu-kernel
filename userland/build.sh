@@ -346,6 +346,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 					-o obj/libredwood-gl.dylib src/eagl.c src/gl_egl.c
 				$DYN -framework CoreFoundation -framework IOSurface $P/out/libEGL.1.dylib $P/out/libGLESv2.2.dylib \
 					-o obj/pvr_gl_test src/pvr_gl_test.c src/gl_egl.c
+				$DYN -framework CoreFoundation -framework IOSurface $P/out/libEGL.1.dylib $P/out/libGLESv2.2.dylib \
+					-o obj/pass_bench src/pass_bench.c src/gl_egl.c
 				cp $P/out/libEGL.1.dylib $P/out/libGLESv2.2.dylib $P/out/libgallium-26.3.0.dylib obj/
 			fi
 			cp $P/out/libvulkan_powervr_mesa.dylib obj/
@@ -442,6 +444,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			if [ -n "$PVR_SYS" ]; then ln -s /fw/pvr/libgallium-26.3.0.dylib root/lib/libgallium-26.3.0.dylib
 			else cp obj/libgallium-26.3.0.dylib root/lib/; fi
 			cp obj/pvr_gl_test root/bin/
+			cp obj/pass_bench root/bin/
 		fi
 	fi
 	# a program is not started with a library that is not there: it would not start at all

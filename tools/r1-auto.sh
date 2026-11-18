@@ -16,7 +16,7 @@ if [ "$2" != --summary ]; then
 	[ -n "$NOWIFI" ] && BASE=${BASE/connsys_soc=6765 connsys_xo_cw00=0x4e1d connsys_step=17 wifi=1 /}
 	# the camera reads the FIRST cam_fps=: one in the extra args replaces the base's
 	case "$2" in *cam_fps=*) BASE=${BASE/ cam_fps=6/};; esac
-	case "$2" in *soak=1*|*idle=1*|*settings=1*|*bltest=1*|*" flip=1"*|*nosw=1*|*sw1=1*|*swwait=1*|*swhome=1*|*swcam=1*|*swloop=1*) SCEN=;; *) SCEN=autotest=1;; esac   # soak=1: the soak scenario (rc.jobs) instead of the autotest one
+	case "$2" in *soak=1*|*idle=1*|*settings=1*|*bltest=1*|*" flip=1"*|*nosw=1*|*sw1=1*|*swwait=1*|*swhome=1*|*swcam=1*|*swloop=1*|*swprof=1*|*passbench=*) SCEN=;; *) SCEN=autotest=1;; esac   # soak=1: the soak scenario (rc.jobs) instead of the autotest one
 	tools/r1-run.sh "$NAME" "${3:-300}" "$BASE $SHOTS $SCEN $2" > "logs/$NAME.out" 2>&1
 	head -3 "logs/$NAME.out"
 	adb -s "${HAKIOS_SERIAL:?set HAKIOS_SERIAL to the adb serial}" get-state 2>&1 | grep -q device || { echo "r1-auto: THE PHONE IS NOT BACK IN ANDROID: stop"; exit 1; }

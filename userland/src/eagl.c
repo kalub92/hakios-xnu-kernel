@@ -435,6 +435,12 @@ static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's
  */
 static uint64_t flush_skip[8];
 static unsigned flush_skips, flushes_skipped, flushes_done;
+/* Boot-arg swprof=1: every ten seconds a "swprof:" line of what a frame is made of (tools/swprof.py reads it): frames, glFlush and glFinish calls,
+ * draws, clears, draws by a framebuffer-fetch program (ours for the vibrant layers, or CoreAnimation's own with gl_LastFragData). Counters for
+ * the home-screen swipe profile (docs/swipe-profile.md); the render passes themselves are the kernel's ("pvr: stats:"). */
+static int swprof_on;
+static unsigned sw_flush_calls, sw_finish_calls, sw_draws, sw_clears, sw_fetch_draws, sw_fetch_programs, sw_frames;
+static bool sw_shader_fetch[256], sw_program_fetch[256];
 /*
  * boot-arg glflush_from=SECONDS: from that uptime on, the callers of the next 150 glFlushes are said in the kept log, each with its
  * number since the last flush of the end-of-update caller below and the time (mach us, as "tl:" lines have it), to tell
@@ -1570,6 +1576,13 @@ frame_end(struct eagl *e, bool finished)
 			    wait_by_kind[0] / (by_kind[0] + !by_kind[0]) % 1000 / 100, by_kind[1], wait_by_kind[1] / (by_kind[1] + !by_kind[1]) / 1000,
 			    wait_by_kind[1] / (by_kind[1] + !by_kind[1]) % 1000 / 100, zk.other_width, zk.other_height, by_kind[2],
 			    flushes_done, flushes_skipped);
+			if (swprof_on) {
+				say_kept("redwood-gl: swprof: %u frames, %u display, %u glFlush, %u glFinish, %u draws, %u clears, %u fetch draws, %u fetch programs made, "
+				    "fetch %s, %llu.%llu ms a frame, %llu.%llu in glFlush", sw_frames, by_kind[0], sw_flush_calls, sw_finish_calls, sw_draws,
+				    sw_clears, sw_fetch_draws, sw_fetch_programs, fetch_offered ? "offered" : "hidden", frame_us / (frames + !frames) / 1000,
+				    frame_us / (frames + !frames) % 1000 / 100, flush_us / (frames + !frames) / 1000, flush_us / (frames + !frames) % 1000 / 100);
+				sw_frames = sw_flush_calls = sw_finish_calls = sw_draws = sw_clears = sw_fetch_draws = 0;
+			}
 			if (flush_mid) {
 				say_kept("redwood-gl: glflush_mid: %u done, %u left out; %u chunks to an update's end, %u.%u on average, %u at most",
 				    flushes_done, flushes_skipped, mid_chunks, mid_chunks / (mid_updates + !mid_updates),
@@ -1623,6 +1636,9 @@ frame_end(struct eagl *e, bool finished)
 			errors_before = e->errors;
 		}
 	}
+	sw_draws += e->draws;
+	sw_clears += e->clears;
+	sw_frames++;
 	e->all_calls += e->calls;
 	e->all_draws += e->draws;
 	e->all_triangles += e->triangles;
@@ -3477,6 +3493,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		}
 		census_draw(e, function, vibrant ? CENSUS_VIBRANT : CENSUS_MASKING);
 		program = vibrant ? e->vibrant : e->masking;
+		sw_fetch_draws += vibrant;
 		glUseProgram(program);
 		glUniformMatrix4fv(vibrant ? e->vibrant_matrix : e->masking_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
 		glUniform4fv(vibrant ? e->vibrant_colours : e->masking_colours, 5, function_values[function]);
@@ -3679,6 +3696,7 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	drawing(e);
 	count_spans(e, mode, count);
 	e->draws++;
+	sw_fetch_draws += sw_program_fetch[e->program % 256];
 	e->triangles += triangles_of(mode, count);
 	if (eagl_tracing) {
 		eagl_trace("glDrawArrays(%#x, %d, %d)\n", mode, first, count);
@@ -3719,6 +3737,7 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	drawing(e);
 	count_spans(e, mode, count);
 	e->draws++;
+	sw_fetch_draws += sw_program_fetch[e->program % 256];
 	e->triangles += triangles_of(mode, count);
 	if (eagl_tracing) {
 		eagl_trace("glDrawElements(%#x, %d, %#x, %p)\n", mode, count, type, indices);
@@ -3758,6 +3777,7 @@ my_glFinish(void *context)
 		eagl_trace("glFinish()\n");
 	}
 	clear_now(e);
+	sw_finish_calls++;
 	glFinish();
 	frame_end(e, true);
 	EAGL_LEAVE(e, 0x2d0);
@@ -3770,6 +3790,7 @@ my_glFlush(void *context)
 	uint64_t began;
 
 	EAGL_ENTER(e, 0x2d8);
+	sw_flush_calls++;
 	if (eagl_tracing) {
 		eagl_trace("glFlush()\n");
 	}
@@ -3874,6 +3895,7 @@ my_glFinishObjectAPPLE(void *context, GLenum object, GLint name)
 	(void)name;
 	EAGL_ENTER(e, 0xeb8);
 	clear_now(e);
+	sw_finish_calls++;
 	glFinish();
 	frame_end(e, true);
 	EAGL_LEAVE(e, 0xeb8);
@@ -4382,6 +4404,7 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 	parts[3] = text;
 	if (fragment) {
 		fetch = strstr(text, "gl_LastFragData") != NULL;
+		sw_shader_fetch[shader % 256] = fetch;
 		parts[2] = fetch ? fragment_fetch : fragment_plain;
 		parts[4] = fetch ? fragment_fetch_end : fragment_plain_end;
 	}
@@ -4436,6 +4459,17 @@ my_glLinkProgram(void *context, GLuint program)
 	glLinkProgram(program);
 	glGetProgramiv(program, GL_LINK_STATUS, &good);
 	e->programs++;
+	{
+		GLuint attached[8];
+		GLsizei n = 0;
+
+		glGetAttachedShaders(program, 8, &n, attached);
+		sw_program_fetch[program % 256] = false;
+		for (GLsizei i = 0; i < n; i++) {
+			sw_program_fetch[program % 256] |= sw_shader_fetch[attached[i] % 256];
+		}
+		sw_fetch_programs += sw_program_fetch[program % 256];
+	}
 	if (!good) {
 		glGetProgramInfoLog(program, sizeof(said), NULL, said);
 		say("redwood-gl: A PROGRAM DOES NOT LINK (program %u): %s\n", program, said);
@@ -4812,6 +4846,7 @@ install(void)
 			trace_corners = (GLsizei)strtol(argument + 16, NULL, 10);
 		}
 		fetch_offered = strstr(arguments, "glfetch=0") == NULL;
+		swprof_on = strstr(arguments, "swprof=1") != NULL;
 		group_vibrant_on = strstr(arguments, "glgroup=0") == NULL;
 		if ((argument = strstr(arguments, "gltrace_place=")) != NULL) {
 			char *end = (char *)argument + 14;

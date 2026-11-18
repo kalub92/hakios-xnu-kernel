@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-18 12:40 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-18 14:00 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -44,7 +44,7 @@ Last updated: 2026-11-18 12:40 PST. Kept current as work lands; details are in t
 - Cellular alongside Wi-Fi (Wi-Fi should win) is untested: unattended runs have no Wi-Fi
 - All audio went silent after a speaker was paired (likely the route moved to a Bluetooth output that could not carry sound; not confirmed)
 - Safari audio spins and never plays; a Safari file download would not start (untested unattended: no Wi-Fi in those runs)
-- Home-screen swipes run at about 8 to 13 fps (parked)
+- Home-screen swipes run at about 9 to 10 fps. Measured cause (`swipe-profile.md`): the PowerVR driver rebuilds a load-op shader on every render pass (46% of render-thread CPU) plus per-pass end-of-tile setup (18%); fix = cache them in the driver (in progress)
 - Camera frames sometimes painted twice after a home swipe (parked)
 - Side-button exit and radio-on shutdown of the modem service not yet exercised
 
