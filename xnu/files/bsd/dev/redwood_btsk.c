@@ -17,7 +17,7 @@
 #include <skywalk/os_skywalk_private.h>
 
 extern void redwood_host_keep_add(const char *format, ...) __printflike(1, 2);
-extern void redwood_connsys_bt_send(const uint8_t *bytes, unsigned length);
+extern bool redwood_connsys_bt_send(const uint8_t *bytes, unsigned length);
 
 static LCK_GRP_DECLARE(btsk_lck_grp, "redwood-btsk");
 static LCK_MTX_DECLARE(btsk_lock, &btsk_lck_grp);
@@ -145,7 +145,10 @@ btsk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus,
 						    length > 3 ? base[offset + 3] : 0, length > 4 ? base[offset + 4] : 0, length > 5 ? base[offset + 5] : 0,
 						    length > 6 ? base[offset + 6] : 0, length > 7 ? base[offset + 7] : 0);
 					}
-					redwood_connsys_bt_send(base + offset, length);
+					if (!redwood_connsys_bt_send(base + offset, length)) {
+						/* no room: this packet stays in its slot for the next sync (redwood_btsk_tx_kick asks for it) */
+						break;
+					}
 				}
 			}
 			(void)kern_channel_slot_detach_packet(ring, slot, ph);
@@ -230,6 +233,20 @@ redwood_btsk_deliver(const uint8_t *bytes, unsigned length)
 		btsk_rxq_count++;
 	}
 	ring = btsk_rxring;
+	lck_mtx_unlock(&btsk_lock);
+	if (ring != NULL) {
+		(void)kern_channel_notify(ring, 0);
+	}
+}
+
+/* the controller's queue has room again after a refusal (redwood_connsys_bt_send false): wake the user's TX ring so it syncs again */
+void
+redwood_btsk_tx_kick(void)
+{
+	kern_channel_ring_t ring;
+
+	lck_mtx_lock(&btsk_lock);
+	ring = btsk_ready ? btsk_txring : NULL;
 	lck_mtx_unlock(&btsk_lock);
 	if (ring != NULL) {
 		(void)kern_channel_notify(ring, 0);

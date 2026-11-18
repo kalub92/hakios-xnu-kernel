@@ -1401,7 +1401,7 @@ connsys_sw_init(void)
 static LCK_GRP_DECLARE(bt_lck_grp, "redwood-bt");
 static LCK_MTX_DECLARE(bt_lock, &bt_lck_grp);
 #define BT_RING         65536u
-#define BT_TXQ          8192u
+#define BT_TXQ          16384u
 static uint8_t bt_ring[BT_RING];
 static unsigned bt_ring_head, bt_ring_count;    /* the bytes the controller sent, not yet read */
 static uint8_t bt_txq[BT_TXQ];
@@ -1409,6 +1409,7 @@ static unsigned bt_txq_count;                   /* what has been written, not ye
 static struct selinfo bt_sel;
 static unsigned bt_opens;
 static uint32_t bt_said_packets_in, bt_said_packets_out;
+static bool bt_tx_blocked;                      /* B5: a Skywalk slot was left for the next sync (queue full); the bridge kicks the ring when there is room */
 static unsigned bt_txq_max, bt_drops;           /* L6: the queue's high-water mark, and what it had no room for */
 
 /* L6: ACL traffic per 10 s, and each L2CAP Connection Request (PSM 0x0019 is AVDTP/A2DP) with its response */
@@ -1823,6 +1824,7 @@ bt_h4_length(const uint8_t *b, unsigned have)
 extern void redwood_btsk_init(void);
 extern bool redwood_btsk_uuid(uuid_t out);
 extern void redwood_btsk_deliver(const uint8_t *bytes, unsigned length);
+extern void redwood_btsk_tx_kick(void);
 
 static kern_ctl_ref bt_ctl_ref;
 static u_int32_t bt_ctl_unit;
@@ -1908,10 +1910,13 @@ bt_ctl_getopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void 
 	return 0;
 }
 
-/* H4 bytes the Skywalk channel's user wrote, for the controller: the queue /dev/cu.bluetooth's writes go to */
-void
+/* H4 bytes the Skywalk channel's user wrote, for the controller: the queue /dev/cu.bluetooth's writes go to.
+ * false = no room (nothing taken): the caller keeps the packet and offers it again (a dropped ACL packet would leak the host's ACL credit). */
+bool
 redwood_connsys_bt_send(const uint8_t *bytes, unsigned length)
 {
+	bool taken = true;
+
 	lck_mtx_lock(&bt_lock);
 	if (bt_txq_count + length <= BT_TXQ) {
 		memcpy(bt_txq + bt_txq_count, bytes, length);
@@ -1920,9 +1925,12 @@ redwood_connsys_bt_send(const uint8_t *bytes, unsigned length)
 			bt_txq_max = bt_txq_count;
 		}
 	} else {
-		bt_drops++;
+		bt_drops++;     /* (now: times a packet had to wait, not lost) */
+		bt_tx_blocked = true;
+		taken = false;
 	}
 	lck_mtx_unlock(&bt_lock);
+	return taken;
 }
 
 static void
@@ -2055,6 +2063,7 @@ bt_bridge(void)
 		for (;;) {
 			uint8_t packet[1100];
 			unsigned n;
+			bool kick;
 
 			lck_mtx_lock(&bt_lock);
 			n = bt_h4_length(bt_txq, bt_txq_count);
@@ -2072,7 +2081,12 @@ bt_bridge(void)
 			memcpy(packet, bt_txq, n);
 			memmove(bt_txq, bt_txq + n, bt_txq_count - n);
 			bt_txq_count -= n;
+			kick = bt_tx_blocked;
+			bt_tx_blocked = false;
 			lck_mtx_unlock(&bt_lock);
+			if (kick) {
+				redwood_btsk_tx_kick();
+			}
 			if (n >= 5 && packet[0] == 1 && packet[1] == 0xe2 && packet[2] == 0xfc) {
 				bt_vsc_sub = packet[4];
 			}
@@ -2119,8 +2133,11 @@ bt_bridge(void)
 				redwood_host_keep_add("connsys: bt: %u bytes written and not a whole H4 packet in 2 s:%s", pending, text);
 			}
 		}
+		/* B5: every frame already waiting is read in this pass (the first waits up to 2 ms, the rest not at all), so the
+		 * controller's Number_Of_Completed_Packets are not held back 2 ms apiece */
+		for (unsigned pass = 0; pass < 32; pass++) {
 		heard[0] = 0;
-		length = connsys_stp_receive(bt_frame, sizeof(bt_frame), heard, sizeof(heard), 2);
+		length = connsys_stp_receive(bt_frame, sizeof(bt_frame), heard, sizeof(heard), pass == 0 ? 2 : 0);
 		if (length > 0) {
 			const unsigned raw_length = (unsigned)length;
 
@@ -2141,8 +2158,12 @@ bt_bridge(void)
 			}
 			bt_dump("in ", bt_frame, (unsigned)length, &bt_said_packets_in);
 			bt_to_host(bt_frame, (unsigned)length);
-		} else if (length < 0) {
-			delay_for_interval(idle_ms != 0 ? idle_ms : 1, NSEC_PER_MSEC);
+		} else {
+			if (length < 0 && pass == 0) {
+				delay_for_interval(idle_ms != 0 ? idle_ms : 1, NSEC_PER_MSEC);
+			}
+			break;
+		}
 		}
 	}
 }

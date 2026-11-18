@@ -1414,6 +1414,13 @@ main(int argc, char **argv, char **envp)
 	chmod("/dev/console", 0666);
 	configure_inject();
 	configure_vnodes();
+	/* BT=1 images carry Apple's Bluetooth audio plug-in (root/hal); a boot from the system image has only our device in
+	 * the plug-in directory, so show this one instead, before launchd starts the audio server */
+	struct stat bt_st;
+
+	if (!flash_root_mode && stat(in_image("/hal/BTAudioHALPlugin.driver"), &bt_st) == 0) {
+		check(bind_dir(in_image("/hal"), "/System/Library/Audio/Plug-Ins/HAL"), "our audio devices + Bluetooth's");
+	}
 	run_rc(in_image("/etc/rc"));
 	printf("\n=== init: done ===\n");
 	reboot(RB_HALT);

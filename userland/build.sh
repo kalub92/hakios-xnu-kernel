@@ -583,6 +583,15 @@ for f in extensions.plist extensions.plist.sig; do
 	[ -f $IOS/rootfs/System/Library/xpc/$f ] && cp $IOS/rootfs/System/Library/xpc/$f root/xpc/
 done
 [ -d root/lib/RedwoodAudio.driver ] && ln -s /redwood/lib/RedwoodAudio.driver root/hal/RedwoodAudio.driver
+# BT=1: Apple's Bluetooth audio plug-in (iOS 16.5, not in the system image; ../ios-extra, docs/bluetooth-audio.md B1)
+# next to ours; init.c binds this directory over the audio server's plug-in directory on a boot from the system image
+if [ -n "$BT" ] && [ -d ../../ios-extra/BTAudioHALPlugin.driver ]; then
+	cp -R ../../ios-extra/BTAudioHALPlugin.driver root/lib/
+	# the boot partition is full: leave out some test tools nothing in rc.jobs runs
+	rm -f root/bin/camera_avtest root/bin/apfs_mmap_test root/bin/metal_test root/bin/pvr_vk_test root/bin/pvr_gl_test
+	find root/lib/BTAudioHALPlugin.driver -name "*.lproj" -empty -exec rmdir {} +   # 50 empty language directories: the boot partition is full
+	ln -s /redwood/lib/BTAudioHALPlugin.driver root/hal/BTAudioHALPlugin.driver
+fi
 # the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/
 # as it is, which the kernel's drivers use where it lies in memory (bsd/dev/redwood_image.c)
 python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -1
