@@ -57,6 +57,7 @@ extern void redwood_r1_stop(void);               /* bsd/dev/redwood_cpufreq.c: w
 extern void redwood_r1_dram_restore(void);       /* bsd/dev/redwood_cpufreq.c: r1_dram= taken back (an MMIO write) */
 extern void redwood_r1_gpu_restore(void);        /* bsd/dev/redwood_pvr.c: r1_gpu='s VCORE vote taken back (an MMIO write) */
 extern void redwood_haptic_quiesce(void);
+extern void redwood_mtkaudio_quiesce(void);
 extern void redwood_md_quiesce(void);          /* bsd/dev/redwood_md.c: MD1 off again, if r1_md=2 left it on */
 extern void redwood_md_stop_request(void);      /* bsd/dev/redwood_md.c (r1_md=10/11): the modem service's orderly end begins, does not wait */
 extern void redwood_md_stop_wait(void);         /* ... and is waited for (what is left of 8 s from the request) */
@@ -397,6 +398,7 @@ loader_return(void)
 	redwood_r1_gpu_restore();
 	redwood_md_quiesce();           /* the modem's MD1 domain off again, if r1_md=2 powered it */
 	redwood_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
+	redwood_mtkaudio_quiesce();     /* the microphone's bias off, if the microphone was up (mtkmic=) */
 	redwood_torch_quiesce();        /* the flashlight off, if it was lit */
 	redwood_camera_quiesce();       /* the camera powered down, if it was powered up */
 	redwood_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */

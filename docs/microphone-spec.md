@@ -645,6 +645,18 @@ The code is checked out read-only at `$SCRATCH/open-mapple/`, and docs/open-mapp
 
 ---------------------------------------------------------------------------------------------------------------
 
+## Device results (2026-11-18): value tags updated (details: HANDOFF-2026-11-17-night.md, "Microphone")
+
+- **G to T:** ACC/DCC: the r1's Android records in **DCC** (`Audio_MIC1/2_Mode_Select` DCCMODE during capture), PGA **18 dB** (index 3), preamp inputs IN_ADC1/IN_ADC3 both live (tone +60 dB on L and R in logs/mic_dual.wav). The default is now `mtkmic_mode=1`.
+- **DCC order (T, logs/mic.trace):** DCC clock 0x2146 = 0x402, 0x400, 0x401 (no 0x2148 write); bias 0x2198 = 0x21; AUDENC_ANA_CON0/1 = 0x302 (gain + DCCEN) for both; then per channel precharge (0x306), input+PGA (0x347 / 0x3c7), ADC on (0x5347 / 0x53c7), precharge off (0x5343 / 0x53c3). This replaces the section 2b DCC list.
+- **top_con0 "both": 0x0000 (T)**, not 0x8000: Android writes 0 when the speaker starts under a running capture, and 0x0040 after the speaker stops. Uplink alone 0x8040 is T.
+- **AFE uplink (T):** A2, A11, A14..A22, A24..A29 all seen in the trace as in section 2c; DAC_CON1 0xa000a. Android's VUL buffer is 0x11221000..0x11224fff; our 0x11225000..0x11228fff (G) also **works** (self-test T1 pass, unknown 6 resolved). Word layout L = low half: verified (T1/T2 pass on both channels without `mtkmic_swap`).
+- **Link (T2 pass):** pins 140/141 are **not** needed (already function 1 at boot anyway), no MTKAIF calibration needed (unknowns 5, 7, 8 resolved).
+- **Thresholds:** T1/T2 peak 500 and T4 10 dB / peak 1000 held on the first run (T4: +37 dB L, +30 dB R). The iOS-path test (8b) needed `mtkmic_settle_ms=800` (now the default): with 100 the file's first seconds carry the start-up transient. 8b result: 92% coverage, file peak 4693, +14 dB.
+- **Not done:** E5/E6 (no debugfs on this Android build; `su` is not needed, adb is root), the AIN1 repeat of E4, speech through the microphone.
+
+---------------------------------------------------------------------------------------------------------------
+
 ## Open unknowns (10)
 
 1. Which AIN the microphones are physically on. The stock config says AIN0 is the main mic and AIN2 the reference (R1), but the board is not verified. E4 or T4 settles it.

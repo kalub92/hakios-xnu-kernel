@@ -88,19 +88,24 @@
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
+#include <kern/kalloc.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <miscfs/devfs/devfs.h>
 #include <pexpert/pexpert.h>
+#include <sys/conf.h>
 #include <sys/proc.h>
 #include <sys/redwood_audio.h>
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 
 /* the blocks a step of a table can be in */
-enum { B_AFE, B_INFRA, B_TOP, B_GPIO, B_MAPPED, B_PMIC = B_MAPPED, B_AMP };
+enum { B_AFE, B_INFRA, B_TOP, B_GPIO, B_MAPPED, B_PMIC = B_MAPPED, B_AMP, B_TOPCON };
+/* B_TOPCON is no block: the step is the codec's AUDIO_TOP_CON0, whose value top_con0() works out from who is using the codec */
 
 static const struct {
 	uint32_t phys, size;
@@ -159,6 +164,20 @@ static vm_offset_t block[B_MAPPED];
 #define AFE_AUD_PAD_TOP_CFG     0xe40
 #define AUDIO_TOP_CON1          0x004
 #define AFE_ADDA_TOP_CON0       0x120
+/* the uplink's (mt6765/mtk-auddrv-afe.h) */
+#define AFE_VUL_BASE            0x080
+#define AFE_VUL_END             0x088
+#define AFE_VUL_CUR             0x08c
+#define AFE_ADDA_UL_SRC_CON0    0x114
+#define AFE_ADDA_UL_SRC_CON1    0x118
+#define AFE_ADDA_UL_SRC_MON0    0x148
+#define AFE_ADDA_UL_SRC_MON1    0x14c
+#define AFE_ADDA_IIR_COEF_02_01 0x290           /* to _10_09, 0x2a0 */
+#define AFE_CONN9               0x440
+#define AFE_CONN10              0x444
+#define AFE_ADDA_MTKAIF_RX_CFG0 0xe20
+#define AFE_ADDA_MTKAIF_RX_CFG1 0xe24
+#define AFE_ADDA_MTKAIF_RX_CFG2 0xe28
 
 /* the MT6357 (include/linux/mfd/mt6357/registers.h; the legacy names in codec/mt6357/mtk-auddrv-ana.h) */
 #define PMIC_SMT_CON1           0x002c
@@ -204,6 +223,21 @@ static vm_offset_t block[B_MAPPED];
 #define PMIC_AUDDEC_ANA_CON13   0x2222
 #define PMIC_ZCD_CON0           0x2288
 #define PMIC_ZCD_CON1           0x228a
+/* the uplink's (codec/mt6357/mtk-auddrv-ana.h, include/linux/mfd/mt6357/registers.h) */
+#define PMIC_GPIO_DIR0          0x0088
+#define PMIC_GPIO_MODE3         0x00bc
+#define PMIC_GPIO_MODE3_SET     0x00be
+#define PMIC_GPIO_MODE3_CLR     0x00c0
+#define PMIC_AFE_UL_SRC_CON0_H  0x210c
+#define PMIC_AFE_UL_SRC_CON0_L  0x210e
+#define PMIC_AFE_DCCLK_CFG0     0x2146
+#define PMIC_AFE_DCCLK_CFG1     0x2148
+#define PMIC_AUDENC_ANA_CON0    0x2188
+#define PMIC_AUDENC_ANA_CON1    0x218a
+#define PMIC_AUDENC_ANA_CON3    0x218e
+#define PMIC_AUDENC_ANA_CON8    0x2198
+#define PMIC_AUDENC_ANA_CON9    0x219a
+#define PMIC_AUDENC_ANA_CON10   0x219c
 
 /*
  * One write of a replay. With a mask, only those bits of the register are given `value`'s (read,
@@ -214,8 +248,20 @@ struct step {
 	uint16_t reg;
 	uint32_t value, mask;
 	uint16_t wait_us;
+	uint8_t  shared;        /* USE_* bits: left out while any of these paths is still running (see `users') */
 };
 #define COUNT(t)                (sizeof(t) / sizeof((t)[0]))
+#define USE_DL                  1u              /* the speaker (downlink) is up */
+#define USE_UL                  2u              /* the microphone (uplink) is up */
+#define USE_BOTH                (USE_DL | USE_UL)
+
+/*
+ * Who has the codec and the AFE up. Only the one thread (mtkaudio_thread) changes it, in the order
+ * "own bit set before an up, cleared before a down", so a step marked `shared' is left out of a down
+ * (or, for the uplink's common parts, of an up) while the other path still needs what it does.
+ * Read by redwood_mtkaudio_quiesce() on a way out where nothing may wait.
+ */
+static volatile uint32_t users;
 
 /*
  * AudDrv_Clk_On (mt6765/mtk-auddrv-clk.c), as traced at 158.580197: the AFE's bus clock, the gates
@@ -310,7 +356,7 @@ static const struct step codec_dac_on[] = {
 	{ B_PMIC, PMIC_AUDDEC_ANA_CON2, 0x0400, 0x0400, 0 },    /* hp_pull_down(true): traced 633 */
 	{ B_PMIC, PMIC_AUDENC_ANA_CON6, 1, 1, 0 },              /* ClsqEnable: traced a1 */
 	{ B_PMIC, PMIC_AUD_TOP_CKPDN_CON0, 0, 0x0066, 250 },    /* Topck_Enable: traced 0 */
-	{ B_PMIC, PMIC_AUDIO_TOP_CON0, 0x002b, 0, 250 },        /* whole: the source's mask (0xc4) would leave 0x3b of the 0xff before */
+	{ B_TOPCON, 0, 0, 0, 250 },                            /* top_con0(): 0x002b whole while only the speaker runs: the source's mask (0xc4) would leave 0x3b of the 0xff before */
 	{ B_PMIC, PMIC_AFUNC_AUD_CON2, 0x0006, 0, 0 },
 	{ B_PMIC, PMIC_AFUNC_AUD_CON0, 0xcba1, 0, 0 },
 	{ B_PMIC, PMIC_AFUNC_AUD_CON2, 0x0003, 0, 0 },
@@ -445,15 +491,15 @@ static const struct step dac_off[] = {
 	{ B_PMIC, PMIC_AFE_DL_SRC2_CON0_L, 0x0000, 0, 0 },      /* setDlMtkifSrc(false) */
 	{ B_PMIC, PMIC_AFUNC_AUD_CON2, 0x0000, 0, 0 },
 	{ B_PMIC, PMIC_AFUNC_AUD_CON0, 0xcba0, 0, 0 },
-	{ B_PMIC, PMIC_AFE_UL_DL_CON0, 0, 1, 0 },
-	{ B_PMIC, PMIC_AUDIO_TOP_CON0, 0x00ff, 0x00ff, 250 },
+	{ B_PMIC, PMIC_AFE_UL_DL_CON0, 0, 1, 0, USE_UL },
+	{ B_TOPCON, 0, 0, 0, 250 },
 	{ B_PMIC, PMIC_GPIO_MODE2_CLR, 0xffff, 0, 0 },          /* set_playback_gpio(false) */
 	{ B_PMIC, PMIC_SMT_CON1, 0, 0x0ff0, 0 },                /* traced f */
-	{ B_PMIC, PMIC_AUD_TOP_CKPDN_CON0, 0x0066, 0x0066, 0 }, /* Topck_Enable(false) */
-	{ B_PMIC, PMIC_AUDENC_ANA_CON6, 0, 1, 0 },              /* ClsqEnable(false): a0 */
+	{ B_PMIC, PMIC_AUD_TOP_CKPDN_CON0, 0x0066, 0x0066, 0, USE_UL }, /* Topck_Enable(false) */
+	{ B_PMIC, PMIC_AUDENC_ANA_CON6, 0, 1, 0, USE_UL },              /* ClsqEnable(false): a0 */
 	{ B_PMIC, PMIC_AUDDEC_ANA_CON2, 0, 0x0400, 0 },         /* hp_pull_down(false): 233 */
-	{ B_PMIC, PMIC_AUDDEC_ANA_CON11, 1u << 4, 1u << 4, 0 }, /* NvregEnable(false): 10 */
-	{ B_PMIC, PMIC_DCXO_CW14, 0, 0x2000, 0 },               /* audckbufEnable(false): 82b5 */
+	{ B_PMIC, PMIC_AUDDEC_ANA_CON11, 1u << 4, 1u << 4, 0, USE_UL }, /* NvregEnable(false): 10 */
+	{ B_PMIC, PMIC_DCXO_CW14, 0, 0x2000, 0, USE_UL },               /* audckbufEnable(false): 82b5 */
 };
 
 /* mtk_pcm_dl1_stop, as traced from 164.601345: the memory no longer read, the connections undone. */
@@ -473,21 +519,21 @@ static const struct step dl1_stop[] = {
 static const struct step dl1_close[] = {
 	{ B_AFE, AFE_ADDA_DL_SRC2_CON0, 0, 1, 0 },
 	{ B_AFE, AFE_I2S_CON1, 0, 1, 0 },
-	{ B_AFE, AFE_ADDA_UL_DL_CON0, 0, 1, 150 },
-	{ B_AFE, AFE_DAC_CON0, 0, 1, 0 },
+	{ B_AFE, AFE_ADDA_UL_DL_CON0, 0, 1, 150, USE_UL },
+	{ B_AFE, AFE_DAC_CON0, 0, 1, 0, USE_UL },
 };
 
 /* AudDrv_Clk_Off, as traced from 164.602855: AudDrv_Clk_On backwards, the AFE's interrupts cleared on the way. */
 static const struct step clocks_off[] = {
-	{ B_INFRA, 0xa4, 0x00000010, 0, 0 },            /* MODULE_SW_CG_2_SET: ifr_audio26m */
-	{ B_AFE, AFE_IRQ_MCU_CLR, 0xffff, 0, 0 },
-	{ B_AFE, AFE_IRQ_MCU_CLR, 0xffff, 0, 0 },
-	{ B_AFE, AUDIO_TOP_CON0, 1u << 2, 1u << 2, 0 },
-	{ B_AFE, AUDIO_TOP_CON0, 1u << 25, 1u << 25, 0 },
-	{ B_AFE, AUDIO_TOP_CON0, 1u << 26, 1u << 26, 0 },
-	{ B_TOP, 0x84, 0x00000080, 0, 0 },              /* CLK_CFG_4_SET */
-	{ B_TOP, 0x74, 0x80000000, 0, 0 },              /* CLK_CFG_3_SET */
-	{ B_INFRA, 0x88, 0x02000000, 0, 0 },            /* MODULE_SW_CG_1_SET */
+	{ B_INFRA, 0xa4, 0x00000010, 0, 0, USE_BOTH },            /* MODULE_SW_CG_2_SET: ifr_audio26m */
+	{ B_AFE, AFE_IRQ_MCU_CLR, 0xffff, 0, 0, USE_BOTH },
+	{ B_AFE, AFE_IRQ_MCU_CLR, 0xffff, 0, 0, USE_BOTH },
+	{ B_AFE, AUDIO_TOP_CON0, 1u << 2, 1u << 2, 0, USE_BOTH },
+	{ B_AFE, AUDIO_TOP_CON0, 1u << 25, 1u << 25, 0, USE_BOTH },
+	{ B_AFE, AUDIO_TOP_CON0, 1u << 26, 1u << 26, 0, USE_BOTH },
+	{ B_TOP, 0x84, 0x00000080, 0, 0, USE_BOTH },              /* CLK_CFG_4_SET */
+	{ B_TOP, 0x74, 0x80000000, 0, 0, USE_BOTH },              /* CLK_CFG_3_SET */
+	{ B_INFRA, 0x88, 0x02000000, 0, 0, USE_BOTH },            /* MODULE_SW_CG_1_SET */
 };
 
 /*
@@ -527,6 +573,130 @@ static const struct step pmic_sgen_off[] = {
 	{ B_PMIC, PMIC_AFE_SGEN_CFG0, 0x0000, 0, 0 },
 	{ B_PMIC, PMIC_AUDIO_TOP_CON0, 1u << 1, 1u << 1, 0 },
 	{ B_PMIC, PMIC_ZCD_CON1, 0x0000, 0x0f9f, 0 },           /* the gain back to Android's (traced: 0) */
+};
+
+/*
+ * ---- the microphone (boot-arg mtkmic=N): the uplink, VUL, of the same AFE and the same codec ----
+ *
+ * docs/microphone-spec.md has every value with where it comes from. Tags in the comments: V is from
+ * MediaTek's published driver of this generation (MiCode/Xiaomi_Kernel_OpenSource, dandelion-q-oss:
+ * mtk-soc-codec-6357.c TurnOnADcPowerACC/DCC, mtk-soc-pcm-capture.c, mtk-soc-afe-control.c,
+ * mt6765-sound.c, mtk-auddrv-afe.h, mtk-auddrv-gpio.c; Linux sound/soc/codecs/mt6357.c), R1 is from the
+ * r1's own stock firmware, G is a guess with a boot-arg (mtkmic_*) or a constant to tune without a build.
+ * The shape (one thread, up when the node is open and down when it closes, the codec's input before the
+ * AFE's, the uplink source off before the ADCs before the bias) follows Open Mapple's MT6781 port:
+ * xnu_kernel_mediatek_mt6781/osfmk/arm64/mt6781_afe.c (ul_start/ul_position/ul_stop) and
+ * xnu_kernel_mediatek_common/bsd/dev/mtk_audio.c (mic_codec_up/down, mic_poll), APSL, adapted.
+ */
+#define UL_BYTES                0x4000u         /* the uplink's buffer: 16 KB = 4096 stereo frames = 85 ms (G, as DL1) */
+#define UL_FRAMES               (UL_BYTES / 4)
+#define UL_SRAM_PHYS_DEFAULT    0x11225000u     /* G: the SRAM right after DL1's 16 KB (Open Mapple's UL_SRAM = AFE_SRAM + 0x4000); mtkmic_vul= */
+#define UL_SRAM_LAST            (SRAM_PHYS + 0x9000u)
+
+/* C1..C10, the codec's common parts first (C0, the rails, is code: rails_on()). Common parts are left out while the speaker is up. */
+static const struct step ul_codec_a[] = {
+	{ B_PMIC, PMIC_DCXO_CW14, 0x2000, 0x2000, 0, USE_DL },          /* C1 audckbufEnable (V, T) */
+	{ B_PMIC, PMIC_AUDDEC_ANA_CON11, 0, 0x0010, 0, USE_DL },        /* C2 NvregEnable (V, T) */
+	{ B_PMIC, PMIC_AUDENC_ANA_CON6, 1, 1, 0, USE_DL },              /* C3 ClsqEnable, the 26 MHz CLKSQ (V, T) */
+	{ B_PMIC, PMIC_GPIO_MODE3_CLR, 0xffff, 0, 0 },                  /* C4 set_capture_gpio(true) (V) */
+	{ B_PMIC, PMIC_GPIO_MODE3_SET, 0x0249, 0, 0 },                  /* C5 PMIC GPIO 12..15 = CLK_MISO, DAT_MISO0/1, SYNC_MISO (V) */
+	{ B_PMIC, PMIC_GPIO_MODE3, 0x0249, 0, 0 },                      /* C6 the vendor writes it too (V) */
+	{ B_PMIC, PMIC_AUDDEC_ANA_CON11, 0x0020, 0x0020, 0 },           /* C7 ADC CLKGEN on (V) */
+	{ B_PMIC, PMIC_AUDENC_ANA_CON3, 0x0000, 0, 0 },                 /* C8 ADC clock from CLKGEN, 13 MHz (V) */
+	{ B_PMIC, PMIC_AUDDEC_ANA_CON12, 0x0100, 0x2500, 0 },           /* C9 LCLDO_ENC on (V) */
+	{ B_PMIC, PMIC_AUDDEC_ANA_CON12, 0x2500, 0x2500, 0 },           /* C10 its remote sense; the speaker owns 0x1055 of this register (V) */
+};
+/* DCC only (mtkmic_mode=1, TurnOnADcPowerDCC), after C10: the DC calibration's clock */
+static const struct step ul_codec_dcc_clock[] = {
+	{ B_PMIC, PMIC_AFE_DCCLK_CFG0, 0x0402, 0, 0 },
+	{ B_PMIC, PMIC_AFE_DCCLK_CFG0, 0x0402, 0, 0 },
+	{ B_PMIC, PMIC_AFE_DCCLK_CFG0, 0x0400, 0, 0 },
+	{ B_PMIC, PMIC_AFE_DCCLK_CFG0, 0x0401, 0, 0 },
+};
+/* C18..C25, after the inputs (C11..C17, ul_codec_inputs()) */
+static const struct step ul_codec_b[] = {
+	{ B_PMIC, PMIC_AUD_TOP_CKPDN_CON0, 0, 0x0066, 250, USE_DL },    /* C18 Topck_Enable (V, T) */
+	{ B_TOPCON, 0, 0, 0, 0 },                                       /* C19 power on the clocks: 0x8040 alone, 0x8000 with the speaker (see top_con0) */
+	{ B_PMIC, PMIC_AFE_TOP_CON0, 0x0000, 0, 0 },                    /* C20 normal paths, no sine (V) */
+	{ B_PMIC, PMIC_AFE_UL_DL_CON0, 1, 1, 0 },                       /* C21 the codec's digital AFE on; common, the speaker sets it too (V) */
+	{ B_PMIC, PMIC_MTKAIF_CFG0, 0x0000, 0, 0 },                     /* C22 MTKAIF TX format, protocol 1 (V) */
+	{ B_PMIC, PMIC_AFE_AUD_PAD_TOP, 0x3100, 0xff00, 0 },            /* C23 aud_pad TX FIFOs on; the speaker owns the low byte (V: mainline AUD_PAD_TX_FIFO_NORMAL_PATH_ENABLE) */
+	{ B_PMIC, PMIC_AFE_UL_SRC_CON0_H, 0x0000, 0, 0 },               /* C24 not DMIC (V) */
+	{ B_PMIC, PMIC_AFE_UL_SRC_CON0_L, 0x0001, 0, 0 },               /* C25 UL SRC on (V) */
+};
+
+/* The codec's uplink power-down (TurnOnADcPowerACC(false), V): the uplink source off before the ADCs, the ADCs before the bias. */
+static const struct step ul_codec_off_a[] = {
+	{ B_PMIC, PMIC_AFE_UL_SRC_CON0_L, 0, 1, 0 },
+	{ B_PMIC, PMIC_AFE_AUD_PAD_TOP, 0x3000, 0xff00, 0 },
+	{ B_PMIC, PMIC_AFE_UL_DL_CON0, 0, 1, 0, USE_DL },               /* only if the speaker is down */
+	{ B_TOPCON, 0, 0, 0, 0 },                                       /* computed with the microphone already gone from `users' */
+};
+static const struct step ul_codec_off_b[] = {
+	{ B_PMIC, PMIC_AUDENC_ANA_CON0, 0, 0xf000, 0 },
+	{ B_PMIC, PMIC_AUDENC_ANA_CON0, 0, 0x0fff, 0 },
+	{ B_PMIC, PMIC_AUDENC_ANA_CON1, 0, 0xf000, 0 },
+	{ B_PMIC, PMIC_AUDENC_ANA_CON1, 0, 0x0fff, 0 },
+	{ B_PMIC, PMIC_AUDENC_ANA_CON8, 0x0000, 0, 0 },                 /* MICBIAS0 off */
+	{ B_PMIC, PMIC_AUDENC_ANA_CON9, 0, 1, 0 },                      /* MICBIAS1 off (only on for AIN1, harmless otherwise) */
+	{ B_PMIC, PMIC_AUDDEC_ANA_CON12, 0x0100, 0x2500, 0 },
+	{ B_PMIC, PMIC_AUDDEC_ANA_CON12, 0, 0x2500, 0 },
+	{ B_PMIC, PMIC_AUDENC_ANA_CON3, 0, 0, 0 },
+	{ B_PMIC, PMIC_AUDDEC_ANA_CON11, 0, 0x0020, 0 },
+	{ B_PMIC, PMIC_GPIO_MODE3_CLR, 0xffff, 0, 0 },                  /* set_capture_gpio(false) */
+	{ B_PMIC, PMIC_GPIO_MODE3, 0x0000, 0, 0 },
+	{ B_PMIC, PMIC_GPIO_DIR0, 0, 0xf000, 0 },
+	{ B_PMIC, PMIC_AUD_TOP_CKPDN_CON0, 0x0066, 0x0066, 0, USE_DL }, /* the common parts, only if the speaker is down */
+	{ B_PMIC, PMIC_AUDENC_ANA_CON6, 0, 1, 0, USE_DL },
+	{ B_PMIC, PMIC_AUDDEC_ANA_CON11, 1u << 4, 1u << 4, 0, USE_DL },
+	{ B_PMIC, PMIC_DCXO_CW14, 0, 0x2000, 0, USE_DL },
+};
+
+/*
+ * The AFE's side, A1..A22 (mtk_capture_pcm_open/hw_params/prepare, set_adc_in, set_adc_enable; V). The
+ * buffer's address and end (A4, A5) and the clearing of it (A6) are code (ul_afe_on()).
+ */
+static const struct step ul_afe_a[] = {
+	{ B_AFE, AUDIO_TOP_CON0, 0, 1u << 24, 0 },                      /* A1 AudDrv_ADC_Clk_On: the aud_adc gate */
+	{ B_AFE, AFE_MEMIF_HDALIGN, 0x7fff0000, 0x7fff0000, 0 },        /* A2 set_sram_mode normal, as DL1 (T) */
+	{ B_AFE, AFE_MEMIF_MSB, 0, 1u << 29, 0 },                       /* A3 */
+	{ B_AFE, AFE_MEMIF_MSB, 0, 1u << 28, 0 },                       /* A7 SetMemIfFormatReg: 16 bits */
+	{ B_AFE, AFE_MEMIF_HDALIGN, 0, 1u << 5, 0 },                    /* A8 VUL isAlign = 0 */
+	{ B_AFE, AFE_MEMIF_HD_MODE, 0, 3u << 10, 0 },                   /* A9 VUL isHD = 0 */
+	{ B_AFE, AFE_CONN_24BIT, 0, 3u << 9, 0 },                       /* A10 O09/O10 are 16-bit */
+	{ B_AFE, AFE_AUD_PAD_TOP_CFG, 0x00000031, 0, 0 },               /* A11 set_chip_adc_in: aud_pad_top fifo on, after the GPIO and the PMIC's MISO clock */
+	{ B_AFE, AFE_ADDA_MTKAIF_CFG0, 0, 0, 0 },                       /* A12 reset MTKAIF_CFG0: no loopback, protocol 1 */
+	{ B_AFE, AFE_ADDA_TOP_CON0, 0, 1, 0 },                          /* A13 the internal ADC */
+	{ B_AFE, AFE_ADDA_IIR_COEF_02_01 + 0x0, 0x00000000, 0, 0 },     /* A14 the software IIR: a 35 Hz high-pass at 48 kHz (V; Open Mapple has the same) */
+	{ B_AFE, AFE_ADDA_IIR_COEF_02_01 + 0x4, 0x00003fb8, 0, 0 },     /* A15 */
+	{ B_AFE, AFE_ADDA_IIR_COEF_02_01 + 0x8, 0x3fb80000, 0, 0 },     /* A16 */
+	{ B_AFE, AFE_ADDA_IIR_COEF_02_01 + 0xc, 0x3fb80000, 0, 0 },     /* A17 */
+	{ B_AFE, AFE_ADDA_IIR_COEF_02_01 + 0x10, 0x0000c048, 0, 0 },    /* A18 */
+	{ B_AFE, AFE_ADDA_UL_SRC_CON0, 0x00060400, 0, 0 },              /* A19 48 kHz (bits 19:17 = 3), IIR on (bit 10), UL_IIR_SW (V; Open Mapple's UL_SRC_CON0_48K) */
+	{ B_AFE, AFE_ADDA_MTKAIF_RX_CFG0, 0, 1, 0 },                    /* A20 rxif data mode: analog mic */
+	{ B_AFE, AFE_ADDA_UL_DL_CON0, 1, 1, 0 },                        /* A21 SetADDAEnable; common, the speaker sets it too */
+	{ B_AFE, AFE_ADDA_UL_SRC_CON0, 1, 1, 0 },                       /* A22 UL SRC on: 0x00060401 */
+};
+/* A24..A29, after the pins */
+static const struct step ul_afe_b[] = {
+	{ B_AFE, AFE_CONN9, 1u << 3, 1u << 3, 0 },                      /* A24 I03 to O09 (SetAdcToVul) */
+	{ B_AFE, AFE_CONN10, 1u << 4, 1u << 4, 0 },                     /* A25 I04 to O10 */
+	{ B_AFE, AFE_DAC_CON1, 10u << 16, 0xfu << 16, 0 },              /* A26 VUL at 48 kHz (I2S_48K = 10) */
+	{ B_AFE, AFE_DAC_CON1, 0, 1u << 27, 0 },                        /* A27 VUL stereo */
+	{ B_AFE, AFE_DAC_CON0, 1u << 3, 1u << 3, 0 },                   /* A28 the VUL memory interface on */
+	{ B_AFE, AFE_DAC_CON0, 1, 1, 0 },                               /* A29 the AFE on; common */
+};
+/* The AFE's uplink power-down (mtk_capture_alsa_stop, pcm_close, set_adc_enable(false); V) */
+static const struct step ul_afe_off_a[] = {
+	{ B_AFE, AFE_DAC_CON0, 0, 1u << 3, 0 },
+	{ B_AFE, AFE_CONN9, 0, 1u << 3, 0 },
+	{ B_AFE, AFE_CONN10, 0, 1u << 4, 0 },
+	{ B_AFE, AFE_ADDA_UL_SRC_CON0, 0, 1, 0 },
+	{ B_AFE, AFE_ADDA_UL_DL_CON0, 0, 1, 150, USE_DL },              /* only if the speaker is down */
+	{ B_AFE, AUDIO_TOP_CON0, 1u << 24, 1u << 24, 0 },               /* the ADC clock gated */
+};
+static const struct step ul_afe_off_b[] = {
+	{ B_AFE, AFE_DAC_CON0, 0, 1, 0, USE_DL },                       /* only if the speaker is down */
 };
 
 static inline uint32_t
@@ -769,7 +939,32 @@ amp_read(uint8_t reg, uint8_t *value)
 	return ok;
 }
 
-static const char *const block_name[] = { "AFE", "infracfg", "topckgen", "GPIO", "PMIC", "amplifier" };
+static const char *const block_name[] = { "AFE", "infracfg", "topckgen", "GPIO", "PMIC", "amplifier", "PMIC" };
+
+/*
+ * The codec's AUDIO_TOP_CON0, the one register the speaker and the microphone fight over (the speaker's
+ * 0x2b sets PDN_ADC and would silence a running microphone). Worked out after the change, from `users':
+ *   neither  0x00ff, in its low byte only (as the speaker's power-down always wrote it)
+ *   speaker  0x002b, whole (T: as traced)
+ *   mic      0x8040, the vendor's 0x8000 / 0xdfbf applied to the idle 0x00ff (V)
+ *   both     mic_top_both, 0x0000 (T: logs/mic.trace, Android writes 0 when the speaker starts under a recording; mtkmic_top_both=)
+ */
+static uint32_t mic_top_both = 0x0000;
+
+static bool
+top_con0(void)
+{
+	switch (users & USE_BOTH) {
+	case USE_DL:
+		return pmic_set(PMIC_AUDIO_TOP_CON0, 0x002b, 0);
+	case USE_UL:
+		return pmic_set(PMIC_AUDIO_TOP_CON0, 0x8040, 0);
+	case USE_BOTH:
+		return pmic_set(PMIC_AUDIO_TOP_CON0, mic_top_both, 0);
+	default:
+		return pmic_set(PMIC_AUDIO_TOP_CON0, 0x00ff, 0x00ff);
+	}
+}
 
 /* One table, in order. Says what it is about to do; false at the first write the PMIC or the amplifier does not take. */
 static bool
@@ -780,7 +975,12 @@ run(const char *what, const struct step *table, unsigned count)
 		const struct step *s = &table[i];
 		bool ok = true;
 
-		if (s->block == B_PMIC) {
+		if (s->shared & users) {
+			continue;       /* the other path still uses it */
+		}
+		if (s->block == B_TOPCON) {
+			ok = top_con0();
+		} else if (s->block == B_PMIC) {
 			ok = pmic_set(s->reg, s->value, s->mask);
 		} else if (s->block == B_AMP) {
 			ok = amp_write((uint8_t)s->reg, (uint8_t)s->value);
@@ -1082,7 +1282,8 @@ mtkaudio_sink(const int16_t *frames, uint32_t count)
 	return taken;
 }
 
-static bool afe_up;                             /* the AFE's clocks run: its registers may be touched */
+static bool afe_up;                             /* the AFE's clocks run (for either path): its registers may be touched */
+static bool dl_afe;                             /* the speaker's part of the AFE is up: power_down() undoes it */
 static uint32_t sgen_gain = 20;                 /* mtkaudio_sgen_gain: DL_GAIN_N_12DB */
 
 /* Everything off, in the order Android went off: the AFE, then the codec and the amplifier. Safe on what is half up. */
@@ -1091,20 +1292,31 @@ power_down(void)
 {
 	bool ok;
 
-	if (afe_up) {
+	users &= ~USE_DL;       /* before anything is done: the shared steps look at what is left */
+	if (dl_afe) {
+		bool mic_runs = (users & USE_UL) != 0;
+
 		run("down 1/6: the AFE's memory interface and connections, mtk_pcm_dl1_stop", dl1_stop, COUNT(dl1_stop));
 		run("down 2/6: the AFE's DAC interface and the AFE, mtk_soc_pcm_dl1_close", dl1_close, COUNT(dl1_close));
-		for (int i = 0; i < 1000 && (rd(B_AFE, AFE_DAC_MON) & 1); i++) {       /* at most 0.1 s; the source waits a second */
+		for (int i = 0; !mic_runs && i < 1000 && (rd(B_AFE, AFE_DAC_MON) & 1); i++) {  /* at most 0.1 s; the source waits a second */
 			delay(100);
 		}
 		for (unsigned i = 0; i < sizeof(link_pins); i++) {
+			if (i == 0 && mic_runs) {
+				continue;       /* pin 136 is the microphone's clock too: it restores it */
+			}
 			pin_set_mode(link_pins[i], link_before[i]);
 		}
 		printf("mtkaudio: the AFE %s (AFE_DAC_MON %#x); pins %u/%u/%u back to function %u/%u/%u\n",
 		    (rd(B_AFE, AFE_DAC_MON) & 1) ? "has NOT stopped" : "has stopped", rd(B_AFE, AFE_DAC_MON), link_pins[0],
 		    link_pins[1], link_pins[2], link_before[0], link_before[1], link_before[2]);
-		run("down 3/6: the clocks and gates, AudDrv_Clk_Off", clocks_off, COUNT(clocks_off));
-		afe_up = false;
+		if (!mic_runs) {
+			run("down 3/6: the clocks and gates, AudDrv_Clk_Off", clocks_off, COUNT(clocks_off));
+			afe_up = false;
+		} else {
+			printf("mtkaudio: down 3/6: the clocks and gates stay up: the microphone is recording\n");
+		}
+		dl_afe = false;
 	}
 	ok = run("down 4/6: the codec's line output and DAC, Speaker_Amp_Change(false)", codec_off, COUNT(codec_off));
 	ok = run("down 5/6: the amplifier", amp_off, COUNT(amp_off)) && ok;
@@ -1112,14 +1324,10 @@ power_down(void)
 	printf("mtkaudio: powered down%s\n", ok ? "" : " (not every write to the PMIC or the amplifier was taken)");
 }
 
-/* The codec and the amplifier: all of `tinymix Speaker_Amp_Switch On`. Nothing of the AFE is touched. */
-static bool
-power_up_analog(void)
+/* The rails (also the microphone's, when the speaker is not up). Said as found, then switched on. */
+static void
+rails_on(void)
 {
-	uint32_t a = 0xdead, b = 0xdead, c = 0xdead, d = 0xdead;
-	uint8_t id = 0;
-	bool answers;
-
 	/*
 	 * The rails Android has on from its start and so never writes while a sound plays (its regulators
 	 * say "enabled" for each): VAUD28, the codec's analog supply, VAUX18, VIO28 and VLDO28. Bit 0 of each
@@ -1141,6 +1349,18 @@ power_up_analog(void)
 		}
 		delay(2000);
 	}
+}
+
+/* The codec and the amplifier: all of `tinymix Speaker_Amp_Switch On`. Nothing of the AFE is touched. */
+static bool
+power_up_analog(void)
+{
+	uint32_t a = 0xdead, b = 0xdead, c = 0xdead, d = 0xdead;
+	uint8_t id = 0;
+	bool answers;
+
+	users |= USE_DL;
+	rails_on();
 	if (!run("up 1/7: the codec's clocks and its DAC's digital side, TurnOnDacPower", codec_dac_on, COUNT(codec_dac_on)) ||
 	    !run_probe("the codec", codec_probe, COUNT(codec_probe), 0) ||
 	    !run("up 2/7: the codec's charge pump, line output and DAC, the rest of Speaker_Amp_Change(true)", codec_spk_on,
@@ -1176,12 +1396,15 @@ power_up_afe(void)
 {
 	uint32_t before, after;
 
-	afe_up = true;
-	run("up 4/7: the clocks and gates, AudDrv_Clk_On", clocks_on, COUNT(clocks_on));
-	run_probe("the AFE", afe_probe, COUNT(afe_probe), 16);
-	printf("mtkaudio: AUDIO_TOP_CON0 %#x (0xa0fd4078 in the capture); gates: infracfg %#x/%#x, topckgen %#x/%#x\n",
-	    rd(B_AFE, AUDIO_TOP_CON0), rd(B_INFRA, INFRA_CG1_STA), rd(B_INFRA, INFRA_CG2_STA), rd(B_TOP, TOP_CLK_CFG_3),
-	    rd(B_TOP, TOP_CLK_CFG_4));
+	dl_afe = true;
+	if (!afe_up) {          /* (the microphone may have brought the AFE's clocks up already) */
+		afe_up = true;
+		run("up 4/7: the clocks and gates, AudDrv_Clk_On", clocks_on, COUNT(clocks_on));
+		run_probe("the AFE", afe_probe, COUNT(afe_probe), 16);
+		printf("mtkaudio: AUDIO_TOP_CON0 %#x (0xa0fd4078 in the capture); gates: infracfg %#x/%#x, topckgen %#x/%#x\n",
+		    rd(B_AFE, AUDIO_TOP_CON0), rd(B_INFRA, INFRA_CG1_STA), rd(B_INFRA, INFRA_CG2_STA), rd(B_TOP, TOP_CLK_CFG_3),
+		    rd(B_TOP, TOP_CLK_CFG_4));
+	}
 
 	run("up 5/7: the sample memory and where the buffer is, mtk_pcm_dl1_params", dl1_params, COUNT(dl1_params));
 	for (uint32_t i = 0; i < DL1_FRAMES; i++) {
@@ -1195,7 +1418,9 @@ power_up_afe(void)
 
 	run("up 6/7: the formats, the DAC interface at 48 kHz, the AFE on, mtk_pcm_prepare", dl1_prepare, COUNT(dl1_prepare));
 	for (unsigned i = 0; i < sizeof(link_pins); i++) {
-		link_before[i] = (uint8_t)pin_mode(link_pins[i]);
+		if (!(i == 0 && (users & USE_UL))) {    /* (pin 136: the microphone has saved what it had) */
+			link_before[i] = (uint8_t)pin_mode(link_pins[i]);
+		}
 		pin_set_mode(link_pins[i], LINK_FUNCTION);
 	}
 	printf("mtkaudio: pins %u/%u/%u (the link to the PMIC) had function %u/%u/%u, now %u; pin 137 (its frame sync, AUD_SYNC_MOSI: "
@@ -1211,6 +1436,497 @@ power_up_afe(void)
 	    rd(B_AFE, AFE_DAC_CON0), rd(B_AFE, AFE_DAC_CON1), before, after,
 	    before == after ? "IT DOES NOT MOVE: no clock reaches the memory interface, nothing will play" : "it reads (480 frames, "
 	    "0x780, are 10 ms)");
+}
+
+/* ---- the microphone: boot-args, the power sequences, the polling, /dev/redwood-mic, the self-test ---- */
+
+static uint32_t mic_level;                      /* mtkmic */
+static uint32_t mic_ch;                         /* mtkmic_ch: 0 = L (AIN0), 1 = R (AIN2): what iOS gets */
+static uint32_t mic_in_l = 1, mic_in_r = 3;     /* mtkmic_in_l/_r: preamp inputs, 1 = AIN0, 2 = AIN1 (and MICBIAS1), 3 = AIN2 */
+static uint32_t mic_gain = 3;                   /* mtkmic_gain: PGA index, 6 dB steps (V: the driver's default 3 = 18 dB; Open Mapple records at 2) */
+static uint32_t mic_mode = 1;                   /* mtkmic_mode: 0 ACC, 1 DCC (T: the r1's Android records in DCC, logs/mic.trace) */
+static uint32_t mic_bias = 2;                   /* mtkmic_bias: MICBIAS0's VREF, bits 6:4 (2 = 1.9 V) */
+static uint32_t mic_shift;                      /* mtkmic_shift: the kernel's digital gain, a saturating left shift */
+static uint32_t mic_settle_ms = 800;            /* mtkmic_settle_ms: dropped after power-up (T: the DCC/IIR transient lasts ~0.7 s; 100 left a +14 dB start in the file) */
+static uint32_t mic_vul = UL_SRAM_PHYS_DEFAULT; /* mtkmic_vul: G, where the uplink's buffer is in the AFE's SRAM */
+static uint32_t mic_swap;                       /* mtkmic_swap=1: G, the left sample is in the HIGH half of a word (test T1 says) */
+static uint32_t mic_pins140;                    /* mtkmic_pins140=1: G, pins 140 and 141 (CLK_MISO, SYNC_MISO) also function 1 (E5, T2 say) */
+static uint32_t mic_dcc_off = 0x2061;           /* mtkmic_dcc_off: G, AFE_DCCLK_CFG0 when DCC is left */
+static uint32_t mic_t12_peak = 500;             /* mtkmic_t12_peak: G, T1 and T2 pass with at least this peak on both channels */
+static uint32_t mic_t4_db = 10;                 /* mtkmic_t4_db: G, T4 passes with the tone this many dB over the quiet before it, */
+static uint32_t mic_t4_peak = 1000;             /* mtkmic_t4_peak: G, and at least this peak */
+static uint32_t mic_t4_tone = 8000;             /* mtkmic_t4_tone: the tone's peak in T4, of 32767 (at most 8000) */
+static uint32_t mic_t5;                         /* mtkmic_t5=1: also run T4 again with AIN1 and MICBIAS1 on the left channel */
+static uint32_t mic_t4_gap = 150;               /* G: ms of the tone before T4 measures it (the air and the microphone's delay) */
+
+static volatile uint32_t *vul;                  /* the uplink's buffer, a frame a word */
+static const uint8_t ul_pins[] = { 142, 143, 140, 141 };        /* the first two: R1 (dtbo, aud_dat_miso_on); the others: mtkmic_pins140 */
+static uint8_t ul_before[sizeof(ul_pins)];
+static bool ul_afe_begun, ul_codec_begun;       /* what mic_down() has to undo */
+static bool mic_on;                             /* the path is up and being read */
+static bool mic_failed;                         /* three failures: off for the rest of the run */
+static bool mic_selftest;                       /* the self-test owns the path: mic_poll() leaves the power alone */
+static uint32_t mic_failures;
+static uint64_t mic_retry_at;                   /* mach time: not before */
+static uint32_t mic_rd;                         /* byte offset in the buffer read so far */
+static uint32_t mic_settle_left;                /* frames still to drop */
+static uint32_t mic_bad;                        /* pointers outside the buffer */
+static volatile uint32_t ios_wants;             /* /dev/redwood-mic is open */
+static char mic_summary[200];                   /* the self-test's result, said again by the quiesce */
+
+struct mic_stats {
+	uint32_t frames, peak[2];
+	int64_t sum[2];
+	uint64_t sq[2];
+};
+static struct mic_stats mic_win, mic_sec;       /* the self-test's window; the log's second */
+static uint32_t mic_seconds;
+static uint64_t mic_sec_start;                  /* ms */
+
+static void
+st_add(struct mic_stats *st, int32_t l, int32_t r)
+{
+	int32_t v[2] = { l, r };
+
+	for (int c = 0; c < 2; c++) {
+		uint32_t a = (uint32_t)(v[c] < 0 ? -v[c] : v[c]);
+
+		st->peak[c] = a > st->peak[c] ? a : st->peak[c];
+		st->sum[c] += v[c];
+		st->sq[c] += (uint64_t)((int64_t)v[c] * v[c]);
+	}
+	st->frames++;
+}
+
+/* 20 log10(rms / 32768) in tenths of a dB, by halvings (6.02 dB each, near enough to tell loud from quiet); -999 for silence */
+static int
+st_db10(const struct mic_stats *st, int c)
+{
+	uint64_t mean_square = st->frames ? st->sq[c] / st->frames : 0;
+	uint32_t rms = 0, r;
+	int tenths = 0;
+
+	for (uint32_t bit = 1u << 15; bit != 0; bit >>= 1) {
+		if ((uint64_t)(rms | bit) * (rms | bit) <= mean_square) {
+			rms |= bit;
+		}
+	}
+	if (rms == 0) {
+		return -999;
+	}
+	for (r = rms; r < 16384; r *= 2) {
+		tenths -= 60;
+	}
+	return tenths - (int)((32768 - r) * 60 / 16384);
+}
+
+#define DB10(x)                 ((x) < 0 ? "-" : ""), ((x) < 0 ? -(x) : (x)) / 10, ((x) < 0 ? -(x) : (x)) % 10
+
+static void
+st_say(const char *what, const struct mic_stats *st)
+{
+	int l = st_db10(st, 0), r = st_db10(st, 1);
+
+	printf("mtkmic: %s: %u frames; L peak %u, %s%d.%d dBFS, mean %lld; R peak %u, %s%d.%d dBFS, mean %lld\n", what, st->frames,
+	    st->peak[0], DB10(l), st->frames ? st->sum[0] / (int64_t)st->frames : 0, st->peak[1], DB10(r),
+	    st->frames ? st->sum[1] / (int64_t)st->frames : 0);
+}
+
+/* ---- /dev/redwood-mic: copied from redwood_mic.c (the mic=4 block), names prefixed ---- */
+#define MIC_RING_FRAMES         16384           /* 341 ms; a power of two */
+#define MIC_RING_KEEP           1920            /* 40 ms: how far behind the microphone a reader is kept */
+#define MIC_RING_MOST           4800            /* 100 ms: more than this waiting, and the oldest is skipped */
+
+static int16_t *mic_ring;
+static volatile uint64_t mic_written;           /* frames put into the ring */
+static uint64_t mic_read_at;                    /* frames taken from it (one reader: the audio server) */
+static bool mic_primed;                         /* the reader is MIC_RING_KEEP behind; false after it ran dry */
+static uint64_t mic_skipped, mic_dry;
+
+static void
+mic_ring_put(const int16_t *samples, uint32_t count)
+{
+	uint64_t at = mic_written;
+
+	for (uint32_t i = 0; i < count; i++) {
+		mic_ring[(at + i) % MIC_RING_FRAMES] = samples[i];
+	}
+	__atomic_store_n(&mic_written, at + count, __ATOMIC_RELEASE);
+}
+
+static int
+mic_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	uint64_t written = __atomic_load_n(&mic_written, __ATOMIC_ACQUIRE), avail, want;
+	int error = 0;
+
+	if (mic_ring == NULL || uio_resid(uio) < 2) {
+		return 0;
+	}
+	want = (uint64_t)uio_resid(uio) / 2;
+	avail = written - mic_read_at;
+	if (avail > MIC_RING_MOST) {
+		mic_skipped += avail - MIC_RING_KEEP;
+		mic_read_at = written - MIC_RING_KEEP;
+		avail = MIC_RING_KEEP;
+	}
+	if (!mic_primed) {
+		if (avail < MIC_RING_KEEP) {
+			return 0;
+		}
+		mic_primed = true;
+	}
+	if (avail < want) {
+		mic_dry++;
+		mic_primed = false;
+	}
+	while (want > 0 && avail > 0 && error == 0) {
+		uint64_t at = mic_read_at % MIC_RING_FRAMES, n = want < avail ? want : avail;
+
+		n = n < MIC_RING_FRAMES - at ? n : MIC_RING_FRAMES - at;
+		error = uiomove((caddr_t)&mic_ring[at], (int)(n * 2), uio);
+		mic_read_at += n;
+		want -= n;
+		avail -= n;
+	}
+	return error;
+}
+
+static int
+mic_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	if (!ios_wants) {       /* a new recording: nothing of an earlier one, the reader 40 ms behind again */
+		mic_read_at = __atomic_load_n(&mic_written, __ATOMIC_ACQUIRE);
+		mic_primed = false;
+		mic_skipped = mic_dry = 0;
+	}
+	ios_wants = 1;
+	wakeup(&feed_wanted);   /* the thread's idle wait */
+	return 0;
+}
+
+/* (on the last close) */
+static int
+mic_dev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	ios_wants = 0;
+	return 0;
+}
+
+static const struct cdevsw mic_cdevsw = {
+	.d_open = mic_dev_open, .d_close = mic_dev_close, .d_read = mic_dev_read, .d_write = eno_rdwrt,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+static void
+mic_node_make(void)
+{
+	int major = cdevsw_add(-1, &mic_cdevsw);
+
+	mic_ring = kalloc_data(MIC_RING_FRAMES * sizeof(int16_t), Z_WAITOK | Z_ZERO);
+	if (mic_ring == NULL || major < 0 ||
+	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-mic") == NULL) {
+		printf("mtkmic: /dev/redwood-mic cannot be made\n");
+		return;
+	}
+	printf("mtkmic: /dev/redwood-mic is made: mono 16-bit 48 kHz, the %s channel (%s), up while it is open\n",
+	    mic_ch ? "right" : "left", mic_ch ? "AIN2" : "AIN0");
+}
+
+/* ---- the sequences ---- */
+
+/* The uplink's own sine into the VUL memory interface (set_chip_sine_gen_enable, outputs O09/O10; 1/32 of full scale): T1 */
+static const struct step ul_sgen_on[] = {
+	{ B_AFE, AFE_SGEN_CON0, 0x04ac2ac1, 0, 0 },
+	{ B_AFE, AFE_SGEN_CON0, 2u << 17, 7u << 17, 0 },
+	{ B_AFE, AFE_SGEN_CON0, 2u << 5, 7u << 5, 0 },
+	{ B_AFE, AFE_SGEN_CON2, 0x25, 0x3f, 0 },
+};
+static const struct step ul_sgen_off[] = {
+	{ B_AFE, AFE_SGEN_CON0, 0, 0, 0 },
+	{ B_AFE, AFE_SGEN_CON2, 0x3f, 0x3f, 0 },
+};
+/* The codec's uplink sine table (SineTable_UL2_Set; mainline "SGEN UL Enable" = AFE_TOP_CON0 bit 1): T2 */
+static const struct step ul_pmic_sgen_on[] = {
+	{ B_PMIC, PMIC_AFE_SGEN_CFG0, 0x0080, 0, 0 },
+	{ B_PMIC, PMIC_AFE_SGEN_CFG1, 0x0101, 0, 0 },
+	{ B_PMIC, PMIC_AFE_TOP_CON0, 2, 2, 0 },
+};
+static const struct step ul_pmic_sgen_off[] = {
+	{ B_PMIC, PMIC_AFE_TOP_CON0, 0, 2, 0 },
+	{ B_PMIC, PMIC_AFE_SGEN_CFG0, 0, 0, 0 },
+	{ B_PMIC, PMIC_AFE_SGEN_CFG1, 0x0101, 0, 0 },
+};
+
+/* C11..C17 and the DCC variant's extras: they depend on the boot-args, so they are built here */
+static bool
+ul_codec_inputs(void)
+{
+	struct step t[24];
+	unsigned n = 0;
+	bool dcc = mic_mode != 0, ain1 = mic_in_l == 2 || mic_in_r == 2;
+	uint32_t bias = mic_bias & 7, gain = mic_gain > 4 ? 4 : mic_gain;
+
+#define T(reg, value, mask) (t[n++] = (struct step){ B_PMIC, (reg), (value), (mask), 0, 0 })
+	T(PMIC_AUDENC_ANA_CON8, 0x0001 | bias << 4, 0);                 /* C11: MICBIAS0 on, VREF 1.9 V by default (T: 0x21) */
+	if (ain1) {
+		T(PMIC_AUDENC_ANA_CON9, 1, 1);                          /* C11b: MICBIAS1 */
+	}
+	/* T (logs/mic.trace, Android in DCC mode, 18 dB): gain and DCCEN for both, then per channel precharge, input and PGA, ADC, precharge off */
+	T(PMIC_AUDENC_ANA_CON0, gain << 8 | (dcc ? 2 : 0), dcc ? 0x0702 : 0x0700);     /* C12: SetMicPGAGain, L (0x302) */
+	T(PMIC_AUDENC_ANA_CON1, gain << 8 | (dcc ? 2 : 0), dcc ? 0x0702 : 0x0700);     /* C13: the same, R */
+	for (int c = 0; c < 2; c++) {
+		uint32_t con = c ? PMIC_AUDENC_ANA_CON1 : PMIC_AUDENC_ANA_CON0, sel = c ? mic_in_r : mic_in_l;
+
+		sel = sel < 1 ? 1 : sel > 3 ? 3 : sel;
+		if (dcc) {
+			T(con, 0x0004, 0x0004);                         /* the DC precharge (0x306) */
+			T(con, (sel << 6) | 0x01, 0x00c1);              /* C14/C16: the preamp's input and the PGA on (0x347, 0x3c7) */
+		} else {
+			T(con, (sel << 6) | 0x01, 0xf0ff);
+		}
+		T(con, 0x5000, 0xf000);                                 /* C15/C17: the ADC's input is the preamp, the ADC on (0x5347, 0x53c7) */
+		if (dcc) {
+			T(con, 0, 0x0004);                              /* the precharge off (0x5343, 0x53c3) */
+		}
+	}
+#undef T
+	return run("mic up: the inputs, the bias and the ADCs (C11..C17)", t, n);
+}
+
+static uint32_t
+ul_position(void)
+{
+	uint32_t cur = rd(B_AFE, AFE_VUL_CUR);
+
+	if (cur == 0) {
+		return 0;
+	}
+	if (cur < mic_vul || cur >= mic_vul + UL_BYTES) {
+		mic_bad++;
+		return mic_rd;
+	}
+	return (cur - mic_vul) & ~15u;  /* 16-byte steps, as Open Mapple's */
+}
+
+/* A0, A4..A6, A1..A22, the pins, A24..A29, A30 */
+static bool
+ul_afe_on(void)
+{
+	uint32_t before, after;
+
+	if (!afe_up) {          /* A0: the speaker's tables, if it is not up */
+		afe_up = true;
+		run("mic up: the clocks and gates, AudDrv_Clk_On", clocks_on, COUNT(clocks_on));
+		run_probe("the AFE", afe_probe, COUNT(afe_probe), 16);
+	}
+	ul_afe_begun = true;
+	wr(B_AFE, AFE_VUL_BASE, mic_vul);                       /* A4 */
+	wr(B_AFE, AFE_VUL_END, mic_vul + UL_BYTES - 1);         /* A5 */
+	for (uint32_t i = 0; i < UL_FRAMES; i++) {              /* A6 */
+		vul[i] = 0;
+	}
+	if (!run("mic up: the AFE's uplink, ADC clock, formats, IIR and source (A1..A22)", ul_afe_a, COUNT(ul_afe_a))) {
+		return false;
+	}
+	/* A23: AudDrv_GPIO_Request(true, ADDA_UL); pin 136 is the speaker's too */
+	if (!(users & USE_DL)) {
+		link_before[0] = (uint8_t)pin_mode(link_pins[0]);
+	}
+	pin_set_mode(link_pins[0], LINK_FUNCTION);
+	for (unsigned i = 0; i < (mic_pins140 ? sizeof(ul_pins) : 2); i++) {
+		ul_before[i] = (uint8_t)pin_mode(ul_pins[i]);
+		pin_set_mode(ul_pins[i], LINK_FUNCTION);
+	}
+	run("mic up: the connections, the rate, the memory interface started (A24..A29)", ul_afe_b, COUNT(ul_afe_b));
+	before = rd(B_AFE, AFE_VUL_CUR);
+	delay(10000);
+	after = rd(B_AFE, AFE_VUL_CUR);
+	mic_rd = ul_position();
+	printf("mtkmic: AFE_DAC_CON0 %#x, UL_SRC_CON0 %#x, pins %u/%u/%u/%u function %u/%u/%u/%u, AUDIO_TOP_CON0 %#x; the pointer went from %#x "
+	    "to %#x in 10 ms: %s\n", rd(B_AFE, AFE_DAC_CON0), rd(B_AFE, AFE_ADDA_UL_SRC_CON0), ul_pins[0], ul_pins[1], ul_pins[2],
+	    ul_pins[3], pin_mode(ul_pins[0]), pin_mode(ul_pins[1]), pin_mode(ul_pins[2]), pin_mode(ul_pins[3]),
+	    rd(B_AFE, AUDIO_TOP_CON0), before, after,
+	    before == after ? "IT DOES NOT MOVE: nothing will be heard" : "it writes (480 frames, 0x780 bytes, are 10 ms)");
+	return before != after;
+}
+
+/* The microphone up. With codec false only the AFE's side (T1). On false the caller must mic_down(). */
+static bool
+mic_up(bool codec)
+{
+	users |= USE_UL;
+	ul_afe_begun = ul_codec_begun = false;
+	if (codec) {
+		ul_codec_begun = true;
+		if (!(users & USE_DL)) {
+			rails_on();     /* C0 */
+		}
+		if (!run("mic up: the codec's common parts, ADC clocks, LCLDO (C1..C10)", ul_codec_a, COUNT(ul_codec_a)) ||
+		    (mic_mode && !run("mic up: DCC's clock", ul_codec_dcc_clock, COUNT(ul_codec_dcc_clock))) ||
+		    !ul_codec_inputs() ||
+		    !run("mic up: the clocks, the digital side and the uplink source (C18..C25)", ul_codec_b, COUNT(ul_codec_b))) {
+			return false;
+		}
+	}
+	if (!ul_afe_on()) {
+		return false;
+	}
+	mic_settle_left = mic_settle_ms * (REDWOOD_AUDIO_RATE / 1000);
+	return true;
+}
+
+/* The microphone down: the AFE first, then the codec, the uplink's bit gone from `users' before either. Safe on what is half up. */
+static void
+mic_down(void)
+{
+	bool dl = (users & USE_DL) != 0;
+
+	users &= ~USE_UL;
+	mic_on = false;
+	if (ul_afe_begun) {
+		run("mic down: the uplink's connections, source and ADC clock", ul_afe_off_a, COUNT(ul_afe_off_a));
+		for (unsigned i = 0; i < (mic_pins140 ? sizeof(ul_pins) : 2); i++) {
+			pin_set_mode(ul_pins[i], ul_before[i]);
+		}
+		if (!dl) {
+			pin_set_mode(link_pins[0], link_before[0]);
+		}
+		run("mic down: the AFE", ul_afe_off_b, COUNT(ul_afe_off_b));
+		if (!dl) {
+			for (int i = 0; i < 1000 && (rd(B_AFE, AFE_DAC_MON) & 1); i++) {
+				delay(100);
+			}
+			run("mic down: the clocks and gates, AudDrv_Clk_Off", clocks_off, COUNT(clocks_off));
+			afe_up = false;
+		}
+		ul_afe_begun = false;
+	}
+	if (ul_codec_begun) {
+		run("mic down: the uplink source, the PAD and the codec's top control", ul_codec_off_a, COUNT(ul_codec_off_a));
+		if (mic_mode) {         /* TurnOnADcPowerDCC(false): DCCEN, then the precharge */
+			pmic_set(PMIC_AUDENC_ANA_CON0, 0, 0x0002);
+			pmic_set(PMIC_AUDENC_ANA_CON1, 0, 0x0002);
+			pmic_set(PMIC_AUDENC_ANA_CON0, 0, 0x0004);
+			pmic_set(PMIC_AUDENC_ANA_CON1, 0, 0x0004);
+		}
+		run("mic down: the ADCs, then the bias, then the rest", ul_codec_off_b, COUNT(ul_codec_off_b));
+		if (mic_mode) {
+			pmic_set(PMIC_AFE_DCCLK_CFG0, mic_dcc_off, 0);
+		}
+		ul_codec_begun = false;
+	}
+}
+
+static void
+mic_second_say(void)
+{
+	int l = st_db10(&mic_sec, 0), r = st_db10(&mic_sec, 1);
+
+	mic_seconds++;
+	if (mic_seconds <= 3 || mic_seconds % 30 == 0) {
+		printf("mtkmic: second %u: %u frames; L peak %u, %s%d.%d dBFS, mean %lld; R peak %u, %s%d.%d dBFS, mean %lld; iOS gets %s; "
+		    "%u bad pointers\n", mic_seconds, mic_sec.frames, mic_sec.peak[0], DB10(l),
+		    mic_sec.frames ? mic_sec.sum[0] / (int64_t)mic_sec.frames : 0, mic_sec.peak[1], DB10(r),
+		    mic_sec.frames ? mic_sec.sum[1] / (int64_t)mic_sec.frames : 0, mic_ch ? "R" : "L", mic_bad);
+	}
+	memset(&mic_sec, 0, sizeof(mic_sec));
+}
+
+static void
+mic_route(const int16_t *mono, int16_t *stereo, uint32_t n, bool route)
+{
+	if (n == 0 || !route) {
+		return;
+	}
+	if (ios_wants && mic_ring != NULL) {
+		mic_ring_put(mono, n);
+	}
+	if (redwood_audio_recording_mic()) {
+		for (uint32_t j = 0; j < n; j++) {
+			stereo[2 * j] = stereo[2 * j + 1] = mono[j];
+		}
+		redwood_audio_record_fed(stereo, n);
+	}
+}
+
+/* The new frames of the buffer: into the statistics, and, with `route', into /dev/redwood-mic and the sound recording. */
+static void
+mic_read_words(bool route)
+{
+	uint32_t pos = ul_position(), frames = ((pos - mic_rd) % UL_BYTES) / 4, at = mic_rd / 4;
+	int16_t mono[240], stereo[480];
+	uint32_t n = 0;
+
+	for (uint32_t i = 0; i < frames; i++, at = (at + 1) % UL_FRAMES) {
+		uint32_t w = vul[at];
+		int32_t l = (int16_t)(w & 0xffff), r = (int16_t)(w >> 16), s;
+
+		if (mic_swap) {
+			int32_t t = l;
+
+			l = r;
+			r = t;
+		}
+		if (mic_settle_left != 0) {
+			mic_settle_left--;
+			continue;
+		}
+		st_add(&mic_win, l, r);
+		st_add(&mic_sec, l, r);
+		s = (mic_ch ? r : l) * (1 << (mic_shift > 4 ? 4 : mic_shift));
+		s = s > 32767 ? 32767 : s < -32768 ? -32768 : s;
+		mono[n++] = (int16_t)s;
+		if (n == 240) {
+			mic_route(mono, stereo, n, route);
+			n = 0;
+		}
+	}
+	mic_route(mono, stereo, n, route);
+	mic_rd = pos;
+}
+
+/* Called every 5 ms (every 20 ms while the path is down) from the one thread: up when the node is opened, down when it is closed. */
+static void
+mic_poll(void)
+{
+	bool want = ios_wants != 0;
+	uint64_t ns = 0;
+
+	if (mic_level < 2 || mic_selftest) {
+		return;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	if (want && !mic_on && !mic_failed && ns >= mic_retry_at) {
+		printf("mtkmic: iOS records: the microphone up (channel %s)\n", mic_ch ? "R" : "L");
+		mic_on = mic_up(true);
+		if (!mic_on) {
+			mic_down();
+			mic_retry_at = ns + 1000ull * NSEC_PER_MSEC;
+			if (++mic_failures >= 3) {
+				mic_failed = true;
+				printf("mtkmic: the power-up FAILED three times: the microphone stays off in this run\n");
+			} else {
+				printf("mtkmic: the power-up FAILED (%u of 3): tried again in a second\n", mic_failures);
+			}
+			return;
+		}
+		memset(&mic_sec, 0, sizeof(mic_sec));
+		mic_seconds = 0;
+		mic_sec_start = ns / NSEC_PER_MSEC;
+	} else if (!want && mic_on) {
+		mic_down();
+		printf("mtkmic: iOS stopped: the microphone is down; %llu frames skipped as too late, %llu reads found too little\n",
+		    mic_skipped, mic_dry);
+	}
+	if (mic_on) {
+		mic_read_words(true);
+		if (ns / NSEC_PER_MSEC - mic_sec_start >= 1000) {
+			mic_sec_start += 1000;
+			mic_second_say();
+		}
+	}
 }
 
 /*
@@ -1249,6 +1965,7 @@ feed_run(bool test)
 		if (done) {
 			break;
 		}
+		mic_poll();     /* (nothing, unless mtkmic>=2) */
 		delay_for_interval(POLL_MS, NSEC_PER_MSEC);
 	}
 	took = now_ms() - start;
@@ -1268,6 +1985,174 @@ feed_run(bool test)
 		printf("; %u frames of the tone NOT played in three seconds", lost);
 	}
 	printf("\n");
+}
+
+
+/* ---- mtkmic=3: the self-test (docs/microphone-spec.md, step 6) ---- */
+
+static void
+mic_win_look(uint32_t ms)
+{
+	memset(&mic_win, 0, sizeof(mic_win));
+	for (uint32_t t = 0; t < ms; t += POLL_MS) {
+		mic_read_words(false);
+		delay_for_interval(POLL_MS, NSEC_PER_MSEC);
+	}
+	mic_read_words(false);
+}
+
+/* wait out the settling (the bias, the pop) without measuring */
+static void
+mic_settle_wait(void)
+{
+	for (uint32_t t = 0; t < 3000 && mic_settle_left != 0; t += POLL_MS) {
+		mic_read_words(false);
+		delay_for_interval(POLL_MS, NSEC_PER_MSEC);
+	}
+}
+
+/* the speaker's feeder and the microphone's reader, together, for `ms` */
+static void
+mic_duet(uint32_t ms)
+{
+	for (uint32_t t = 0; t < ms; t += POLL_MS) {
+		lck_mtx_lock(&mtkaudio_lock);
+		dl1_feed();
+		lck_mtx_unlock(&mtkaudio_lock);
+		mic_read_words(false);
+		delay_for_interval(POLL_MS, NSEC_PER_MSEC);
+	}
+}
+
+static bool
+mic_both_loud(const struct mic_stats *st)
+{
+	return st->frames != 0 && st->peak[0] >= mic_t12_peak && st->peak[1] >= mic_t12_peak;
+}
+
+/* T4: the speaker plays the 440 Hz tone and the microphones should hear it. pass[0] = L, pass[1] = R. */
+static void
+mic_t4(const char *what, bool pass[2])
+{
+	struct mic_stats quiet;
+	uint32_t peak = mic_t4_tone > 8000 ? 8000 : mic_t4_tone;
+
+	pass[0] = pass[1] = false;
+	if (!power_up_analog()) {
+		power_down();
+		printf("mtkmic: %s: the speaker would not come up\n", what);
+		return;
+	}
+	power_up_afe();
+	lck_mtx_lock(&mtkaudio_lock);
+	dl1_begin();
+	lck_mtx_unlock(&mtkaudio_lock);
+	mic_duet(100);                  /* the speaker's power-up moves AUDIO_TOP_CON0 under the running microphone: let that go by */
+	memset(&mic_win, 0, sizeof(mic_win));
+	mic_duet(300);
+	quiet = mic_win;
+	st_say("T4 quiet, the speaker up", &quiet);
+	lck_mtx_lock(&mtkaudio_lock);
+	tone_y1 = 0;
+	tone_y2 = -(int32_t)peak * TONE_HZ_SIN;
+	tone_left = REDWOOD_AUDIO_RATE;
+	lck_mtx_unlock(&mtkaudio_lock);
+	mic_duet(mic_t4_gap);
+	memset(&mic_win, 0, sizeof(mic_win));
+	mic_duet(600);
+	st_say("T4 the tone", &mic_win);
+	for (int c = 0; c < 2; c++) {
+		int delta = st_db10(&mic_win, c) - st_db10(&quiet, c);
+
+		pass[c] = mic_win.frames != 0 && delta >= (int)mic_t4_db * 10 && mic_win.peak[c] >= mic_t4_peak;
+		printf("mtkmic: %s, channel %s: the tone is %d dB (tenths) over the quiet, peak %u: %s (needs %u dB and a peak of %u)\n", what,
+		    c ? "R" : "L", delta, mic_win.peak[c], pass[c] ? "PASS" : "FAIL", mic_t4_db, mic_t4_peak);
+	}
+	lck_mtx_lock(&mtkaudio_lock);
+	tone_left = 0;
+	lck_mtx_unlock(&mtkaudio_lock);
+	power_down();                   /* the microphone stays up: the shared steps are left out */
+}
+
+static void
+mic_selftest_run(void)
+{
+	bool ok, t1 = false, t2 = false, t3 = false, t4[2] = { false, false }, t5[2] = { false, false };
+	bool ran5 = false;
+	int l, r;
+
+	mic_selftest = true;
+	printf("mtkmic: the self-test: T1 the AFE's sine into the VUL memory, T2 the codec's sine over the link, T3 silence, T4 the speaker's "
+	    "tone heard%s\n", mic_t5 ? ", T5 the same on AIN1" : "");
+
+	/* T1: the codec left out */
+	ok = mic_up(false);
+	mic_settle_left = 0;
+	if (ok) {
+		run("T1: the AFE's sine on", ul_sgen_on, COUNT(ul_sgen_on));
+		mic_win_look(500);
+		run("T1: the AFE's sine off", ul_sgen_off, COUNT(ul_sgen_off));
+		st_say("T1", &mic_win);
+		t1 = mic_both_loud(&mic_win);
+		if (!t1) {
+			printf("mtkmic: T1 FAILED: the pointer or the word layout is wrong (L and R swapped? try mtkmic_swap=1; stuck? the buffer's place, "
+			    "mtkmic_vul=)\n");
+		}
+	} else {
+		printf("mtkmic: T1: the AFE's uplink did not come up\n");
+	}
+	mic_down();
+
+	/* T2: everything, the codec's own sine */
+	ok = mic_up(true);
+	if (ok) {
+		mic_on = true;
+		run("T2: the codec's uplink sine on", ul_pmic_sgen_on, COUNT(ul_pmic_sgen_on));
+		mic_settle_wait();
+		mic_win_look(500);
+		run("T2: the codec's uplink sine off", ul_pmic_sgen_off, COUNT(ul_pmic_sgen_off));
+		st_say("T2", &mic_win);
+		t2 = mic_both_loud(&mic_win);
+		if (!t2) {
+			printf("mtkmic: T2 FAILED%s: the link (pins 142/143, PMIC GPIO_MODE3, AUD_PAD_TOP, mtkmic_pins140=1?)\n", t1 ? "" : " as well");
+		}
+
+		/* T3: silence, the bias on */
+		mic_win_look(1000);
+		st_say("T3 the room", &mic_win);
+		l = st_db10(&mic_win, 0);
+		r = st_db10(&mic_win, 1);
+		t3 = mic_win.frames != 0 && ((l > -900 && mic_win.sum[0] != 0) || (r > -900 && mic_win.sum[1] != 0));
+		printf("mtkmic: T3: %s: a live microphone is not digital silence (L %s%d.%d dBFS, R %s%d.%d dBFS)\n", t3 ? "PASS" : "FAIL",
+		    DB10(l), DB10(r));
+
+		/* T4: the acoustic loopback, the speaker up beside it */
+		mic_t4("T4", t4);
+
+		/* T5: the same with AIN1 and MICBIAS1 on the left */
+		if (mic_t5 && mic_in_l != 2) {
+			uint32_t was = mic_in_l;
+
+			ran5 = true;
+			mic_down();
+			mic_in_l = 2;
+			ok = mic_up(true);
+			if (ok) {
+				mic_on = true;
+				mic_settle_wait();
+				mic_t4("T5 (AIN1 on L)", t5);
+			}
+			mic_in_l = was;
+		}
+	} else {
+		printf("mtkmic: T2: the microphone did not come up (T3 and T4 are not run)\n");
+	}
+	mic_down();
+	snprintf(mic_summary, sizeof(mic_summary), "mtkmic: SELFTEST T1 %s T2 %s T3 %s T4 L %s R %s%s%s%s",
+	    t1 ? "PASS" : "FAIL", t2 ? "PASS" : "FAIL", t3 ? "PASS" : "FAIL", t4[0] ? "PASS" : "FAIL", t4[1] ? "PASS" : "FAIL",
+	    ran5 ? " T5 L " : "", ran5 ? (t5[0] ? "PASS" : "FAIL") : "", ran5 ? (t5[1] ? " R PASS" : " R FAIL") : "");
+	printf("%s\n", mic_summary);
+	mic_selftest = false;
 }
 
 /* The registers mtkaudio=1 prints, with what Android leaves in them when nothing plays (from the trace), where the trace says. */
@@ -1350,6 +2235,50 @@ static const struct {
 	{ "AUDDEC_ANA_CON9", PMIC_AUDDEC_ANA_CON9, NOT_SEEN },
 };
 
+/* mtkmic=1: the uplink's registers (spec step 3); read only */
+static const struct {
+	const char *name;
+	uint32_t reg;
+} ul_afe_dump[] = {
+	{ "AFE_ADDA_UL_SRC_CON0", AFE_ADDA_UL_SRC_CON0 }, { "AFE_ADDA_UL_SRC_CON1", AFE_ADDA_UL_SRC_CON1 },
+	{ "AFE_VUL_BASE", AFE_VUL_BASE }, { "AFE_VUL_END", AFE_VUL_END }, { "AFE_VUL_CUR", AFE_VUL_CUR },
+	{ "AFE_CONN9", AFE_CONN9 }, { "AFE_CONN10", AFE_CONN10 },
+	{ "AFE_ADDA_MTKAIF_RX_CFG0", AFE_ADDA_MTKAIF_RX_CFG0 }, { "AFE_ADDA_MTKAIF_RX_CFG1", AFE_ADDA_MTKAIF_RX_CFG1 },
+	{ "AFE_ADDA_MTKAIF_RX_CFG2", AFE_ADDA_MTKAIF_RX_CFG2 }, { "AFE_AUD_PAD_TOP_CFG", AFE_AUD_PAD_TOP_CFG },
+	{ "AFE_ADDA_UL_SRC_MON0", AFE_ADDA_UL_SRC_MON0 }, { "AFE_ADDA_UL_SRC_MON1", AFE_ADDA_UL_SRC_MON1 },
+}, ul_pmic_dump[] = {
+	{ "AUDENC_ANA_CON0", PMIC_AUDENC_ANA_CON0 }, { "AUDENC_ANA_CON1", PMIC_AUDENC_ANA_CON1 },
+	{ "AUDENC_ANA_CON3", PMIC_AUDENC_ANA_CON3 }, { "AUDENC_ANA_CON8", PMIC_AUDENC_ANA_CON8 },
+	{ "AUDENC_ANA_CON9", PMIC_AUDENC_ANA_CON9 }, { "AUDENC_ANA_CON10", PMIC_AUDENC_ANA_CON10 },
+	{ "AFE_UL_SRC_CON0_H", PMIC_AFE_UL_SRC_CON0_H }, { "AFE_UL_SRC_CON0_L", PMIC_AFE_UL_SRC_CON0_L },
+	{ "GPIO_MODE3", PMIC_GPIO_MODE3 }, { "AFE_DCCLK_CFG0", PMIC_AFE_DCCLK_CFG0 }, { "AFE_DCCLK_CFG1", PMIC_AFE_DCCLK_CFG1 },
+	{ "AFE_SGEN_CFG0", PMIC_AFE_SGEN_CFG0 }, { "AFE_SGEN_CFG1", PMIC_AFE_SGEN_CFG1 },
+};
+
+static void
+dump_uplink(bool afe_gated)
+{
+	printf("mtkmic: pins 136..143 function:");
+	for (uint32_t pin = 136; pin <= 143; pin++) {
+		printf(" %u=%u", pin, pin_mode(pin));
+	}
+	printf("\n");
+	if (!afe_gated) {
+		for (unsigned i = 0; i < COUNT(ul_afe_dump); i++) {
+			printf("mtkmic: AFE %#05x %-26s = %#010x\n", ul_afe_dump[i].reg, ul_afe_dump[i].name, rd(B_AFE, ul_afe_dump[i].reg));
+		}
+	}
+	for (unsigned i = 0; i < COUNT(ul_pmic_dump); i++) {
+		uint32_t value = 0;
+
+		if (!pmic_read(ul_pmic_dump[i].reg, &value)) {
+			printf("mtkmic: PMIC %#06x %s NOT READ\n", ul_pmic_dump[i].reg, ul_pmic_dump[i].name);
+			break;
+		}
+		printf("mtkmic: PMIC %#06x %-18s = %#06x\n", ul_pmic_dump[i].reg, ul_pmic_dump[i].name, value);
+	}
+}
+
 /* mtkaudio=1: nothing written. */
 static void
 dump(void)
@@ -1394,6 +2323,9 @@ dump(void)
 		}
 		printf("\n");
 	}
+	if (mic_level >= 1) {
+		dump_uplink((cg1 & (1u << 25)) || (cfg4 & (1u << 7)));
+	}
 }
 
 static void
@@ -1406,6 +2338,9 @@ mtkaudio_thread(void *parameter, __unused wait_result_t result)
 	}
 	pwrap = ml_io_map(PWRAP_PHYS, 0x1000);
 	sram = (volatile uint32_t *)ml_io_map(SRAM_PHYS, DL1_BYTES);
+	if (mic_level >= 2) {
+		vul = (volatile uint32_t *)ml_io_map(mic_vul, UL_BYTES);
+	}
 	dump();
 	if (level < 2) {
 		thread_terminate(current_thread());
@@ -1446,11 +2381,33 @@ mtkaudio_thread(void *parameter, __unused wait_result_t result)
 		power_down();
 	}
 
+	if (mic_level >= 3) {
+		mic_selftest_run();
+	}
+	if (mic_level >= 2) {
+		mic_node_make();
+	}
 	redwood_audio_set_sink("the r1's speaker (the AFE, the MT6357 and the AW87390, redwood_mtkaudio.c)", mtkaudio_sink);
 	for (;;) {
 		lck_mtx_lock(&mtkaudio_lock);
 		while (!feed_wanted) {
-			msleep(&feed_wanted, &mtkaudio_lock, PZERO, "redwood-mtkaudio", NULL);
+			if (mic_level < 2) {
+				msleep(&feed_wanted, &mtkaudio_lock, PZERO, "redwood-mtkaudio", NULL);
+			} else if (mic_on) {
+				lck_mtx_unlock(&mtkaudio_lock);
+				mic_poll();
+				delay_for_interval(POLL_MS, NSEC_PER_MSEC);
+				lck_mtx_lock(&mtkaudio_lock);
+			} else {
+				struct timespec idle = { 0, 20 * NSEC_PER_MSEC };
+
+				lck_mtx_unlock(&mtkaudio_lock);
+				mic_poll();
+				lck_mtx_lock(&mtkaudio_lock);
+				if (!feed_wanted) {
+					msleep(&feed_wanted, &mtkaudio_lock, PZERO, "redwood-mtkaudio", &idle);
+				}
+			}
 		}
 		lck_mtx_unlock(&mtkaudio_lock);
 		printf("mtkaudio: iOS plays: powering up\n");
@@ -1482,6 +2439,34 @@ redwood_mtkaudio_init(void)
 	PE_parse_boot_argn("mtkaudio_tone", &tone_peak, sizeof(tone_peak));
 	PE_parse_boot_argn("mtkaudio_skip0", &probe_skip, sizeof(probe_skip));
 	PE_parse_boot_argn("mtkaudio_sgen_gain", &sgen_gain, sizeof(sgen_gain));
+	/* the microphone (docs/microphone-spec.md); with no mtkmic, none of this does anything */
+	PE_parse_boot_argn("mtkmic", &mic_level, sizeof(mic_level));
+	PE_parse_boot_argn("mtkmic_ch", &mic_ch, sizeof(mic_ch));
+	PE_parse_boot_argn("mtkmic_in_l", &mic_in_l, sizeof(mic_in_l));
+	PE_parse_boot_argn("mtkmic_in_r", &mic_in_r, sizeof(mic_in_r));
+	PE_parse_boot_argn("mtkmic_gain", &mic_gain, sizeof(mic_gain));
+	PE_parse_boot_argn("mtkmic_mode", &mic_mode, sizeof(mic_mode));
+	PE_parse_boot_argn("mtkmic_bias", &mic_bias, sizeof(mic_bias));
+	PE_parse_boot_argn("mtkmic_shift", &mic_shift, sizeof(mic_shift));
+	PE_parse_boot_argn("mtkmic_settle_ms", &mic_settle_ms, sizeof(mic_settle_ms));
+	PE_parse_boot_argn("mtkmic_vul", &mic_vul, sizeof(mic_vul));
+	PE_parse_boot_argn("mtkmic_swap", &mic_swap, sizeof(mic_swap));
+	PE_parse_boot_argn("mtkmic_pins140", &mic_pins140, sizeof(mic_pins140));
+	PE_parse_boot_argn("mtkmic_dcc_off", &mic_dcc_off, sizeof(mic_dcc_off));
+	PE_parse_boot_argn("mtkmic_top_both", &mic_top_both, sizeof(mic_top_both));
+	PE_parse_boot_argn("mtkmic_t12_peak", &mic_t12_peak, sizeof(mic_t12_peak));
+	PE_parse_boot_argn("mtkmic_t4_db", &mic_t4_db, sizeof(mic_t4_db));
+	PE_parse_boot_argn("mtkmic_t4_peak", &mic_t4_peak, sizeof(mic_t4_peak));
+	PE_parse_boot_argn("mtkmic_t4_tone", &mic_t4_tone, sizeof(mic_t4_tone));
+	PE_parse_boot_argn("mtkmic_t4_gap", &mic_t4_gap, sizeof(mic_t4_gap));
+	PE_parse_boot_argn("mtkmic_t5", &mic_t5, sizeof(mic_t5));
+	mic_ch = mic_ch ? 1 : 0;
+	mic_settle_ms = mic_settle_ms > 2000 ? 2000 : mic_settle_ms;
+	if (mic_vul < SRAM_PHYS + DL1_BYTES || mic_vul + UL_BYTES > UL_SRAM_LAST || (mic_vul & 0xfff) != 0) {
+		printf("mtkmic: mtkmic_vul=%#x is not page aligned inside the AFE's SRAM after DL1: %#x used\n", mic_vul,
+		    UL_SRAM_PHYS_DEFAULT);
+		mic_vul = UL_SRAM_PHYS_DEFAULT;
+	}
 	if (sgen_gain > 0x1f) {
 		sgen_gain = 0x1f;       /* DL_GAIN_N_40DB */
 	}
@@ -1493,4 +2478,29 @@ redwood_mtkaudio_init(void)
 	} else {
 		printf("mtkaudio: cannot start its thread\n");
 	}
+}
+
+/*
+ * On the way back to Android (loader_return.c) and on a panic's: the microphone's bias must not stay on. No lock and no
+ * waiting: the uplink source, both ADCs and both biases are written straight. Nothing if the microphone was never up.
+ */
+void
+redwood_mtkaudio_quiesce(void)
+{
+	uint32_t con9 = 0;
+
+	if (mic_summary[0] != 0) {
+		printf("%s\n", mic_summary);   /* (the log keeps its beginning and its end: said again here) */
+	}
+	if (!(users & USE_UL) || pwrap == 0) {
+		return;
+	}
+	(void)pmic_write_raw(PMIC_AFE_UL_SRC_CON0_L, 0);
+	(void)pmic_write_raw(PMIC_AUDENC_ANA_CON0, 0);
+	(void)pmic_write_raw(PMIC_AUDENC_ANA_CON1, 0);
+	(void)pmic_write_raw(PMIC_AUDENC_ANA_CON8, 0);          /* MICBIAS0 off */
+	if (pmic_read_raw(PMIC_AUDENC_ANA_CON9, &con9)) {
+		(void)pmic_write_raw(PMIC_AUDENC_ANA_CON9, con9 & ~1u);  /* MICBIAS1 off */
+	}
+	printf("mtkmic: the run ends with the microphone up: its bias is switched off\n");
 }

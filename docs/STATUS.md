@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-18 14:38 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-18 15:23 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -27,20 +27,19 @@ Last updated: 2026-11-18 14:38 PST. Kept current as work lands; details are in t
 - Cellular in test images: LTE registration, data bearer, DNS and HTTP over `pdp_ip0` (8 of 10 approved radio-on attempts used)
 - Modem as a service with the radio off (`r1_md=10`): 30 minutes, no faults, clean shutdown
 - Bluetooth audio plug-in loads in mediaserverd and connects to bluetoothd
+- Microphone (`mtkmic=2`): kernel self-test passes on both mics; an iOS recording of a speaker tone is 14 dB above the quiet floor; playback unchanged before and after. Speech not tested
 - Boot image has about 1.4 MB free (Android ramdisk repacked lz4 to gzip)
 - Cellular stage 4c/4d on a simulated bearer (radio off): `celld` publishes the service, `pdp_ip0` becomes the primary interface, DNS and traffic go out on it, the data budget cuts traffic off (about 5 KB overshoot)
 
 ## In progress
 
 - Home-screen swipes: driver shader caches took the swipe test from 9 to 21 swaps per second (`swipe-profile.md`); home, Settings and Camera screenshots look correct with them; needs a hands-on look
-- Microphone: capture path written into the audio driver (default off), device tests next
 - Using Open Mapple (github.com/open-mapple, same code lineage, MediaTek phone): plan in `open-mapple-plan.md`; phase 1 small items done (volume guard, UI-activity CPU boost with no measured gain yet, boot-args length check); pass benchmark and profiler next
-- Microphone and video recording: analysis of what each needs (see open problems)
+- Video recording: next run registers the encoders inside mediaserverd (`video-recording-spec-3.md`)
 - Bluetooth speaker audio (A2DP): ready for a hands-on session; no sound has been sent to a speaker yet
 
 ## Open problems
 
-- Microphone records silence: the kernel audio driver has no capture (uplink) path at all
 - Video recording: Camera's Video mode now streams (video stabilization forced off, `vfix=1`) and recording starts and stops without error, but there is still no working H.264 encoder: VideoToolbox never calls a registered encoder (-12908), so no confirmed movie file
 - Cellular alongside Wi-Fi (Wi-Fi should win) is untested: unattended runs have no Wi-Fi
 - All audio went silent after a speaker was paired (likely the route moved to a Bluetooth output that could not carry sound; not confirmed)
