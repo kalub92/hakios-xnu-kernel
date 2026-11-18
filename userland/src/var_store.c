@@ -48,10 +48,16 @@
 
 #define BLOCK           4096
 #define BUFFER          (4u << 20)              /* the loader's own buffer: one request a write */
-#define STORE_AT        8589934592LL            /* darwin's block 2097152: past the cryptexes, with room to spare */
-#define SLOT_BYTES      0x80000000LL            /* 2 GiB a slot, two slots */
 #define SLOTS           2
-#define DEVICE          "/dev/rufs_darwin"
+/*
+ * Where the store is. X6826B: /dev/rufs_darwin, from darwin's block 2097152 (past the cryptexes, with
+ * room to spare), 2 GiB a slot. r1: /dev/remmc_var (bsd/dev/redwood_emmc.c, emmc_write=1) when it
+ * exists -- the GPT partition xnudata, its first sector the kernel's header (it says the window's
+ * length): [header][slot 0][slot 1][the rest, reserved], the slots R1_SLOT_BYTES each from the first BLOCK.
+ */
+#define R1_SLOT_BYTES   (960LL << 20)
+static const char *DEVICE = "/dev/rufs_darwin";
+static off_t STORE_AT = 8589934592LL, SLOT_BYTES = 0x80000000LL;
 #define ROOT            "/private/var"
 #define MAX_PATH        1024
 #define MAX_DEPTH       32
@@ -113,30 +119,39 @@ struct entry {
 #define VAR_SAVE_WANTED 2
 #define VAR_SAVE_DONE   3
 
-/* Is NAME=VALUE among the kernel's arguments? (as init.c reads them) */
-static int
-boot_arg_is(const char *name, const char *value)
+/* The value of NAME= among the kernel's arguments, up to the next space, or NULL (as init.c reads them) */
+static const char *
+boot_arg_value(const char *name)
 {
 	static char args[1024];
-	size_t len = sizeof(args) - 1, n = strlen(name), v = strlen(value);
+	size_t len = sizeof(args) - 1, n = strlen(name);
 
 	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
-		return 0;
+		return NULL;
 	}
 	args[len < sizeof(args) ? len : sizeof(args) - 1] = 0;
 	for (char *p = args; *p;) {
 		while (*p == ' ') {
 			p++;
 		}
-		if (strncmp(p, name, n) == 0 && p[n] == '=' && strncmp(p + n + 1, value, v) == 0 &&
-		    (p[n + 1 + v] == 0 || p[n + 1 + v] == ' ')) {
-			return 1;
+		if (strncmp(p, name, n) == 0 && p[n] == '=') {
+			return p + n + 1;
 		}
 		while (*p && *p != ' ') {
 			p++;
 		}
 	}
-	return 0;
+	return NULL;
+}
+
+/* Is NAME=VALUE among the kernel's arguments? */
+static int
+boot_arg_is(const char *name, const char *value)
+{
+	const char *p = boot_arg_value(name);
+	size_t v = strlen(value);
+
+	return p != NULL && strncmp(p, value, v) == 0 && (p[v] == 0 || p[v] == ' ');
 }
 
 static long
@@ -165,6 +180,42 @@ sysctl_set_int(const char *name, int value)
 }
 
 /* The claim on the store: nothing may be written without it, and only one program may hold it. */
+/* A line for the host's .keep file too (kern.redwood.host_keep: the console log keeps only its last
+ * 261 KB), built a piece at a time -- libmini has no snprintf. */
+static char kept[200];
+static int kept_n;
+
+static void
+keep_s(const char *s)
+{
+	while (*s && kept_n < (int)sizeof(kept) - 1) {
+		kept[kept_n++] = *s++;
+	}
+}
+
+static void
+keep_u(uint64_t v)
+{
+	char d[24];
+	int k = 0;
+
+	do {
+		d[k++] = (char)('0' + v % 10);
+	} while ((v /= 10) != 0);
+	while (k > 0 && kept_n < (int)sizeof(kept) - 1) {
+		kept[kept_n++] = d[--k];
+	}
+}
+
+static void
+keep_end(void)
+{
+	kept[kept_n] = 0;
+	printf("%s\n", kept);
+	(void)sysctlbyname("kern.redwood.host_keep", NULL, NULL, kept, (size_t)kept_n);
+	kept_n = 0;
+}
+
 static int
 claim(void)
 {
@@ -232,6 +283,7 @@ static uint64_t stream_left;            /* bytes of the archive still to come (l
 static off_t stream_limit;              /* the end of the slot: nothing is read or written past it */
 static uint32_t stream_crc;
 static uint64_t entries;
+static uint64_t saved_generation;       /* of the last save that went through: told to the kernel at the end */
 
 static off_t
 slot_at(int slot)
@@ -883,6 +935,7 @@ save(void)
 	printf("var_store: %llu blocks into the flash, %llu left alone (they held this already)%s\n",
 	    (unsigned long long)written_blocks, (unsigned long long)skipped_blocks,
 	    unsorted_dirs ? " (a directory was too big to put in order)" : "");
+	saved_generation = h.generation;
 	return 1;
 }
 
@@ -1153,10 +1206,25 @@ load(void)
 	struct head h;
 	int best;
 
+	/* what each slot holds and which one is loaded, in one line for the .keep file */
+	keep_s("var_store: at boot:");
+	for (int slot = 0; slot < SLOTS; slot++) {
+		keep_s(" slot ");
+		keep_u((uint64_t)slot);
+		if (read_head(slot, &h)) {
+			keep_s(" holds generation ");
+			keep_u(h.generation);
+		} else {
+			keep_s(" holds nothing good");
+		}
+		keep_s(";");
+	}
 	memset(&h, 0, sizeof(h));
 	best = newest(&h);
 	if (best < 0) {
 		printf("var_store: no store yet: /private/var stays as init made it\n");
+		keep_s(" nothing loaded");
+		keep_end();
 		return 1;
 	}
 	printf("var_store: slot %d: generation %llu of %llu seconds, %llu entries, %llu bytes\n", best,
@@ -1176,16 +1244,27 @@ load(void)
 		}
 		if (left < 0) {
 			printf("var_store: nothing good in the store: /private/var stays as init made it\n");
+			keep_s(" nothing loaded (torn)");
+			keep_end();
 			return 1;
 		}
+		best = left;
 		h = other;
 		printf("var_store: slot %d is good after all: generation %llu\n", left,
 		    (unsigned long long)h.generation);
 	}
+	keep_s(" loading generation ");
+	keep_u(h.generation);
+	keep_s(" from slot ");
+	keep_u((uint64_t)best);
 	if (!pass(&h, 1)) {
 		printf("var_store: the archive read differently the second time: what was made stays\n");
+		keep_s(": FAILED, half made");
+		keep_end();
 		return 0;
 	}
+	keep_s(": done");
+	keep_end();
 	printf("var_store: %llu directories, %llu files (%llu bytes), %llu links back in /private/var\n",
 	    (unsigned long long)made_dirs, (unsigned long long)made_files, (unsigned long long)made_bytes,
 	    (unsigned long long)made_links);
@@ -1300,11 +1379,18 @@ watch(int seconds)
 
 			if (!ok) {
 				printf("var_store: this save came to nothing; the store keeps what it had\n");
+				if (asked) {
+					keep_s("var_store: exit save FAILED: ");
+					keep_s(strerror(errno));
+					keep_end();
+				}
 			}
 			last = (uint64_t)tv.tv_sec;
 			if (asked) {
-				/* answered either way: the kernel is waiting on this to go back to the loader */
-				(void)sysctl_set_int("kern.redwood.var_save", VAR_SAVE_DONE);
+				/* answered either way: the kernel is waiting on this to go back to the loader, and it
+				 * says what came of it (redwood_ufs.c): the generation saved, or 0 for nothing */
+				(void)sysctl_set_int("kern.redwood.var_save",
+				    VAR_SAVE_DONE | (ok ? (int)saved_generation << 8 : 0));
 				return ok;
 			}
 		}
@@ -1362,6 +1448,28 @@ main(int argc, char **argv, char **envp)
 
 	(void)envp;
 	crc_init();
+	{
+		/* r1: the kernel's window, if it offers one (its header block: magic, lba, blocks) */
+		static uint8_t head[512];
+		int f = open("/dev/remmc_var", O_RDONLY, 0);
+		uint64_t blocks;
+
+		if (f >= 0 && pread(f, head, sizeof(head), 0) == (ssize_t)sizeof(head) &&
+		    memcmp(head, "XNUVAR01", 8) == 0) {
+			memcpy(&blocks, head + 16, sizeof(blocks));
+			if (blocks < (uint64_t)(BLOCK + SLOTS * R1_SLOT_BYTES) / 512) {
+				printf("var_store: /dev/remmc_var is %llu blocks, too small for %d slots of %lld bytes: not used\n",
+				    (unsigned long long)blocks, SLOTS, R1_SLOT_BYTES);
+			} else {
+				DEVICE = "/dev/remmc_var";
+				STORE_AT = BLOCK;
+				SLOT_BYTES = R1_SLOT_BYTES;     /* fixed: the rest of the window is not the store's */
+			}
+		}
+		if (f >= 0) {
+			close(f);
+		}
+	}
 	if (strcmp(what, "stamp") == 0) {
 		return stamp(argc > 2 ? argv[2] : "/private/var/redwood-stamp") ? 0 : 1;
 	}
@@ -1381,7 +1489,10 @@ main(int argc, char **argv, char **envp)
 			printf("var_store: not asked to keep the data volume (var_store=1): nothing to watch\n");
 			return 0;
 		}
-		return watch(argc > 2 ? (int)parse_number(argv[2]) : 0) ? 0 : 1;
+		/* seconds between saves: the argument, else var_every= (r1, where a run held by XNU_STAY never
+		 * ends by the loader_return_after that asks for a save), else only when asked */
+		return watch(argc > 2 ? (int)parse_number(argv[2]) :
+		           boot_arg_value("var_every") ? (int)parse_number(boot_arg_value("var_every")) : 0) ? 0 : 1;
 	}
 	fd = open(DEVICE, strcmp(what, "load") == 0 || strcmp(what, "show") == 0 ? O_RDONLY : O_RDWR, 0);
 	if (fd < 0) {

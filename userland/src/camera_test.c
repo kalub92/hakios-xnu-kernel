@@ -1,7 +1,7 @@
 /*
  * camera_test: the wide camera's frames as a program gets them (cam=5).
  *
- * usage: camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [ccm M] [sensor N]
+ * usage: camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [flat] [ccm M] [sensor N]
  *        camera_test cycle [FRAMES]
  *        camera_test noise [SENSOR|all]
  *   raw: reads FRAMES frames (default 150) from the kernel's /dev/redwood-camera, with src/camera_isp.c's
@@ -12,6 +12,9 @@
  *   With sensor N, another sensor first (0 the macro, 1 the wide, 2 the front, 3 the ultra-wide); with
  *   noawb, no white balance (gains of 1: for colour bars, whose colours are known); with ccm M, the
  *   colour matrix M (nine numbers, row by row, separated by commas: a check of the matrix's path).
+ *   With flat, the last frame is taken for a flat field (a white sheet over the lens, evenly lit) and the camera's
+ *   tuning file is written from it (camera_isp.h ISP_TUNING_FILE: the lens shading, and M or the usual matrix), which
+ *   mediaserverd's camera reads when it starts.
  *   cycle: each of the four sensors in turn, FRAMES frames each (default 30), the kernel's exposure:
  *   what came of each, and how long the change from one to the next took.
  *   noise: the sensor's black level and noise in the dark (the lens covered, or a dark room): at the
@@ -288,6 +291,7 @@ full_piece(void *context, size_t i)
 }
 
 static float ccm[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+static bool ccm_given, flat;
 
 static int
 raw(int frames, bool ae, bool awb, bool keep_raw, bool full, int sensor)
@@ -357,6 +361,24 @@ raw(int frames, bool ae, bool awb, bool keep_raw, bool full, int sensor)
 	}
 	printf("camera_test: %d frames of %llu (%llu skipped) in %.1f s\n", got, f->sequence - first_seq + 1,
 	    f->sequence - first_seq + 1 - got, ms_since(started) / 1000);
+	if (flat) {
+		/* the last frame is a flat field (a white sheet over the lens, evenly lit): its shading, and the matrix given
+		 * (or the usual one), into the file mediaserverd's camera reads when it starts */
+		struct isp t;
+		float darkest = 0;
+
+		isp_init(&t);
+		if (ccm_given) {
+			isp_set_ccm(&t, ccm);
+		}
+		if (!isp_lsc_from_flat(&t, f, (const uint8_t *)f + f->header_bytes, &darkest)) {
+			printf("camera_test: flat: the frame is too dark or clipped for a flat field (green %.0f above black): nothing saved\n", s.mean[1]);
+		} else if (!isp_tuning_save(&t, ISP_TUNING_FILE)) {
+			perror("camera_test: flat: " ISP_TUNING_FILE);
+		} else {
+			printf("camera_test: flat: the darkest corner has %.0f %% of the middle's green; saved in %s\n", darkest * 100, ISP_TUNING_FILE);
+		}
+	}
 
 	if (keep_raw) {
 		struct redwood_camera_command *k = (struct redwood_camera_command *)((uint8_t *)f + f->header_bytes) - 1;
@@ -422,11 +444,13 @@ main(int argc, char **argv)
 			awb = awb && strcmp(argv[i], "noawb") != 0;
 			keep_raw = keep_raw || strcmp(argv[i], "keepraw") == 0;
 			full = full || strcmp(argv[i], "full") == 0;
+			flat = flat || strcmp(argv[i], "flat") == 0;
 			if (strcmp(argv[i], "ccm") == 0 && i + 1 < argc) {
 				const char *at = argv[++i];
 
 				for (int k = 0; k < 9 && at != NULL; k++) {
 					ccm[k] = strtof(at, NULL);
+					ccm_given = true;
 					at = strchr(at, ',');
 					at = at != NULL ? at + 1 : NULL;
 				}

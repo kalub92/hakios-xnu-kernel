@@ -27,6 +27,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -263,6 +264,71 @@ load_the_tweaks(void)
 	}
 }
 
+/* Settings aborted (userabort, 2026-11-17) from an uncaught Objective-C exception: say which, to the host's log */
+static void
+exception_seen(CFTypeRef exception)
+{
+	char name[160] = "?", reason[300] = "?";
+	CFTypeRef n = ((CFTypeRef (*)(CFTypeRef, SEL))objc_msgSend)(exception, sel_registerName("name"));
+	CFTypeRef r = ((CFTypeRef (*)(CFTypeRef, SEL))objc_msgSend)(exception, sel_registerName("reason"));
+
+	if (n != NULL) {
+		CFStringGetCString(n, name, sizeof(name), kCFStringEncodingUTF8);
+	}
+	if (r != NULL) {
+		CFStringGetCString(r, reason, sizeof(reason), kCFStringEncodingUTF8);
+	}
+	say("redwood: tweaks: %s uncaught exception %s: %s\n", executable_name(), name, reason);
+	CFTypeRef a = ((CFTypeRef (*)(CFTypeRef, SEL))objc_msgSend)(exception, sel_registerName("callStackReturnAddresses"));
+	if (a != NULL) {
+		char line[400] = "";
+		size_t n_addr = (size_t)CFArrayGetCount(a), o = 0;
+		for (size_t i = 0; i < n_addr && i < 24 && o < sizeof(line) - 20; i++) {
+			unsigned long long v = ((unsigned long long (*)(CFTypeRef, SEL))objc_msgSend)(CFArrayGetValueAtIndex(a, (CFIndex)i), sel_registerName("unsignedLongLongValue"));
+			o += (size_t)snprintf(line + o, sizeof(line) - o, " 0x%llx", v);
+		}
+		say("redwood: tweaks: exception stack:%s\n", line);
+	}
+}
+
+/*
+ * Settings builds the Wallet row from PKIconImageCache's icon for com.apple.Passbook, which this system does not have:
+ * the icon is nil, the row's dictionary literal throws NSInvalidArgumentException (objects[3] = "iconImage") and Settings
+ * aborts (set0..set5, 2026-11-17). Leave out the pairs with a nil key or object, as an app that tolerates a missing icon
+ * would (the row then has no icon). Settings only.
+ */
+static id (*real_init_dict)(id, SEL, const id *, const id *, unsigned long);
+
+static id
+init_dict(id self, SEL cmd, const id *objects, const id *keys, unsigned long count)
+{
+	id o[64], k[64];
+	unsigned long n = 0;
+
+	if (count > 64) {
+		return real_init_dict(self, cmd, objects, keys, count);
+	}
+	for (unsigned long i = 0; i < count; i++) {
+		if (objects[i] != NULL && keys[i] != NULL) {
+			o[n] = objects[i];
+			k[n++] = keys[i];
+		}
+	}
+	return real_init_dict(self, cmd, o, k, n);
+}
+
+static void
+tolerate_nil_in_dictionaries(void)
+{
+	Class c = objc_getClass("__NSPlaceholderDictionary");
+	Method m = c != NULL ? class_getInstanceMethod(c, sel_registerName("initWithObjects:forKeys:count:")) : NULL;
+
+	if (m != NULL && strcmp(executable_name(), "Preferences") == 0) {
+		real_init_dict = (id (*)(id, SEL, const id *, const id *, unsigned long))method_setImplementation(m, (IMP)init_dict);
+		say("redwood: tweaks: Preferences: dictionaries drop nil pairs\n");
+	}
+}
+
 __attribute__((constructor))
 static void
 redwood_tweaks_init(void)
@@ -273,5 +339,10 @@ redwood_tweaks_init(void)
 		return;
 	}
 	done = true;
+	void (*set_handler)(void (*)(CFTypeRef)) = dlsym(RTLD_DEFAULT, "NSSetUncaughtExceptionHandler");
+	if (set_handler != NULL) {
+		set_handler(exception_seen);
+	}
+	tolerate_nil_in_dictionaries();
 	load_the_tweaks();
 }

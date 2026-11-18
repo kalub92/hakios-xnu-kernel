@@ -50,6 +50,15 @@ redwood_battery_temperature(void)
 	return battery_temperature_c;
 }
 
+/* r1_md=7 gate 10: the last reading, and whether there has been one */
+bool
+redwood_battery_get(int *soc, int *charger)
+{
+	*soc = battery_soc_percent;
+	*charger = battery_charger_present;
+	return battery_updates > 0;
+}
+
 SYSCTL_NODE(_kern, OID_AUTO, redwood, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "redwood phone bits");
 SYSCTL_INT(_kern_redwood, OID_AUTO, battery_soc, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_soc_percent, 0, "battery state of charge, 0..100 percent, or -1 if unknown");

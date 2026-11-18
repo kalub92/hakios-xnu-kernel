@@ -1,0 +1,136 @@
+--- a/src/imagination/vulkan/pvr_image.c
++++ b/src/imagination/vulkan/pvr_image.c
+@@ -241,8 +241,25 @@
+              explicit_mod->drmFormatModifierPlaneCount == 1);
+       *modifier = explicit_mod->drmFormatModifier;
+ 
++#ifdef __APPLE__
++      /* Darwin on redwood (glyuv): the plane's offset in the memory is kept (image->import_offset,
++       * pvr_BindImageMemory2()), not refused: Zink imports the chroma plane of an IOSurface at its
++       * offset. One line, the first few: the offset and the pitch.
++       */
++      if (explicit_mod->pPlaneLayouts[0].offset != 0) {
++         static int said;
++
++         if (said < 4) {
++            said++;
++            mesa_logi("pvr: import: offset %llu pitch %llu",
++                      (unsigned long long)explicit_mod->pPlaneLayouts[0].offset,
++                      (unsigned long long)explicit_mod->pPlaneLayouts[0].rowPitch);
++         }
++      }
++#else
+       if (explicit_mod->pPlaneLayouts[0].offset != 0)
+          return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
++#endif
+ 
+       if (explicit_mod->pPlaneLayouts[0].rowPitch %
+           (bpp * pbe_stride_align) != 0) {
+@@ -277,7 +294,10 @@
+    if (!image)
+       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+-   pvr_image_init(device, pCreateInfo, image);
++   if (pvr_image_init(device, pCreateInfo, image) != VK_SUCCESS) {
++      vk_image_destroy(&device->vk, pAllocator, &image->vk);
++      return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
++   }
+ 
+    *pImage = pvr_image_to_handle(image);
+ 
+@@ -298,9 +318,9 @@
+    vk_image_destroy(&device->vk, pAllocator, &image->vk);
+ }
+ 
+-void pvr_image_init(struct pvr_device *device,
+-                    const VkImageCreateInfo *pCreateInfo,
+-                    struct pvr_image *image)
++VkResult pvr_image_init(struct pvr_device *device,
++                        const VkImageCreateInfo *pCreateInfo,
++                        struct pvr_image *image)
+ {
+    unsigned pbe_stride_align = get_pbe_stride_align(&device->pdevice->dev_info);
+ 
+@@ -311,15 +331,26 @@
+       VkResult res = pvr_pick_modifier(pCreateInfo,
+                                        pbe_stride_align,
+                                        &image->vk.drm_format_mod);
+-      if (res != VK_SUCCESS)
+-         assert(res == VK_SUCCESS);
++      if (res != VK_SUCCESS) {
++         mesa_loge("pvr: image: unusable DRM format modifier layout (%d)", (int)res);
++         return res;
++      }
+ 
+       assert(image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR);
++
++      /* The explicit layout's offset into the memory (0 unless imported): see pvr_BindImageMemory2(). */
++      const VkImageDrmFormatModifierExplicitCreateInfoEXT *explicit_mod =
++         vk_find_struct_const(pCreateInfo->pNext,
++                              IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
++      if (explicit_mod)
++         image->import_offset = explicit_mod->pPlaneLayouts[0].offset;
+    }
+ 
+    pvr_image_init_memlayout(image);
+    pvr_image_init_physical_extent(image, pCreateInfo, pbe_stride_align);
+    pvr_image_setup_mip_levels(image);
++
++   return VK_SUCCESS;
+ }
+ 
+ void pvr_image_fini(struct pvr_device *device, struct pvr_image *image)
+@@ -371,6 +402,7 @@
+       VK_FROM_HANDLE(pvr_device_memory, mem, pBindInfos[i].memory);
+       VK_FROM_HANDLE(pvr_image, image, pBindInfos[i].image);
+       VkDeviceSize offset = pBindInfos[i].memoryOffset;
++      VkDeviceSize size = image->total_size;
+       VkResult result;
+ 
+ #if defined(PVR_USE_WSI_PLATFORM)
+@@ -389,10 +421,21 @@
+       }
+ #endif
+ 
++      /* An imported plane (glyuv) starts at its own offset in the memory. */
++      offset += image->import_offset;
++#ifdef __APPLE__
++      /* pvr_srv/drm vma_map() refuse a mapping whose page-aligned end is past the memory's: the image's
++       * size is for this plane only, so shorten it to the memory's end (a plane that ends in the
++       * surface's last page is fine as it is).
++       */
++      if (offset < mem->bo->size && offset + size > mem->bo->size)
++         size = mem->bo->size - offset;
++#endif
++
+       result = pvr_bind_memory(device,
+                                mem,
+                                offset,
+-                               image->total_size,
++                               size,
+                                image->alignment,
+                                &image->vma,
+                                &image->dev_addr);
+--- a/src/imagination/vulkan/pvr_image.h
++++ b/src/imagination/vulkan/pvr_image.h
+@@ -63,6 +63,7 @@
+ 
+    VkDeviceSize alignment;
+    VkDeviceSize total_size;
++   VkDeviceSize import_offset; /* explicit-modifier plane layout offset (glyuv import), 0 else */
+ 
+    uint8_t plane_count;
+    struct pvr_image_plane planes[PVR_MAX_PLANE_COUNT];
+@@ -169,9 +170,9 @@
+                                       const VkImageSubresource *subresource,
+                                       VkSubresourceLayout *layout);
+ 
+-void pvr_image_init(struct pvr_device *device,
+-                    const VkImageCreateInfo *pCreateInfo,
+-                    struct pvr_image *image);
++VkResult pvr_image_init(struct pvr_device *device,
++                        const VkImageCreateInfo *pCreateInfo,
++                        struct pvr_image *image);
+ void pvr_image_fini(struct pvr_device *device, struct pvr_image *image);
+ 
+ #endif /* PVR_IMAGE_H */

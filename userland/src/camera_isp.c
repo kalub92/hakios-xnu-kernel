@@ -6,6 +6,7 @@
  * one is set), sRGB's curve. Grey-world white balance; no noise reduction yet.
  */
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "camera_isp.h"
@@ -264,35 +265,67 @@ lsc_at(const struct isp *isp, float u, float v, float g[3])
 	}
 }
 
-/* one line of the picture as 8-bit R, G, B */
+/*
+ * The colours of one line of cells (cy, the cells x0 to x0 + cw), kept for the next line of the picture: a preview larger than the
+ * cells (1504x1128 of 816x612, combo1) shows each cell ~1.8 times across and down, and each is worked out once (cy 0: none yet).
+ */
+struct cell_line {
+	uint32_t        cy;             /* the line's cy + 1 */
+	uint8_t         rgb[3 * 4096];
+};
+
+/* one line of the picture as 8-bit R, G, B: each pixel its nearest cell's colour */
 static void
 render_line(const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw, uint32_t width, uint32_t height,
-    uint32_t row, uint8_t *rgb)
+    uint32_t row, uint8_t *rgb, struct cell_line *cl)
 {
 	uint32_t x0, y0, cw, ch, cells_w = f->width / 2, cells_h = f->height / 2;
 	int r, b;
 	struct pipe p;
 
 	crop(f, width, height, &x0, &y0, &cw, &ch);
+	if (isp->rot180) {
+		row = height - 1 - row;
+	}
+	uint32_t cy = y0 + (uint32_t)((uint64_t)row * ch / height);
+	uint64_t step = ((uint64_t)cw << 16) / width, at = 0;
+
+	if (cw > 4096) {
+		return;
+	}
+	const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
+	float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0, gains[3] = { 1, 1, 1 };
+	bool fresh = cl->cy != cy + 1;
+	uint32_t last = ~0u;
+
 	cell_places(f->bayer, &r, &b);
 	pipe_init(isp, &p);
-	uint32_t cy = y0 + (uint32_t)((uint64_t)row * ch / height);
-	const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
-	uint64_t step = ((uint64_t)cw << 16) / width, at = (uint64_t)x0 << 16;
-	float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0, gains[3] = { 1, 1, 1 };
-
 	for (uint32_t x = 0; x < width; x++, at += step) {
-		uint32_t cx = (uint32_t)(at >> 16);
-		int v[4], g = 0;
+		uint32_t i = (uint32_t)(at >> 16), cx = x0 + i;
 
-		cell(top, f->stride, cx, v);
-		for (int j = 0; j < 4; j++) {
-			g += j != r && j != b ? v[j] : 0;
+		if (fresh && i != last) {
+			int v[4], g = 0;
+
+			cell(top, f->stride, cx, v);
+			for (int j = 0; j < 4; j++) {
+				g += j != r && j != b ? v[j] : 0;
+			}
+			if (isp->lsc.on) {
+				lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
+			}
+			pixel(isp, &p, v[r] * gains[0], g * 0.5f * gains[1], v[b] * gains[2], cl->rgb + 3 * i);
+			last = i;
 		}
-		if (isp->lsc.on) {
-			lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
+		memcpy(rgb + 3 * x, cl->rgb + 3 * i, 3);
+	}
+	cl->cy = cy + 1;
+	for (uint32_t x = 0; isp->rot180 && x < width / 2; x++) {
+		for (int k = 0; k < 3; k++) {
+			uint8_t t = rgb[3 * x + k];
+
+			rgb[3 * x + k] = rgb[3 * (width - 1 - x) + k];
+			rgb[3 * (width - 1 - x) + k] = t;
 		}
-		pixel(isp, &p, v[r] * gains[0], g * 0.5f * gains[1], v[b] * gains[2], rgb + 3 * x);
 	}
 }
 
@@ -342,6 +375,7 @@ isp_render_nv12(const struct isp *isp, const struct redwood_camera_frame *f, con
     uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
 {
 	uint8_t line[2][3 * 8192];
+	struct cell_line cl = { 0 };
 
 	if (width > 8192) {
 		return;
@@ -349,8 +383,8 @@ isp_render_nv12(const struct isp *isp, const struct redwood_camera_frame *f, con
 	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
 		bool second = row + 1 < height;
 
-		render_line(isp, f, raw, width, height, row, line[0]);
-		render_line(isp, f, raw, width, height, second ? row + 1 : row, line[1]);
+		render_line(isp, f, raw, width, height, row, line[0], &cl);
+		render_line(isp, f, raw, width, height, second ? row + 1 : row, line[1], &cl);
 		nv12_pair(line[0], line[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
 		    uv + (size_t)(row / 2) * uv_stride, video_range);
 	}
@@ -361,6 +395,7 @@ isp_render_bgra(const struct isp *isp, const struct redwood_camera_frame *f, con
     uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row)
 {
 	uint8_t line[3 * 8192];
+	struct cell_line cl = { 0 };
 
 	if (width > 8192) {
 		return;
@@ -368,7 +403,7 @@ isp_render_bgra(const struct isp *isp, const struct redwood_camera_frame *f, con
 	for (uint32_t row = first_row; row < end_row && row < height; row++) {
 		uint8_t *o = out + (size_t)row * stride;
 
-		render_line(isp, f, raw, width, height, row, line);
+		render_line(isp, f, raw, width, height, row, line, &cl);
 		for (uint32_t x = 0; x < width; x++) {
 			o[4 * x] = line[3 * x + 2];
 			o[4 * x + 1] = line[3 * x + 1];
@@ -553,4 +588,58 @@ isp_lsc_from_flat(struct isp *isp, const struct redwood_camera_frame *f, const u
 		*min_ratio = darkest;
 	}
 	return true;
+}
+
+/* ---- a camera's tuning in a file ------------------------------------------------------------------------- */
+
+struct isp_tuning {
+	char            magic[8];       /* "RWTUNE1" */
+	float           ccm[9];
+	uint32_t        lsc_on;
+	float           lsc[3][LSC_H][LSC_W];
+};
+
+bool
+isp_tuning_save(const struct isp *isp, const char *path)
+{
+	struct isp_tuning t = { .magic = "RWTUNE1", .lsc_on = isp->lsc.on };
+	FILE *f = fopen(path, "wb");
+	bool ok;
+
+	memcpy(t.ccm, isp->ccm, sizeof(t.ccm));
+	memcpy(t.lsc, isp->lsc.gain, sizeof(t.lsc));
+	ok = f != NULL && fwrite(&t, sizeof(t), 1, f) == 1;
+	if (f != NULL) {
+		ok = fclose(f) == 0 && ok;
+	}
+	return ok;
+}
+
+bool
+isp_tuning_load(struct isp *isp)
+{
+	static const char *const paths[] = { ISP_TUNING_FILE, ISP_TUNING_IMAGE };
+
+	for (int i = 0; i < 2; i++) {
+		struct isp_tuning t;
+		FILE *f = fopen(paths[i], "rb");
+		bool ok = f != NULL && fread(&t, sizeof(t), 1, f) == 1 && memcmp(t.magic, "RWTUNE1", 8) == 0;
+
+		if (f != NULL) {
+			fclose(f);
+		}
+		for (int k = 0; ok && k < 9; k++) {             /* (a file that is not one of ours: numbers no matrix has) */
+			ok = t.ccm[k] > -8 && t.ccm[k] < 8;
+		}
+		for (int k = 0; ok && t.lsc_on && k < 3 * LSC_H * LSC_W; k++) {
+			ok = (&t.lsc[0][0][0])[k] >= 0.5f && (&t.lsc[0][0][0])[k] <= 16;
+		}
+		if (ok) {
+			isp_set_ccm(isp, t.ccm);
+			isp->lsc.on = t.lsc_on != 0;
+			memcpy(isp->lsc.gain, t.lsc, sizeof(t.lsc));
+			return true;
+		}
+	}
+	return false;
 }

@@ -21,6 +21,13 @@ EPOCH=$(date +%s)
 RUN_ID=$(( EPOCH & 0x7fffffff ))   # r1: tags the loader marker (expdb restores old ones)
 TEST_FLAGS=(-DRUN_ID=${RUN_ID}u -DXNU_WDT_SECONDS=0 -DXNU_CORES=$CORES -DXNU_WATCH_SECONDS=$WATCH
 	"-DXNU_RETURN_AFTER=\"$SECS\"" "-DXNU_EXTRA_ARGS=\"$XNU_ARGS epoch=$EPOCH\"")
+# XNU_STAY=1 (r1): the image boots XNU at every power-on and stays there. Holding the side button
+# for three seconds ends the run and starts Android once (the loader's watcher); a reboot of Android
+# is XNU again. Nothing is asked of Android and no log is waited for.
+if [ -n "$XNU_STAY" ]; then
+	TEST_FLAGS=(-DRUN_ID=${RUN_ID}u -DXNU_WDT_SECONDS=0 -DXNU_CORES=$CORES -DXNU_WATCH_SECONDS=315360000 -DMENU_DEFAULT_XNU=1
+		"-DXNU_RETURN_AFTER=\"0\"" "-DXNU_EXTRA_ARGS=\"$XNU_ARGS epoch=$EPOCH\"")
+fi
 for tool in adb fastboot python3; do
 	command -v $tool >/dev/null || { echo "xnu-cycle.sh: $tool is not in PATH"; exit 1; }
 done
@@ -35,6 +42,7 @@ fastboot devices | grep -q $S || { echo "the phone did not come up in fastboot";
 [ "$(fastboot -s $S getvar current-slot 2>&1 | sed -n 's/^current-slot: //p')" = a ] || { echo "current slot is not a"; exit 1; }
 fastboot -s $S flash boot_a "$ROOT/xnu-flashed-slot_a.img" >/dev/null 2>&1
 fastboot -s $S reboot >/dev/null 2>&1
+[ -n "$XNU_STAY" ] && { echo "flashed: the r1 now boots XNU by itself; hold the side button 3 s for Android"; exit 0; }
 echo "waiting for Android, to ask it for one XNU boot..."
 for i in $(seq 1 100); do [ "$(adb -s $S get-state 2>/dev/null)" = device ] && break; sleep 3; done
 adb -s $S root >/dev/null 2>&1; sleep 2; adb -s $S wait-for-device  # r1: userdebug adb root instead of su

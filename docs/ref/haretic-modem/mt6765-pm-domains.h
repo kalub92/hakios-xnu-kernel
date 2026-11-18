@@ -1,0 +1,175 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
+#ifndef __MT6765_PM_DOMAINS_H
+#define __MT6765_PM_DOMAINS_H
+
+#include "mtk-pm-domains.h"
+#include <dt-bindings/power/mediatek,mt6765-power.h>
+
+/*
+ * MT6765 power domain support
+ */
+
+#define MT6765_PWR_STATUS 0x180
+#define MT6765_PWR_STATUS_2ND 0x184
+
+static enum scpsys_bus_prot_block scpsys_bus_prot_blocks_mt6765[] = {
+	BUS_PROT_BLOCK_INFRA,
+};
+
+static const struct scpsys_domain_data scpsys_domain_data_mt6765[] = {
+	[MT6765_POWER_DOMAIN_MD1] = {
+		.name = "md1",
+		.sta_mask = BIT(0),
+		.ctl_offs = 0x320,
+		.pwr_sta_offs = MT6765_PWR_STATUS,
+		.pwr_sta2nd_offs = MT6765_PWR_STATUS_2ND,
+		.sram_pdn_bits = GENMASK(8, 8),
+		.sram_pdn_ack_bits = 0,
+		/* MD_SRAM_ISO_CON and MD_EXTRA_PWR_CON */
+		.ext_sram_iso_offs = 0x394,
+		.ext_sram_iso_mask = BIT(0),
+		.ext_buck_iso_offs = 0x398,
+		.ext_buck_iso_mask = BIT(0),
+		/*
+		 * Off until the modem driver boots the modem, instead of being
+		 * powered at probe and powered off again as unused. A running
+		 * modem stays powered through system sleep: the modem driver
+		 * keeps the domain on by marking its device as awake path.
+		 */
+		.caps = MTK_SCPD_MODEM_LEGACY_PWRSEQ | MTK_SCPD_EXT_SRAM_ISO |
+			MTK_SCPD_KEEP_DEFAULT_OFF | MTK_SCPD_ACTIVE_WAKEUP,
+		.bp_cfg = {
+			/* PERI2MD, then the MD bus masters and MD2PERI */
+			BUS_PROT_WR_IGN(INFRA, BIT(7), 0x2a0, 0x2a4, 0x228),
+			BUS_PROT_WR_IGN(INFRA, BIT(3) | BIT(4),
+					0x2a0, 0x2a4, 0x228),
+			BUS_PROT_WR_IGN(INFRA, BIT(6), 0x2a8, 0x2ac, 0x258),
+		},
+	},
+	[MT6765_POWER_DOMAIN_CONN] = {
+		.name = "conn",
+		.sta_mask = PWR_STATUS_CONN,
+		.ctl_offs = 0x32c,
+		.pwr_sta_offs = MT6765_PWR_STATUS,
+		.pwr_sta2nd_offs = MT6765_PWR_STATUS_2ND,
+		.sram_pdn_bits = 0,
+		.sram_pdn_ack_bits = 0,
+		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
+		/*
+		 * Same steps as the vendor clk-mt6765-pg.c. The vendor code
+		 * never waits for the INFRA_TOPAXI_PROTECTEN_1 bit 18 ack, so
+		 * that step has no ack mask here; the others ack in STA1.
+		 */
+		.bp_cfg = {
+			BUS_PROT_WR_IGN(INFRA, BIT(13), 0x2a0, 0x2a4, 0x228),
+			_BUS_PROT(INFRA, BIT(18), 0x2a8, 0x2ac, 0, 0x258,
+				  BUS_PROT_IGNORE_CLR_ACK),
+			BUS_PROT_WR_IGN(INFRA, BIT(14) | BIT(16),
+					0x2a0, 0x2a4, 0x228),
+		},
+	},
+	/*
+	 * DPY (the DRAM controller) and IFR (infra) have no consumers. Once
+	 * SCPSYS syncs, genpd powers unused domains off, and that hung the
+	 * board at boot. The SPM firmware handles them in system sleep.
+	 */
+	[MT6765_POWER_DOMAIN_DPY] = {
+		.name = "dpy",
+		.sta_mask = BIT(2),
+		.ctl_offs = 0x31c,
+		.pwr_sta_offs = MT6765_PWR_STATUS,
+		.pwr_sta2nd_offs = MT6765_PWR_STATUS_2ND,
+		.sram_pdn_bits = GENMASK(11, 8),
+		.sram_pdn_ack_bits = GENMASK(15, 12),
+		.caps = MTK_SCPD_ALWAYS_ON,
+	},
+	[MT6765_POWER_DOMAIN_DISP] = {
+		.name = "disp",
+		.sta_mask = PWR_STATUS_DISP,
+		.ctl_offs = 0x30c,
+		.pwr_sta_offs = MT6765_PWR_STATUS,
+		.pwr_sta2nd_offs = MT6765_PWR_STATUS_2ND,
+		.sram_pdn_bits = GENMASK(8, 8),
+		.sram_pdn_ack_bits = GENMASK(12, 12),
+	},
+	[MT6765_POWER_DOMAIN_MFG] = {
+		.name = "mfg",
+		.sta_mask = PWR_STATUS_MFG,
+		.ctl_offs = 0x338,
+		.pwr_sta_offs = MT6765_PWR_STATUS,
+		.pwr_sta2nd_offs = MT6765_PWR_STATUS_2ND,
+		.sram_pdn_bits = GENMASK(8, 8),
+		.sram_pdn_ack_bits = GENMASK(12, 12),
+		.bp_cfg = {
+			BUS_PROT_WR_IGN(INFRA, BIT(25), 0x2a0, 0x2a4, 0x228),
+			BUS_PROT_WR_IGN(INFRA, BIT(21) | BIT(22),
+					0x2a0, 0x2a4, 0x228),
+		},
+	},
+	[MT6765_POWER_DOMAIN_ISP] = {
+		.name = "isp",
+		.sta_mask = PWR_STATUS_ISP,
+		.ctl_offs = 0x308,
+		.pwr_sta_offs = MT6765_PWR_STATUS,
+		.pwr_sta2nd_offs = MT6765_PWR_STATUS_2ND,
+		.sram_pdn_bits = GENMASK(8, 8),
+		.sram_pdn_ack_bits = GENMASK(12, 12),
+	},
+
+	[MT6765_POWER_DOMAIN_IFR] = {
+		.name = "ifr",
+		.sta_mask = BIT(6),
+		.ctl_offs = 0x318,
+		.pwr_sta_offs = MT6765_PWR_STATUS,
+		.pwr_sta2nd_offs = MT6765_PWR_STATUS_2ND,
+		.sram_pdn_bits = GENMASK(8, 8),
+		.sram_pdn_ack_bits = GENMASK(12, 12),
+		.caps = MTK_SCPD_ALWAYS_ON,
+	},
+	[MT6765_POWER_DOMAIN_MFG_CORE0] = {
+		.name = "mfg_core0",
+		.sta_mask = BIT(7),
+		.ctl_offs = 0x34c,
+		.pwr_sta_offs = MT6765_PWR_STATUS,
+		.pwr_sta2nd_offs = MT6765_PWR_STATUS_2ND,
+		.sram_pdn_bits = GENMASK(8, 8),
+		.sram_pdn_ack_bits = GENMASK(12, 12),
+	},
+	[MT6765_POWER_DOMAIN_MFG_ASYNC] = {
+		.name = "mfg_async",
+		.sta_mask = PWR_STATUS_MFG_ASYNC,
+		.ctl_offs = 0x334,
+		.pwr_sta_offs = MT6765_PWR_STATUS,
+		.pwr_sta2nd_offs = MT6765_PWR_STATUS_2ND,
+		.sram_pdn_bits = 0,
+		.sram_pdn_ack_bits = 0,
+	},
+	[MT6765_POWER_DOMAIN_CAM] = {
+		.name = "cam",
+		.sta_mask = BIT(25),
+		.ctl_offs = 0x344,
+		.pwr_sta_offs = MT6765_PWR_STATUS,
+		.pwr_sta2nd_offs = MT6765_PWR_STATUS_2ND,
+		.sram_pdn_bits = GENMASK(9, 8),
+		.sram_pdn_ack_bits = GENMASK(13, 12),
+	},
+	[MT6765_POWER_DOMAIN_VCODEC] = {
+		.name = "vcodec",
+		.sta_mask = BIT(26),
+		.ctl_offs = 0x300,
+		.pwr_sta_offs = MT6765_PWR_STATUS,
+		.pwr_sta2nd_offs = MT6765_PWR_STATUS_2ND,
+		.sram_pdn_bits = GENMASK(8, 8),
+		.sram_pdn_ack_bits = GENMASK(12, 12),
+    },
+};
+
+static const struct scpsys_soc_data mt6765_scpsys_data = {
+	.domains_data = scpsys_domain_data_mt6765,
+	.num_domains = ARRAY_SIZE(scpsys_domain_data_mt6765),
+	.bus_prot_blocks = scpsys_bus_prot_blocks_mt6765,
+	.num_bus_prot_blocks = ARRAY_SIZE(scpsys_bus_prot_blocks_mt6765),
+};
+
+#endif /* __MT6765_PM_DOMAINS_H */

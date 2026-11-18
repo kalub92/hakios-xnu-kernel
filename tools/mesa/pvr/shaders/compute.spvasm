@@ -1,0 +1,38 @@
+; pvr_vk_test's compute shader
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %arr ArrayStride 4
+               OpMemberDecorate %Buf 0 Offset 0
+               OpDecorate %Buf BufferBlock
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+       %void = OpTypeVoid
+     %fnvoid = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+     %v3uint = OpTypeVector %uint 3
+  %ptr_in_v3 = OpTypePointer Input %v3uint
+        %gid = OpVariable %ptr_in_v3 Input
+        %arr = OpTypeRuntimeArray %uint
+        %Buf = OpTypeStruct %arr
+    %ptr_buf = OpTypePointer Uniform %Buf
+        %buf = OpVariable %ptr_buf Uniform
+      %int_0 = OpConstant %int 0
+     %uint_0 = OpConstant %uint 0
+     %uint_3 = OpConstant %uint 3
+     %uint_7 = OpConstant %uint 7
+%ptr_in_uint = OpTypePointer Input %uint
+ %ptr_u_uint = OpTypePointer Uniform %uint
+       %main = OpFunction %void None %fnvoid
+      %entry = OpLabel
+        %pid = OpAccessChain %ptr_in_uint %gid %uint_0
+          %x = OpLoad %uint %pid
+          %m = OpIMul %uint %x %uint_3
+          %v = OpIAdd %uint %m %uint_7
+          %e = OpAccessChain %ptr_u_uint %buf %int_0 %x
+               OpStore %e %v
+               OpReturn
+               OpFunctionEnd

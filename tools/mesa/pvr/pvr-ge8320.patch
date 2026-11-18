@@ -1,0 +1,164 @@
+--- /dev/null
++++ b/src/imagination/common/device_info/ge8320.h
+@@ -0,0 +1,135 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * GE8320 (Series 8XE), BVNC 22.87.104.18: the GPU of MediaTek's MT6765 (the Rabbit r1).
++ * Not an upstream entry (Darwin on redwood, tools/mesa/pvr-ge8320.patch).
++ *
++ * Where each value is from:
++ *   [FW]  the device-info block of the open firmware rogue_22.87.104.18_v1.fw
++ *   [KM]  Imagination's kernel-side DDK headers rgxconfig_km_22.V.104.18.h and
++ *         rgxcore_km_22.87.104.18.h (dual MIT/GPL; the same values in four public trees, e.g.
++ *         github.com/MediaTek-Labs/common-kernel-4.19 drivers/gpu/mediatek/gpu_rgx/
++ *         m1.11ED5425693/hwdefs/km/{configs,cores}/ and github.com/tomstokes/
++ *         ti-img-rogue-driver hwdefs/rogue/km/{configs,cores}/)
++ *   [8300] NOT SOURCED for this core: copied from Mesa's GE8300 22.V.54.38 (ge8300.h), the
++ *         nearest relative with an entry. These are user-mode-only values that neither the
++ *         firmware nor the KM headers carry; the authoritative source is the user-mode
++ *         rgxconfig_22.V.104.18.h of the closed DDK (or Imagination).
++ */
++
++#ifndef GE8320_H
++#define GE8320_H
++
++#include <stdbool.h>
++
++#include "pvr_device_info.h"
++
++#define PVR_DEVICE_IDENT_22_V_104_18 \
++   .device_id = 0x22104018, .series_name = "Rogue", \
++   .public_name = "GE8320", .arch = PVR_DEVICE_ARCH_ROGUE
++
++static const struct pvr_device_features pvr_device_features_22_V_104_18 = {
++   .has_astc = true,                                /* [8300] */
++   .has_common_store_size_in_dwords = true,         /* [FW] */
++   .has_compute = true,                             /* [FW][KM] */
++   .has_compute_overlap = true,                     /* [FW] */
++   /* .has_gs_rta_support = true,                      [FW][KM] has it; left off as in ge8300.h */
++   .has_ipf_creq_pf = true,                         /* [8300] */
++   .has_isp_max_tiles_in_flight = true,             /* [FW] */
++   .has_isp_samples_per_pixel = true,               /* [FW] */
++   .has_max_instances_per_pds_task = true,          /* [8300] */
++   .has_max_multisample = true,                     /* [8300] */
++   .has_max_partitions = true,                      /* [FW] */
++   .has_max_usc_tasks = true,                       /* [8300] */
++   .has_num_clusters = true,                        /* [FW][KM] */
++   .has_num_raster_pipes = true,                    /* [FW][KM] */
++   .has_pbe2_in_xe = true,                          /* [FW][KM] */
++   .has_pbe_filterable_f16 = true,                  /* [8300] */
++   .has_pbe_yuv = true,                             /* [8300] */
++   .has_roguexe = true,                             /* [FW][KM] */
++   .has_simple_internal_parameter_format = true,    /* [FW][KM] */
++   .has_simple_internal_parameter_format_v1 = true, /* [KM] */
++   .has_simple_parameter_format_version = true,     /* [FW][KM] */
++   .has_slc_cache_line_size_bits = true,            /* [FW][KM] */
++   .has_tile_size_16x16 = true,                     /* [FW] */
++   .has_tile_size_x = true,                         /* [FW] */
++   .has_tile_size_y = true,                         /* [FW] */
++   .has_tpu_parallel_instances = true,              /* [8300] */
++   .has_transform_feedback_query_bits = true,       /* [8300] */
++   .has_unified_store_depth = true,                 /* [8300] */
++   .has_usc_f16sop_u8 = true,                       /* [8300] */
++   .has_usc_itrsmp = true,                          /* [8300] */
++   .has_usc_itrsmp_enhanced = true,                 /* [8300] */
++   .has_usc_itr_parallel_instances = true,          /* [8300] */
++   .has_usc_min_output_registers_per_pix = true,    /* [FW] */
++   .has_usc_slots = true,                           /* [8300] */
++   .has_uvs_banks = true,                           /* [8300] */
++   .has_uvs_pba_entries = true,                     /* [8300] */
++   .has_uvs_vtx_entries = true,                     /* [8300] */
++   .has_vdm_cam_size = true,                        /* [8300] */
++
++   .common_store_size_in_dwords = 19456U,           /* [FW] (the GE8300 has 16384) */
++   .isp_max_tiles_in_flight = 7U,                   /* [FW] (the GE8300 has 4) */
++   .isp_samples_per_pixel = 1U,                     /* [FW] */
++   .max_instances_per_pds_task = 32U,               /* [8300] */
++   .max_multisample = 4U,                           /* [8300] */
++   .max_partitions = 10U,                           /* [FW] */
++   .max_usc_tasks = 104U,                           /* [8300] */
++   .num_clusters = 1U,                              /* [FW][KM] */
++   .num_raster_pipes = 1U,                          /* [FW][KM] */
++   .simple_parameter_format_version = 1U,           /* [FW][KM] */
++   .slc_cache_line_size_bits = 512U,                /* [FW][KM] */
++   .tile_size_x = 16U,                              /* [FW] */
++   .tile_size_y = 16U,                              /* [FW] */
++   .tpu_parallel_instances = 4U,                    /* [8300] */
++   .transform_feedback_query_bits = 32U,            /* [8300] */
++   .unified_store_depth = 208U,                     /* [8300] */
++   .usc_itr_parallel_instances = 16U,               /* [8300] */
++   .usc_min_output_registers_per_pix = 2U,          /* [FW] */
++   .usc_slots = 64U,                                /* [8300] */
++   .uvs_banks = 4U,                                 /* [8300] */
++   .uvs_pba_entries = 320U,                         /* [8300] */
++   .uvs_vtx_entries = 288U,                         /* [8300] */
++   .vdm_cam_size = 64U,                             /* [8300] */
++
++   .has_s8xe = true,                                /* derived: ROGUEXE and B = 22, as ge8300.h */
++};
++
++/*
++ * [FW] enhancement mask 0x1a5 = ERN 35421, 38748, 42606, 57596 and one more bit (61389 by [KM]);
++ * of those Mesa knows 35421 and 38748. ERN 42307 is not in the firmware's list (the kernel's
++ * table has no bit for it): [8300].
++ */
++static const struct pvr_device_enhancements
++   pvr_device_enhancements_22_87_104_18 = {
++      .has_ern35421 = true, /* [FW] */
++      .has_ern38748 = true, /* [FW] */
++      .has_ern42307 = true, /* [8300] */
++   };
++
++/*
++ * [FW] quirks: BRN 49927, 63553, 66011 and three bits the kernel's table has no name for; of the
++ * named ones Mesa knows 49927 and 66011 (63553 is the kernel's business). BRN 70165 and 74056 are
++ * user-mode workarounds that no source for this core names: [8300].
++ */
++static const struct pvr_device_quirks pvr_device_quirks_22_87_104_18 = {
++   .has_brn49927 = true, /* [FW] */
++   .has_brn66011 = true, /* [FW] */
++   .has_brn70165 = true, /* [8300] */
++   .has_brn74056 = true, /* [8300] */
++};
++
++static const struct pvr_device_info pvr_device_info_22_87_104_18 = {
++   .ident = {
++      PVR_DEVICE_IDENT_22_V_104_18,
++      .b = 22,
++      .v = 87,
++      .n = 104,
++      .c = 18,
++   },
++   .features = pvr_device_features_22_V_104_18,
++   .enhancements = pvr_device_enhancements_22_87_104_18,
++   .quirks = pvr_device_quirks_22_87_104_18,
++};
++
++#endif /* GE8320_H */
+--- a/src/imagination/common/pvr_device_info.c
++++ b/src/imagination/common/pvr_device_info.c
+@@ -36,6 +36,7 @@
+ #include "device_info/gx6650.h"
+ #include "device_info/ge7800.h"
+ #include "device_info/ge8300.h"
++#include "device_info/ge8320.h"
+ #include "device_info/axe-1-16m.h"
+ #include "device_info/bxe-2-32.h"
+ #include "device_info/bxe-4-32.h"
+@@ -54,6 +55,7 @@
+    &pvr_device_info_22_67_54_30,
+    &pvr_device_info_22_68_54_30,
+    &pvr_device_info_22_102_54_38,
++   &pvr_device_info_22_87_104_18,
+    &pvr_device_info_33_15_11_3,
+    &pvr_device_info_36_29_52_182,
+    &pvr_device_info_36_50_54_182,
+@@ -87,6 +89,7 @@
+       CASE_PACKED_BVNC_DEVICE_INFO(15, 5, 1, 64);
+       CASE_PACKED_BVNC_DEVICE_INFO(22, 67, 54, 30);
+       CASE_PACKED_BVNC_DEVICE_INFO(22, 68, 54, 30);
++      CASE_PACKED_BVNC_DEVICE_INFO(22, 87, 104, 18);
+       CASE_PACKED_BVNC_DEVICE_INFO(22, 102, 54, 38);
+       CASE_PACKED_BVNC_DEVICE_INFO(33, 15, 11, 3);
+       CASE_PACKED_BVNC_DEVICE_INFO(36, 29, 52, 182);

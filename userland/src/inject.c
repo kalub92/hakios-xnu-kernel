@@ -38,6 +38,7 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <notify.h>
+#include <os/lock.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
@@ -48,6 +49,7 @@ static void *prof_main(void *unused);  /* bbd_prof=1 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <signal.h>
@@ -1360,6 +1362,153 @@ brightness_fixes(void)
 	method_setImplementation(method, (IMP)wait_for_als_arrival);
 }
 
+/* ---- backboardd: the r1's backlight (sysctl kern.redwood.backlight, boot-arg r1_bl=1) ---------------- */
+
+/*
+ * CoreBrightness finds no AppleARMBacklight, so -[BrightnessSystem copyPropertyForKey:@"CBBrightnessControlAvailable"]
+ * is nil and Control Centre disables its slider: that answer is forced to YES. backboardd's funnel is then
+ * -[BrightnessSystem setProperty:forKey:]: the slider sends DisplayBrightness (and DisplayInitialBrightness at boot) as
+ * @{Brightness: 0..1, Commit: bool}; lock and blank send DisplayBrightnessFactor / DisplayBrightnessFactorWithFade (0..1).
+ * level = max(8, round(brightness x factor x 511)), 0 when the factor is 0, to the kernel's MT6370 driver.
+ * Nothing is done unless the sysctl reads (r1_bl=1).
+ */
+static IMP bl_orig_set, bl_orig_copy;
+static float bl_brightness = -1, bl_factor = 1;
+static int bl_written = -1, bl_writes, bl_errno;
+static unsigned bl_calls;
+static os_unfair_lock bl_lock = OS_UNFAIR_LOCK_INIT;
+
+static void
+bl_write(CFStringRef key)
+{
+	int level, current;
+	size_t length = sizeof(current);
+	char name[48] = "?";
+
+	if (key != NULL) {
+		CFStringGetCString(key, name, sizeof(name), kCFStringEncodingUTF8);
+	}
+	os_unfair_lock_lock(&bl_lock);
+	level = bl_factor <= 0 ? 0 : (int)(bl_brightness * bl_factor * 511.0f + 0.5f);
+	level = bl_factor > 0 && level < 8 ? 8 : level;
+	if (bl_brightness >= 0 && level != bl_written && sysctlbyname("kern.redwood.backlight", &current, &length, NULL, 0) == 0) {
+		if (sysctlbyname("kern.redwood.backlight", NULL, NULL, &level, sizeof(level)) == 0) {
+			bl_written = level;
+			bl_writes++;
+			bl_errno = 0;
+		} else {
+			bl_errno = errno;
+		}
+		if (++bl_calls <= 40 || bl_calls % 20 == 0) {
+			keep_line("r1bl-hook: #%u %s brightness %.3f factor %.3f -> level %d errno %d", bl_calls, name, bl_brightness, bl_factor, level, bl_errno);
+		}
+	}
+	os_unfair_lock_unlock(&bl_lock);
+}
+
+/* a CFNumber (or the "Brightness" of a CFDictionary) as a float; false when it is neither */
+static bool
+bl_float(CFTypeRef value, float *out)
+{
+	if (value != NULL && CFGetTypeID(value) == CFDictionaryGetTypeID()) {
+		value = CFDictionaryGetValue(value, CFSTR("Brightness"));
+	}
+	return value != NULL && CFGetTypeID(value) == CFNumberGetTypeID() && CFNumberGetValue(value, kCFNumberFloatType, out);
+}
+
+static BOOL
+bl_set(id self, SEL selector, CFTypeRef value, CFStringRef key)
+{
+	BOOL result = ((BOOL (*)(id, SEL, CFTypeRef, CFStringRef))bl_orig_set)(self, selector, value, key);
+	float number;
+
+	if (key == NULL || CFGetTypeID(key) != CFStringGetTypeID()) {
+		return result;
+	}
+	if (CFEqual(key, CFSTR("DisplayBrightness")) || CFEqual(key, CFSTR("DisplayInitialBrightness"))) {
+		if (bl_float(value, &number)) {
+			bl_brightness = number;
+			bl_write(key);
+		}
+	} else if (CFEqual(key, CFSTR("DisplayBrightnessFactor")) || CFEqual(key, CFSTR("DisplayBrightnessFactorWithFade"))) {
+		if (bl_float(value, &number)) {
+			bl_factor = number;
+			bl_write(key);
+		}
+	}
+	return result;
+}
+
+static CFTypeRef
+bl_copy(id self, SEL selector, CFStringRef key)
+{
+	CFTypeRef result = ((CFTypeRef (*)(id, SEL, CFStringRef))bl_orig_copy)(self, selector, key);   /* +1 ("copy") */
+	static bool said;
+
+	if (result == NULL && key != NULL && CFGetTypeID(key) == CFStringGetTypeID() && CFEqual(key, CFSTR("CBBrightnessControlAvailable"))) {
+		if (!said) {
+			said = true;
+			keep_line("r1bl-hook: CBBrightnessControlAvailable forced YES");
+		}
+		return CFRetain(kCFBooleanTrue);
+	}
+	return result;
+}
+
+static void
+backlight_try(void)
+{
+	Class cls = objc_getClass("BrightnessSystem");
+	Method m;
+
+	if (cls == NULL) {
+		return;
+	}
+	if (bl_orig_set == NULL && (m = class_getInstanceMethod(cls, sel_registerName("setProperty:forKey:"))) != NULL &&
+	    strcmp(method_getTypeEncoding(m), "B32@0:8@16@24") == 0) {
+		bl_orig_set = method_setImplementation(m, (IMP)bl_set);
+		keep_line("r1bl-hook: -[BrightnessSystem setProperty:forKey:] hooked");
+	}
+	if (bl_orig_copy == NULL && (m = class_getInstanceMethod(cls, sel_registerName("copyPropertyForKey:"))) != NULL &&
+	    strcmp(method_getTypeEncoding(m), "@24@0:8@16") == 0) {
+		bl_orig_copy = method_setImplementation(m, (IMP)bl_copy);
+		keep_line("r1bl-hook: -[BrightnessSystem copyPropertyForKey:] hooked");
+	}
+}
+
+/* BrightnessSystem (CoreBrightness) may not be loaded yet when this runs: look again every half second */
+static void *
+backlight_thread(__unused void *argument)
+{
+	/* the kernel's kept lines are full early on: a line a minute is what survives */
+	for (unsigned tries = 1;; tries++) {
+		usleep(500000);
+		if (tries < 240 && (bl_orig_set == NULL || bl_orig_copy == NULL)) {
+			backlight_try();
+		}
+		if (tries % 120 == 0) {
+			keep_line("r1bl-hook: a minute on: set %d, copy %d; brightness %.3f factor %.3f, %d write(s), last level %d, errno %d",
+			    bl_orig_set != NULL, bl_orig_copy != NULL, bl_brightness, bl_factor, bl_writes, bl_written, bl_errno);
+		}
+	}
+	return NULL;
+}
+
+static void
+backlight_hook(void)
+{
+	pthread_t thread;
+	int current;
+	size_t length = sizeof(current);
+
+	if (sysctlbyname("kern.redwood.backlight", &current, &length, NULL, 0) != 0) {
+		return;         /* no r1_bl=1: inactive */
+	}
+	if (pthread_create(&thread, NULL, backlight_thread, NULL) == 0) {
+		pthread_detach(thread);
+	}
+}
+
 /* ---- backboardd: the touch screen and the buttons ---------------------------------------------- */
 
 /* IOKit's HID event system, the part that has no public header on iOS (prototypes checked against 20F66) */
@@ -1815,6 +1964,20 @@ container_manager_fixes(void)
  * Boot-arg gl=0: not even with a GPU; gl=1: also without one, by Mesa's software driver (slow;
  * for working on eagl.c in QEMU).
  */
+/* caenv=CA_PRINT_...: CoreAnimation writes these to the window server's stderr; into the log as "ca: ..." lines */
+static void *
+ca_stderr_reader(void *argument)
+{
+	FILE *in = fdopen((int)(intptr_t)argument, "r");
+	char line[512];
+
+	while (in != NULL && fgets(line, sizeof(line), in) != NULL) {
+		line[strcspn(line, "\n")] = 0;
+		say("ca: %.300s\n", line);
+	}
+	return NULL;
+}
+
 static void
 opengl_es(void)
 {
@@ -1843,6 +2006,12 @@ opengl_es(void)
 		if (gpu == 0) {
 			/* the Infinix's Mali, kept by the kernel with boot-arg mali=1 (iokit/Kernel/RedwoodMali.cpp) */
 			gpu = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodMali"));
+		}
+		if (gpu == 0 && strstr(arguments, "pvr_gl=1") != NULL) {
+			/* the rabbit r1's PowerVR, served to programs by the kernel with boot-arg pvr=6 (iokit/Kernel/
+			 * RedwoodPVR.cpp): Mesa's Zink over its Vulkan driver (build.sh PVR=gl, src/gl_egl.c). Only when
+			 * asked for, while that is new: src/pvr_gl_test.c tries it without the window server */
+			gpu = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodPVR"));
 		}
 		wanted = gpu != 0;
 		if (gpu != 0) {
@@ -3060,6 +3229,273 @@ bluetool_serves(void)
 	dispatch_main();
 }
 
+/* Boot-arg bb_prof=SECONDS: sb_prof's sampler (inject_sb.c) in the window server: SECONDS after start, 10 s of samples (as fast as the loop goes, ~1-2 kHz) of the
+ * RUNNING threads, each a pc + lr + frame-pointer chain of up to BBPROF_DEPTH. Kept lines: "bbprof img N name unslid-base" (N+off below = image N + offset from its header),
+ * "bbprof thr" (samples per thread), "bbprof leaf" (top 40 leaf frames of the busiest thread), "bbprof stk" (top 25 stacks of it, depth >= 12, 12 frames a line). */
+#define BBPROF_DEPTH 28
+#define BBPROF_MAX   24000
+#define BBPROF_IMGS  512
+
+static struct bbprof_sample_t {
+	uint64_t tid;
+	uintptr_t frame[BBPROF_DEPTH];
+} bbprof_samples[BBPROF_MAX];
+static unsigned bbprof_n, bbprof_sec[16];
+static struct { uint64_t tid; char name[24]; } bbprof_names[64];
+static struct { uintptr_t lo, hi, header; const char *name; unsigned used; } bbprof_imgs[BBPROF_IMGS];
+static unsigned bbprof_nimgs;
+
+static void
+bbprof_sample(thread_t thread, unsigned *running)
+{
+	thread_basic_info_data_t info;
+	mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+	arm_thread_state64_t state;
+	thread_identifier_info_data_t ident;
+	uintptr_t frame[BBPROF_DEPTH] = { 0 }, fp;
+
+	if (thread_info(thread, THREAD_BASIC_INFO, (thread_info_t)&info, &count) != KERN_SUCCESS ||
+	    info.run_state != TH_STATE_RUNNING || bbprof_n >= BBPROF_MAX || thread_suspend(thread) != KERN_SUCCESS) {
+		return;
+	}
+	count = ARM_THREAD_STATE64_COUNT;
+	if (thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&state, &count) == KERN_SUCCESS) {
+		frame[0] = (uintptr_t)arm_thread_state64_get_pc(state) & 0x0000000fffffffffULL;
+		frame[1] = (uintptr_t)arm_thread_state64_get_lr(state) & 0x0000000fffffffffULL;
+		fp = (uintptr_t)arm_thread_state64_get_fp(state);
+		for (unsigned i = 2; i < BBPROF_DEPTH && fp != 0 && (fp & 7) == 0; i++) {
+			uintptr_t next = ((uintptr_t *)fp)[0];
+
+			frame[i] = ((uintptr_t *)fp)[1] & 0x0000000fffffffffULL;
+			if (next <= fp) {
+				break;
+			}
+			fp = next;
+		}
+	}
+	thread_resume(thread);
+	count = THREAD_IDENTIFIER_INFO_COUNT;
+	if (thread_info(thread, THREAD_IDENTIFIER_INFO, (thread_info_t)&ident, &count) != KERN_SUCCESS) {
+		ident.thread_id = 0;
+	}
+	(*running)++;
+	bbprof_samples[bbprof_n].tid = ident.thread_id;
+	memcpy(bbprof_samples[bbprof_n].frame, frame, sizeof(frame));
+	bbprof_n++;
+	for (unsigned i = 0; i < 64; i++) {
+		if (bbprof_names[i].tid == ident.thread_id) {
+			break;
+		}
+		if (bbprof_names[i].tid == 0) {
+			thread_extended_info_data_t ext;
+
+			count = THREAD_EXTENDED_INFO_COUNT;
+			bbprof_names[i].tid = ident.thread_id;
+			if (thread_info(thread, THREAD_EXTENDED_INFO, (thread_info_t)&ext, &count) == KERN_SUCCESS) {
+				snprintf(bbprof_names[i].name, sizeof(bbprof_names[i].name), "%s", ext.pth_name);
+			}
+			break;
+		}
+	}
+}
+
+static unsigned
+bbprof_image(uintptr_t address)	/* index into bbprof_imgs of the image holding the (PAC-stripped) address, or ~0 */
+{
+	for (unsigned i = 0; i < bbprof_nimgs; i++) {
+		if (address >= bbprof_imgs[i].lo && address < bbprof_imgs[i].hi) {
+			return i;
+		}
+	}
+	return ~0u;
+}
+
+static void
+bbprof_load_images(void)
+{
+	for (uint32_t i = 0; i < _dyld_image_count() && bbprof_nimgs < BBPROF_IMGS; i++) {
+		const struct mach_header_64 *mh = (const void *)_dyld_get_image_header(i);
+		intptr_t s = _dyld_get_image_vmaddr_slide(i);
+		const struct load_command *lc = (const void *)(mh + 1);
+		uintptr_t lo = ~(uintptr_t)0, hi = 0;
+
+		for (uint32_t c = 0; c < mh->ncmds; c++, lc = (const void *)((const char *)lc + lc->cmdsize)) {
+			if (lc->cmd == LC_SEGMENT_64) {
+				const struct segment_command_64 *sg = (const void *)lc;
+
+				if (strcmp(sg->segname, "__PAGEZERO") == 0 || sg->vmsize == 0) {
+					continue;
+				}
+				uintptr_t a = (sg->vmaddr + (uintptr_t)s) & 0x0000000fffffffffULL;
+				if (a < lo) lo = a;
+				if (a + sg->vmsize > hi) hi = a + sg->vmsize;
+			}
+		}
+		bbprof_imgs[bbprof_nimgs].lo = lo;
+		bbprof_imgs[bbprof_nimgs].hi = hi;
+		bbprof_imgs[bbprof_nimgs].header = (uintptr_t)mh & 0x0000000fffffffffULL;
+		bbprof_imgs[bbprof_nimgs].name = _dyld_get_image_name(i);
+		bbprof_nimgs++;
+	}
+}
+
+/* "N+off" of an address; marks the image used */
+static int
+bbprof_fmt(char *out, size_t size, uintptr_t a)
+{
+	unsigned i = bbprof_image(a);
+
+	if (i == ~0u) {
+		return snprintf(out, size, " ?%lx", (unsigned long)a);
+	}
+	bbprof_imgs[i].used = 1;
+	return snprintf(out, size, " %u+%lx", i, (unsigned long)(a - bbprof_imgs[i].header));
+}
+
+static int
+bbprof_same(const struct bbprof_sample_t *a, const struct bbprof_sample_t *b)
+{
+	return memcmp(a->frame, b->frame, sizeof(a->frame)) == 0;
+}
+
+static void *
+bbprof_thread(void *argument)
+{
+	unsigned delay = (unsigned)(uintptr_t)argument, rounds = 0, running = 0;
+	thread_t me = mach_thread_self();
+	uint64_t end, begin;
+	mach_timebase_info_data_t base;
+	static unsigned done[BBPROF_MAX];
+	static unsigned rank_n[BBPROF_MAX], rank_i[BBPROF_MAX];
+
+	pthread_setname_np("redwood bb profiler");
+	sleep(delay);
+	mach_timebase_info(&base);
+	begin = mach_absolute_time();
+	end = begin + 10ULL * NSEC_PER_SEC * base.denom / base.numer;
+	while (mach_absolute_time() < end) {
+		thread_act_array_t threads;
+		mach_msg_type_number_t n;
+
+		if (task_threads(mach_task_self(), &threads, &n) != KERN_SUCCESS) {
+			break;
+		}
+		for (unsigned round = 0; round < 20; round++, rounds++) {
+			unsigned before = running;
+
+			for (mach_msg_type_number_t i = 0; i < n; i++) {
+				if (threads[i] != me) {
+					bbprof_sample(threads[i], &running);
+				}
+			}
+			unsigned sec = (unsigned)((mach_absolute_time() - begin) * base.numer / base.denom / NSEC_PER_SEC);
+
+			bbprof_sec[sec < 15 ? sec : 15] += running - before;
+			usleep(200);
+		}
+		for (mach_msg_type_number_t i = 0; i < n; i++) {
+			mach_port_deallocate(mach_task_self(), threads[i]);
+		}
+		vm_deallocate(mach_task_self(), (vm_address_t)threads, n * sizeof(threads[0]));
+	}
+	double secs = (double)(mach_absolute_time() - begin) * base.numer / base.denom / 1e9;
+
+	keep_line("bbprof: %u rounds in %.2f s (%.0f Hz), %u running-thread samples; shared cache slide %#lx", rounds, secs, rounds / secs, running, (unsigned long)slide);
+	keep_line("bbprof per second: %u %u %u %u %u %u %u %u %u %u", bbprof_sec[0], bbprof_sec[1], bbprof_sec[2], bbprof_sec[3], bbprof_sec[4], bbprof_sec[5],
+	    bbprof_sec[6], bbprof_sec[7], bbprof_sec[8], bbprof_sec[9]);
+	bbprof_load_images();
+	/* samples per thread */
+	uint64_t best_tid = 0;
+	unsigned best_count = 0;
+	for (unsigned t = 0; t < 64 && bbprof_names[t].tid; t++) {
+		unsigned c = 0;
+
+		for (unsigned i = 0; i < bbprof_n; i++) {
+			c += bbprof_samples[i].tid == bbprof_names[t].tid;
+		}
+		keep_line("bbprof thr %llx %s: %u", (unsigned long long)bbprof_names[t].tid, bbprof_names[t].name, c);
+		if (c > best_count) {
+			best_count = c;
+			best_tid = bbprof_names[t].tid;
+		}
+	}
+	keep_line("bbprof busiest thread %llx: %u samples", (unsigned long long)best_tid, best_count);
+	/* group the busiest thread's samples: leaf frame (rank by pc) and whole stack */
+	for (int pass = 0; pass < 2; pass++) {
+		unsigned groups = 0;
+
+		memset(done, 0, sizeof(done));
+		for (unsigned i = 0; i < bbprof_n; i++) {
+			if (bbprof_samples[i].tid != best_tid || done[i]) {
+				continue;
+			}
+			unsigned c = 0;
+
+			for (unsigned j = i; j < bbprof_n; j++) {
+				if (!done[j] && bbprof_samples[j].tid == best_tid &&
+				    (pass == 0 ? bbprof_samples[j].frame[0] == bbprof_samples[i].frame[0] : bbprof_same(&bbprof_samples[i], &bbprof_samples[j]))) {
+					done[j] = 1;
+					c++;
+				}
+			}
+			rank_n[groups] = c;
+			rank_i[groups++] = i;
+		}
+		for (unsigned top = 0; top < (pass == 0 ? 40u : 25u) && top < groups; top++) {
+			unsigned b = top;
+
+			for (unsigned g = top + 1; g < groups; g++) {
+				if (rank_n[g] > rank_n[b]) b = g;
+			}
+			unsigned tn = rank_n[b], ti = rank_i[b];
+			rank_n[b] = rank_n[top]; rank_i[b] = rank_i[top];
+			rank_n[top] = tn; rank_i[top] = ti;
+			char line[200];
+			size_t used;
+			unsigned depth = 0;
+
+			while (depth < BBPROF_DEPTH && bbprof_samples[ti].frame[depth]) depth++;
+			if (pass == 0) {
+				used = (size_t)snprintf(line, sizeof(line), "bbprof leaf %u:", tn);
+				bbprof_fmt(line + used, sizeof(line) - used, bbprof_samples[ti].frame[0]);
+				keep_line("%s", line);
+				continue;
+			}
+			for (unsigned f = 0; f < depth; f += 12) {
+				used = (size_t)snprintf(line, sizeof(line), "bbprof stk %u n%u d%u@%u:", top, tn, depth, f);
+				for (unsigned k = f; k < f + 12 && k < depth && used < sizeof(line) - 16; k++) {
+					used += (size_t)bbprof_fmt(line + used, sizeof(line) - used, bbprof_samples[ti].frame[k]);
+				}
+				keep_line("%s", line);
+			}
+		}
+	}
+	for (unsigned i = 0; i < bbprof_nimgs; i++) {
+		if (bbprof_imgs[i].used) {
+			uintptr_t h = bbprof_imgs[i].header;
+
+			keep_line("bbprof img %u %s unslid %lx", i, bbprof_imgs[i].name, (unsigned long)(h >= CACHE_BASE + slide ? h - slide : h));
+		}
+	}
+	return NULL;
+}
+
+static void
+bbprof_if_asked(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	const char *arg;
+	pthread_t thread;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (arg = strstr(args, "bb_prof=")) == NULL ||
+	    (arg != args && arg[-1] != ' ') || atoi(arg + 8) <= 0) {
+		return;
+	}
+	pthread_create(&thread, NULL, bbprof_thread, (void *)(uintptr_t)atoi(arg + 8));
+	pthread_detach(thread);
+}
+
 __attribute__((constructor))
 static void
 redwood_init(void)
@@ -3087,6 +3523,17 @@ redwood_init(void)
 			setenv("CA_FORCE_TIMER", "1", 1);
 			say("redwood: ca_vbl=1: CoreAnimation is to take the display driver's refresh notifications\n");
 		}
+				if (strstr(arguments, "caenv=CA_PRINT") != NULL) {
+			int fds[2];
+			pthread_t reader;
+
+			if (pipe(fds) == 0) {
+				dup2(fds[1], 2);
+				close(fds[1]);
+				pthread_create(&reader, NULL, ca_stderr_reader, (void *)(intptr_t)fds[0]);
+				pthread_detach(reader);
+			}
+		}
 		/*
 		 * Boot-arg caenv=NAME=VALUE (as many as wanted): into the window server's environment, for
 		 * CoreAnimation's own switches (CA_LOG_TRIPLE_BUFFERING=1, CA_FORCE_DOUBLE_BUFFERING=1 ...).
@@ -3109,6 +3556,7 @@ redwood_init(void)
 		}
 		opengl_es();
 		window_server_fixes();
+		backlight_hook();
 		/*
 		 * brightness_fixes() is not used for now: with it backboardd no longer took our touch
 		 * screen service for its own ("still waiting for a main screen digitizer"), whether the
@@ -3117,6 +3565,7 @@ redwood_init(void)
 		 * survive; not tried again since, and until it is, the five seconds stay.)
 		 */
 		input_start();
+		bbprof_if_asked();
 		orientation_start();
 	} else if (strncmp(name, "containermanagerd", 17) == 0) {
 		container_manager_fixes();

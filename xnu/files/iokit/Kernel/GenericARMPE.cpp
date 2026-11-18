@@ -387,13 +387,20 @@ GenericARMPE::start(IOService * provider)
  * firmware's clock) -- and the kernel's own timer counts from there. Without either the
  * calendar starts in 1970, as before.
  */
+extern "C" bool redwood_rtc_read(uint64_t *epoch);
+extern "C" bool redwood_rtc_write(uint64_t epoch);
+extern "C" void redwood_rtc_say(const char *format, ...) __printflike(1, 2);
+extern "C" bool redwood_rtc_read(uint64_t * epoch);
+extern "C" bool redwood_rtc_write(uint64_t epoch);
+extern "C" void redwood_rtc_say(const char * format, ...) __printflike(1, 2);
+static uint32_t gRtcMode;       /* boot-arg r1_rtc: 0 off, 1 read at boot, 2 also write back */
 static long gBootEpoch;         /* the calendar time at which the system timer read zero */
 static bool gBootEpochKnown;
 
 static void
 findBootEpoch(void)
 {
-	uint64_t epoch = 0;
+	uint64_t epoch = 0, rtc = 0;
 
 	if (gBootEpochKnown) {
 		return;
@@ -407,6 +414,14 @@ findBootEpoch(void)
 			memcpy(&epoch, data->getBytesNoCopy(), sizeof(epoch));
 		}
 		OSSafeReleaseNULL(chosen);
+	}
+	if (PE_parse_boot_argn("r1_rtc", &gRtcMode, sizeof(gRtcMode)) && gRtcMode >= 1) {
+		bool ok = redwood_rtc_read(&rtc);
+
+		redwood_rtc_say("r1rtc: epoch= %llu, diff %lld s; using %s", epoch, ok ? (long long)(rtc - epoch) : 0, ok ? "rtc" : "arg");
+		if (ok) {
+			epoch = rtc;
+		}
 	}
 	if (epoch != 0) {
 		clock_sec_t secs;
@@ -440,6 +455,9 @@ GenericARMPE::setGMTTimeOfDay(long secs)
 	clock_get_system_microtime(&uptime, &usecs);
 	gBootEpoch = secs - (long) uptime;
 	gBootEpochKnown = true;
+	if (gRtcMode == 2 && secs > 0) {
+		(void) redwood_rtc_write((uint64_t) secs);
+	}
 }
 
 /* Device-tree nodes to drop entirely. */

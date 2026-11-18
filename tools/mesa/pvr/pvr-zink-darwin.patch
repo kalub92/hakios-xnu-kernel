@@ -1,0 +1,194 @@
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -72,7 +72,12 @@
+ #include <unistd.h>
+ #if DETECT_OS_APPLE
+ /* See the vulkan-loader-rpath meson option for how to specify rpath at build time. */
++#ifdef ZINK_NO_MOLTENVK
++/* Darwin on redwood: no Vulkan loader; the PowerVR driver itself (tools/mk-mesa-pvr.sh) */
++#define VK_LIBNAME "/redwood/lib/libvulkan_powervr_mesa.dylib"
++#else
+ #define VK_LIBNAME "@rpath/libvulkan.1.dylib"
++#endif
+ #elif DETECT_OS_ANDROID
+ #define VK_LIBNAME "libvulkan.so"
+ #else
+@@ -80,7 +85,7 @@
+ #endif
+ #endif
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(ZINK_NO_MOLTENVK)
+ #include "MoltenVK/mvk_vulkan.h"
+ // Source of MVK_VERSION
+ #include "MoltenVK/mvk_config.h"
+@@ -1191,8 +1196,10 @@
+       caps->max_varyings = 16;
+    }
+ 
++   /* (Darwin on redwood: an IOSurface comes in as a dma-buf would, src/redwood-drm; nothing goes out,
++    * but EGL offers the import only with both) */
+    caps->dmabuf =
+-#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
++#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD || defined(ZINK_NO_MOLTENVK))
+       screen->info.have_KHR_external_memory_fd &&
+       screen->info.have_EXT_external_memory_dma_buf &&
+       screen->info.have_EXT_queue_family_foreign
+--- a/src/gallium/drivers/zink/meson.build
++++ b/src/gallium/drivers/zink/meson.build
+@@ -58,7 +58,10 @@
+ inc_zink_vk = []
+ zink_link_args = []
+ 
+-if host_machine.system() == 'darwin'
++if host_machine.system() == 'darwin' and host_machine.subsystem() == 'ios'
++  # Darwin on redwood: the Vulkan below is Mesa's own PowerVR driver, not MoltenVK
++  zink_c_args += ['-DZINK_NO_MOLTENVK']
++elif host_machine.system() == 'darwin'
+ 
+   # MoltenVK options
+   if with_moltenvk_dir != ''
+@@ -106,6 +109,7 @@
+     idep_vulkan_wsi_defines, idep_vulkan_util, dep_libdrm, vulkan_wsi_deps, idep_ntv,
+   ],
+   c_args: zink_c_args,
++  cpp_args: host_machine.system() == 'darwin' and host_machine.subsystem() == 'ios' ? ['-DZINK_NO_MOLTENVK'] : [],
+ )
+ 
+ zink_deps = [libzink]
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -48,7 +48,7 @@
+ #include "util/os_file.h"
+ #include "frontend/winsys_handle.h"
+ 
+-#if !defined(__APPLE__)
++#if !defined(__APPLE__) || defined(ZINK_NO_MOLTENVK) /* (an IOSurface comes in as a dma-buf would) */
+ #define ZINK_USE_DMABUF
+ #endif
+ 
+@@ -60,7 +60,7 @@
+ #define DRM_FORMAT_MOD_LINEAR 0
+ #endif
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(ZINK_NO_MOLTENVK)
+ #include "MoltenVK/mvk_vulkan.h"
+ // Source of MVK_VERSION
+ #include "MoltenVK/mvk_config.h"
+@@ -1114,7 +1114,12 @@
+    if (alloc_info->whandle) {
+       imfi.pNext = NULL;
+       imfi.handleType = alloc_info->external;
++#ifdef ZINK_NO_MOLTENVK
++      /* Darwin on redwood: not a descriptor but an IOSurface's ID, which the PowerVR driver takes as it is */
++      imfi.fd = alloc_info->whandle->handle;
++#else
+       imfi.fd = os_dupfd_cloexec(alloc_info->whandle->handle);
++#endif
+       if (imfi.fd < 0) {
+          mesa_loge("ZINK: failed to dup dmabuf fd: %s\n", strerror(errno));
+          return roc_fail_and_cleanup_object;
+--- a/src/gallium/drivers/zink/zink_instance.py
++++ b/src/gallium/drivers/zink/zink_instance.py
+@@ -81,7 +81,7 @@
+ 
+ #include <vulkan/vulkan_core.h>
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(ZINK_NO_MOLTENVK)
+ #include "MoltenVK/mvk_vulkan.h"
+ // Source of MVK_VERSION
+ #include "MoltenVK/mvk_config.h"
+@@ -253,7 +253,7 @@
+ 
+    VkInstanceCreateInfo ici = {0};
+    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(ZINK_NO_MOLTENVK)
+    ici.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+ #endif
+    ici.pApplicationInfo = &ai;
+@@ -302,7 +302,7 @@
+          if (screen->instance_info->have_${ext.name_with_vendor()}) {
+       %for cmd in registry.get_registry_entry(ext.name).instance_commands:
+             if (!screen->vk.${cmd.name()}) {
+-      #ifndef NDEBUG
++      #if !defined(NDEBUG) || defined(ZINK_NO_MOLTENVK) /* Darwin on redwood: the stub says which function, always */
+                screen->vk.${cmd.name()} = (PFN_${cmd.full_name})zink_stub_${cmd.name()};
+       #else
+                screen->vk.${cmd.name()} = (PFN_${cmd.full_name})zink_stub_function_not_loaded;
+@@ -311,7 +311,7 @@
+       %endfor
+       %for cmd in registry.get_registry_entry(ext.name).pdevice_commands:
+             if (!screen->vk.${cmd.name()}) {
+-      #ifndef NDEBUG
++      #if !defined(NDEBUG) || defined(ZINK_NO_MOLTENVK) /* Darwin on redwood: the stub says which function, always */
+                screen->vk.${cmd.name()} = (PFN_${cmd.full_name})zink_stub_${cmd.name()};
+       #else
+                screen->vk.${cmd.name()} = (PFN_${cmd.full_name})zink_stub_function_not_loaded;
+@@ -326,7 +326,7 @@
+ %endfor
+ }
+ 
+-#ifndef NDEBUG
++#if !defined(NDEBUG) || defined(ZINK_NO_MOLTENVK) /* Darwin on redwood: the stub says which function, always */
+ /* generated stub functions */
+ ## see zink_device_info.py for why this is needed
+ <% generated_funcs = set() %>
+--- a/src/gallium/drivers/zink/zink_device_info.py
++++ b/src/gallium/drivers/zink/zink_device_info.py
+@@ -862,7 +862,7 @@
+                %endif
+             %endif
+                   if (!screen->vk.${cmd.name()}) {
+-            #ifndef NDEBUG
++            #if !defined(NDEBUG) || defined(ZINK_NO_MOLTENVK) /* Darwin on redwood: the stub says which function, always */
+                      screen->vk.${cmd.name()} = (PFN_${cmd.full_name})zink_stub_${cmd.name()};
+             #else
+                      screen->vk.${cmd.name()} = (PFN_${cmd.full_name})zink_stub_function_not_loaded;
+@@ -895,7 +895,7 @@
+ %endfor
+ }
+ 
+-#ifndef NDEBUG
++#if !defined(NDEBUG) || defined(ZINK_NO_MOLTENVK) /* Darwin on redwood: the stub says which function, always */
+ /* generated stub functions */
+ ## remember the stub functions that are already generated
+ <% generated_funcs = set() %>
+--- a/src/gallium/drivers/zink/zink_batch.c
++++ b/src/gallium/drivers/zink/zink_batch.c
+@@ -615,6 +615,33 @@
+ {
+    MESA_TRACE_FUNC();
+ 
++#ifdef ZINK_NO_MOLTENVK
++   {
++      /* Darwin on redwood: every ten seconds, as a line the kernel keeps (kern.redwood.say, "!" first):
++       * how many batches went to Vulkan, how many batch states the context holds -- they are used
++       * again only when their batch is known to be finished --, and how far behind that knowledge is.
++       */
++      extern int sysctlbyname(const char *, void *, size_t *, void *, size_t);
++      static int64_t said;
++      static unsigned submits;
++      const int64_t now = os_time_get_nano();
++
++      submits++;
++      if (!said)
++         said = now;
++      if (now - said >= 10000000000ll) {
++         char line[200];
++
++         snprintf(line, sizeof(line),
++                  "!MESA: zink: 10 s: %u batches submitted; the context holds %u batch states; batch %u, the last "
++                  "known finished %u", submits, bs->ctx->batch_states_count, (unsigned)screen->curr_batch, screen->last_finished);
++         sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
++         submits = 0;
++         said = now;
++      }
++   }
++#endif
++
+    if (bs->is_device_lost) {
+       if (bs->ctx->reset.reset)
+          bs->ctx->reset.reset(bs->ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);

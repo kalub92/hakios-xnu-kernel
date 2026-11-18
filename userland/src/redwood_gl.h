@@ -11,6 +11,7 @@ struct redwood_gl *redwood_gl_create(int version);              /* a context of 
 int redwood_gl_make_current(struct redwood_gl *gl);             /* ... the calling thread's (NULL: none); 0 on failure */
 void redwood_gl_destroy(struct redwood_gl *gl);
 const char *redwood_gl_library(void);                           /* for the log */
+void *redwood_gl_current(void);                                  /* the library's own word on which context is the calling thread's (NULL: none, or it cannot say) */
 
 /*
  * The texture bound to GL_TEXTURE_2D made of an IOSurface's own memory: what is drawn into the
@@ -19,6 +20,7 @@ const char *redwood_gl_library(void);                           /* for the log *
  * done; the texture is to be filled and read back with OpenGL ES calls.
  */
 int redwood_gl_surface_texture(struct redwood_gl *gl, uint32_t surface);
+int redwood_gl_surface_plane_texture(struct redwood_gl *gl, uint32_t surface, int plane);  /* (plane -1: as above) */
 
 /*
  * CoreAnimation draws a layer's pixels with one of ninety "functions" (a fragment shader each); these

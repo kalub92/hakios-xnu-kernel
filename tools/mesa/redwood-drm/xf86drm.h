@@ -78,4 +78,69 @@ struct redwood_drm_surface {
 };
 int redwood_drm_surface(int fd, struct redwood_drm_surface *surface);
 
+/*
+ * For Mesa's PowerVR Vulkan driver (src/imagination; redwood_pvr_drm.c, the service RedwoodPVR):
+ * what it takes from libdrm beyond the above. It finds its GPU by listing devices, so there is a
+ * list of one; fences are the kernel's syncobjs, asked for with Linux's own requests.
+ */
+#define DRM_NODE_MAX            3
+#define DRM_DIR_NAME            "/dev"          /* (where the one node is said to be: /dev/null) */
+#define DRM_BUS_PCI             0               /* (none here; Mesa's common code names it) */
+#define DRM_BUS_PLATFORM        2
+#define DRM_BUS_HOST1X          3
+
+typedef struct _drmPciBusInfo {
+	uint16_t domain;
+	uint8_t bus, dev, func;
+} drmPciBusInfo, *drmPciBusInfoPtr;
+
+typedef struct _drmPlatformBusInfo {
+	char fullname[512];
+} drmPlatformBusInfo, *drmPlatformBusInfoPtr;
+
+typedef struct _drmPciDeviceInfo {
+	uint16_t vendor_id, device_id, subvendor_id, subdevice_id;
+	uint8_t revision_id;
+} drmPciDeviceInfo, *drmPciDeviceInfoPtr;
+
+typedef struct _drmPlatformDeviceInfo {
+	char **compatible;                      /* ends with NULL */
+} drmPlatformDeviceInfo, *drmPlatformDeviceInfoPtr;
+
+typedef struct _drmDevice {
+	char **nodes;                           /* DRM_NODE_MAX of them */
+	int available_nodes;                    /* bits by DRM_NODE_* */
+	int bustype;
+	union {
+		drmPciBusInfoPtr pci;
+		drmPlatformBusInfoPtr platform;
+		drmPlatformBusInfoPtr host1x;   /* (the same shape) */
+	} businfo;
+	union {
+		drmPciDeviceInfoPtr pci;
+		drmPlatformDeviceInfoPtr platform;
+	} deviceinfo;
+} drmDevice, *drmDevicePtr;
+
+int drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int max_devices);
+void drmFreeDevices(drmDevicePtr devices[], int count);
+int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device);
+void drmFreeDevice(drmDevicePtr *device);
+int drmDevicesEqual(drmDevicePtr a, drmDevicePtr b);
+int drmGetDeviceFromDevId(dev_t dev_id, uint32_t flags, drmDevicePtr *device);
+char *drmGetDeviceNameFromFd2(int fd);
+char *drmGetRenderDeviceNameFromFd(int fd);
+char *drmGetPrimaryDeviceNameFromFd(int fd);
+int drmGetNodeTypeFromFd(int fd);
+int drmIsKMS(int fd);
+int drmDropMaster(int fd);
+int drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t count);
+int drmSyncobjTimelineSignal(int fd, const uint32_t *handles, uint64_t *points, uint32_t count);
+int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t count);
+int drmSyncobjQuery2(int fd, uint32_t *handles, uint64_t *points, uint32_t count, uint32_t flags);
+
+/* (pvr maps a buffer where Vulkan's VK_EXT_map_memory_placed asks: `address` NULL for anywhere) */
+void *redwood_pvr_map(int fd, uint32_t handle, uint64_t size, void *address);
+void redwood_pvr_unmap(int fd, uint32_t handle, void *address);
+
 #endif

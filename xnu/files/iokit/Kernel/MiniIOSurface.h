@@ -123,6 +123,7 @@ public:
 	OSDictionary *                  values;
 	uint32_t                        useCount[2];
 	uint64_t                        maliSeq;        /* the last Mali job that draws into it (RedwoodMali) */
+	uint64_t                        pvrFence;       /* glwait=3: drawn when the PowerVR's jobs up to this are done (lockCommon) */
 	uint32_t                        purgeable;
 	bool                            traced;         /* made by a program of boot-arg surftrace_of: its ports are said too */
 

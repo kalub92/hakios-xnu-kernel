@@ -51,7 +51,8 @@
  * program and of the functions it asks for in vain (see census_draw()); glshaders=1 writes down
  * the text of every shader, glshow=TEXTURE (or WxH, with glshow_part=W,H and glshow_zoom=N) puts that texture over the corner of the picture, glplain=0 leaves the
  * draws without a program alone, glskip=N[,N...] leaves out the draws of those programs (see skip_draw()), glcopy=1 copies every IOSurface as if the library could not
- * share one, glwait=1 waits for the GPU at the end of every frame and glwait=0 never (see
+ * share one, glwait=1 waits for the GPU at the end of every frame, glwait=0 never and glwait=2 only after a
+ * frame that drew into a surface of the display's size (see
  * wait_for_frames), glfetch=0 keeps EXT_shader_framebuffer_fetch from CoreAnimation (see
  * fetch_offered), glgroup=0 leaves vibrant layers inside groups as they were (see group_draw_begin()), glprecision=0 leaves the shaders' "lowp" and "mediump" as they are (see all_highp), glenv=NAME=VALUE puts that into the environment for the library to find
  * (its own switches: FD_MESA_DEBUG=sysmem, say), vblur=0 blurs nothing whose radius varies and
@@ -61,16 +62,20 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <pthread.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "redwood_gl.h"
@@ -138,6 +143,7 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 struct eagl;
 static int eagl_tracing;                /* this frame's calls are written down (boot-arg gltrace=FIRST-LAST) */
 static int frame_lines;                 /* boot-arg glframes=1: a line for every frame (see frame_end()) */
+static int thread_lines;                /* boot-arg glthreads=1: every 10 s, this program's threads' processor time, and the cores' idle (threads_say()) */
 static int latency_lines;               /* boot-arg touch_lat=1: when every frame began and ended (see frame_end()) */
 static uint64_t slow_calls_us;          /* boot-arg glslow=US: a line for every call that takes longer (eagl_leave()) */
 static uint64_t call_began_us;          /* (when the call in progress began) */
@@ -168,6 +174,54 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+}
+
+/*
+ * The rabbit r1's PowerVR behind this (src/gl_egl.c: Mesa's Zink over its Vulkan driver), where the window
+ * server's stderr is in no log: what is worth knowing of it goes to the kernel as lines to keep
+ * (kern.redwood.say, "!" first), which the kernel says again at the end of its log.
+ */
+static int zink_behind;
+
+/*
+ * ... and what the window server asked of this file, counted for that line (said every ten seconds,
+ * frame_end()): by which way a surface came to be a texture and what became of it, what was drawn
+ * into what, and how many frames ended with a picture in a surface.
+ */
+extern int redwood_gl_surface_stage, redwood_gl_surface_error;         /* src/gl_egl.c, src/gl_osmesa.c: why a surface was not shared */
+static struct {
+	unsigned attach, attach_no, attach_why;         /* -attachImage:toCoreSurface:: asked; refused, and the last reason (1 target, 2 no texture bound, 3 format, 4 no room) */
+	unsigned teximage;                              /* -texImageIOSurface:... */
+	unsigned mirrored, shared, copies;              /* an attached surface became: a second texture of its memory, the texture's memory, neither */
+	unsigned import_no, import_stage, import_error; /* redwood_gl_surface_texture() said no: how often, and the last time's stage and error */
+	unsigned width, height, row;                    /* the last surface attached */
+	unsigned fb_target;                             /* glFramebufferTexture2D with a surface's texture */
+	unsigned draws, draws_target, draws_none, draws_other;  /* draws and clears: into a surface's texture, with framebuffer 0, into another texture */
+	unsigned incomplete, status;                    /* a surface's framebuffer was not complete when drawn into: how often, the last status */
+	unsigned tex_shared, tex_copied;                /* -texImageIOSurface:...: the texture became the surface's memory; a copy */
+	unsigned uploads, uploads_planar;               /* textures filled from a surface by the processor (surface_to_texture()); ... from a plane of a planar one */
+	uint64_t upload_bytes, upload_us;               /* ... how much, and how long that took on the calling thread (the GPU's copy is in glFlush) */
+	uint32_t up_format, up_plane;                   /* the last one: the surface's pixel format, the plane, the size */
+	int up_width, up_height;
+	unsigned frames, presented;                     /* frames ended; ... with a picture drawn in or copied to a surface */
+	unsigned other_width, other_height;             /* the last surface not of the display's size that was drawn into */
+	IOSurfaceRef display;                           /* the last surface of the display's size that was drawn into */
+} zk;
+
+static unsigned zk_said_attach, zk_said_draw, zk_calls;         /* (zk_calls: what CoreAnimation called of OpenGL ES since the last line) */
+
+static void
+say_kept(const char *format, ...)
+{
+	char line[200] = "!";
+	va_list ap;
+
+	va_start(ap, format);
+	vsnprintf(line + 1, sizeof(line) - 1, format, ap);
+	va_end(ap);
+	write(2, line + 1, strlen(line + 1));
+	write(2, "\n", 1);
+	sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
 }
 
 static void
@@ -241,6 +295,12 @@ struct image {
 
 struct eagl {
 	void *table[SLOTS];             /* [0] is the context itself: what every entry gets as its first argument */
+	uint64_t owner, home;           /* zink_bind(): the thread it is current on (0: none), and the thread that draws the frames */
+	bool wanted;                    /* ... and another thread is waiting for it */
+	bool frame_ended;               /* ... or the frame is over: given back at the end of this call (zink_unbind()) */
+	uint64_t left_us;               /* when its owner last ended a call, and which (for the line that says who holds it) */
+	unsigned left_slot;
+	unsigned binds;                 /* how often it was made a thread's (the health line) */
 	id object;                      /* the EAGLContext */
 	struct redwood_gl *gl;
 	unsigned long api;
@@ -293,6 +353,7 @@ struct eagl {
 		GLenum type;
 	} arrays[8];                    /* the vertex arrays, as given */
 	bool in_frame;
+	bool drew_display;               /* (Zink) this frame drew into a surface of the display's size */
 	struct {                        /* what the line a frame gets with glframes=1 says (frame_end()) */
 		bool taken, boxed;      /* the first draw or clear into the display's picture seen; scissored */
 		GLint box[4];
@@ -301,6 +362,7 @@ struct eagl {
 		unsigned solid_spans, blended_spans;    /* line draws into it with blending off and on (glyphs' spans) */
 		unsigned solid_ends, blended_ends;      /* ... and their lines' ends */
 		unsigned other_spans, other_ends;       /* line draws into other targets */
+		char tex[200];          /* big shown surfaces bound: " id/plane WxH seed" (camera planes) */
 	} line;
 	/* a frame's worth */
 	unsigned calls, draws, triangles, uploads, clears, last_draws;
@@ -336,6 +398,7 @@ static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
 static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
+static int share_planes;                /* boot-arg glyuv=1: a camera's '420f' planes shared too, not copied every picture (surface_shared()) */
 /*
  * A frame is not drawn into its surface's memory but into a texture of the library's own, and the
  * GPU copies it into the surface at the frame's end (one blit; the display's driver waits for that
@@ -352,10 +415,44 @@ static int blit_targets = 1;
  * the GPU itself before it puts a surface on the panel, on a thread of its own, and says so in
  * the registry ("RedwoodWaitsForGPU"); the window server is then at its next frame meanwhile.
  * With a driver that does not, the frame is waited for here (glFinish). Boot-arg glwait=1:
- * here in any case; glwait=0: nowhere, to see what the waiting costs (and frames half drawn).
+ * here in any case; glwait=0: nowhere, to see what the waiting costs (and frames half drawn); glwait=2
+ * (Zink, a test): only after a frame that drew into a surface of the display's size -- a frame into
+ * smaller ones only is flushed and caught by the next wait (its readers in other programs, SpringBoard's
+ * snapshots, are then not waited for).
  */
 static int wait_for_frames = 1;
+/* glwait=3 (Zink, glblit=0): not waited for at all; the surface is marked for the kernel instead (target_to_surface()) */
+static unsigned marks_refused;
 static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's end does not push what Mesa holds back (frame_end()) */
+/*
+ * boot-arg glflush=1 (a test): the glFlushes CoreAnimation asks for in the middle of drawing are left
+ * out; the last of an update's (CA's render of it, QuartzCore, return 0x1882c9f7c, measured in s2b) is done
+ * as before, and frame_end() with it. Told apart by where in QuartzCore the call comes from (my_glFlush's
+ * return address, unslid: the first address of glframes=1's "asked for by"). glflush=1: the two of the
+ * per-draw state sync (0x1884ad1cc), made before a draw whose program reads the destination as a texture
+ * ("texmatD"); with Zink such a flush only ends the render pass. glflush=ADDR[,ADDR...] (hex, up to 8):
+ * those instead.
+ */
+static uint64_t flush_skip[8];
+static unsigned flush_skips, flushes_skipped, flushes_done;
+/*
+ * boot-arg glflush_from=SECONDS: from that uptime on, the callers of the next 150 glFlushes are said in the kept log, each with its
+ * number since the last flush of the end-of-update caller below and the time (mach us, as "tl:" lines have it), to tell
+ * the callers of mid-frame flushes from the last one before a swap.
+ * boot-arg glflush_mid=1: a glFlush that comes while a frame is being drawn into the display's surface (and nothing else that
+ * another program could read has been drawn into) is counted, not done: what it would have sent is sent by the next flush that is
+ * not left out -- CoreAnimation's end of an update (its caller, below), a glFinish, or the 24th in a row. Nothing here reads
+ * the surface before then: frame_end() (which hands the surface to the display) is left out with it.
+ */
+#define FLUSH_END_CALLER 0x1882c9f7cUL  /* (unslid) the return from CA's last flush of an update: see glflush=1 above */
+static uint64_t flush_from_us;
+static unsigned flush_log_left, flush_index, flush_run, flush_mid;
+static unsigned mid_chunks, mid_chunks_max, mid_updates;
+
+extern const void *_dyld_get_shared_cache_range(size_t *length);
+
+/* Where the shared cache was built to be, before it was moved (as src/inject.c has it). */
+#define CACHE_BASE 0x180000000UL
 /*
  * EXT_shader_framebuffer_fetch -- a fragment shader reads the pixel it is about to write -- is
  * what CoreAnimation draws a number of things with where the library offers it: the shadows
@@ -379,17 +476,120 @@ static const char *eagl_slot_name(unsigned offset);
 static void census_report(void);
 static void clear_now(struct eagl *e);
 
+/*
+ * EGL (Zink, the rabbit r1's PowerVR): a context is one thread's at a time, where EAGL's -- and OSMesa's,
+ * which simply lets it be -- can be current in several, used by one after the other. CoreAnimation makes
+ * its context in one thread and draws in another: left with the first, the second could not have it
+ * (EGL_BAD_ACCESS), and every call of the renderer's did nothing at all -- no texture, no framebuffer, no
+ * error (the r1, 13 November 2026: every -attachImage refused for "no texture bound", every draw "with
+ * no framebuffer"). So the context is handed over. The thread that ends the frames (frame_end()) is its
+ * home and keeps it between the calls of a frame; any other gives it back at the end of each call; and
+ * the home gives it up at the end of a call when another thread waits for it, and at the end of every
+ * frame.
+ * (At the end of every frame: the home thread sleeps between frames, and a thread asleep gives nothing
+ * up. Kept over that sleep, the context was out of every other thread's reach -- each call of
+ * another's waited its two seconds and then did nothing, thirty of them in a row a minute of a window
+ * server that stood still, 13 November 2026. One hand-over a frame costs nothing that is seen.)
+ */
+static pthread_mutex_t zink_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t zink_free = PTHREAD_COND_INITIALIZER;
+
+static uint64_t
+thread_id(void)
+{
+	uint64_t id = 0;
+
+	pthread_threadid_np(NULL, &id);
+	return id;
+}
+
+static void
+zink_bind(struct eagl *e)
+{
+	static unsigned said, failed;
+	uint64_t me = thread_id(), waited = now_us(), from;
+	struct timespec until;
+	bool bound = false;
+
+	clock_gettime(CLOCK_REALTIME, &until);
+	until.tv_sec += 2;
+	pthread_mutex_lock(&zink_lock);
+	if (current != NULL && current != e && current->owner == me) {
+		redwood_gl_make_current(NULL);          /* (this thread's other context, given back first) */
+		current->owner = 0;
+		current->wanted = false;
+		pthread_cond_broadcast(&zink_free);
+	}
+	current = NULL;
+	from = e->owner;
+	while (e->owner != 0 && e->owner != me) {
+		e->wanted = true;
+		if (pthread_cond_timedwait(&zink_free, &zink_lock, &until) != 0) {
+			break;
+		}
+	}
+	if (e->owner == 0 || e->owner == me) {
+		bound = redwood_gl_make_current(e->gl);
+		if (bound) {
+			e->owner = me;
+			e->binds++;
+			current = e;
+		}
+	}
+	pthread_mutex_unlock(&zink_lock);
+	if (!bound && (failed++ < 8 || failed % 20 == 0)) {
+		say_kept("redwood-gl: pvr: THE CONTEXT CANNOT BE MADE thread %llu's (%u times now): thread %llu has it and did not "
+		    "give it up in 2 s; the frames' thread %llu, %s a frame; its last call ended %llu ms ago (entry %#x)", me, failed,
+		    e->owner, e->home, e->in_frame ? "inside" : "outside", (now_us() - e->left_us) / 1000, e->left_slot);
+	} else if (bound && said++ < 6) {
+		say_kept("redwood-gl: pvr: the context is thread %llu's now (before: %llu; waited %llu us; the frames' thread %llu); "
+		    "EGL's current context here %p", me, from, now_us() - waited, e->home, redwood_gl_current());
+	}
+}
+
+/* ... and at the end of a call: given back, unless this is the frames' thread and nobody waits */
+static void
+zink_unbind(struct eagl *e, bool always)
+{
+	uint64_t me = thread_id();
+
+	/*
+	 * Kept only by the frames' thread, and by that only inside a frame: from its first draw or clear
+	 * (frame_begin()) to the call that ends it. Outside a frame every call gives it back -- the few
+	 * that set a frame up before its first draw, and those after its end, which were what took it
+	 * again for the sleep that follows (14 November 2026: the frame's end gave it back, a call or two
+	 * of tidying up took it again, and thread 353, woken by a finger on a dark screen, waited two
+	 * seconds a call for a context nobody was using; no frame after that).
+	 */
+	if (current != e || e->owner != me || (!always && e->home == me && e->in_frame && !e->wanted && !e->frame_ended)) {
+		return;
+	}
+	pthread_mutex_lock(&zink_lock);
+	redwood_gl_make_current(NULL);
+	e->owner = 0;
+	e->wanted = false;
+	e->frame_ended = false;
+	current = NULL;
+	pthread_cond_broadcast(&zink_free);
+	pthread_mutex_unlock(&zink_lock);
+}
+
 static void
 eagl_enter(struct eagl *e, unsigned offset)
 {
 	if (current != e) {
-		if (!redwood_gl_make_current(e->gl)) {
-			say("redwood-gl: the context cannot be made this thread's\n");
+		if (zink_behind) {
+			zink_bind(e);
+		} else {
+			if (!redwood_gl_make_current(e->gl)) {
+				say("redwood-gl: the context cannot be made this thread's\n");
+			}
+			current = e;
 		}
-		current = e;
 	}
 	slot_calls[offset / 8]++;
 	e->calls++;
+	zk_calls++;
 	if (slow_calls_us != 0) {
 		call_began_us = now_us();
 	}
@@ -404,6 +604,9 @@ eagl_leave(struct eagl *e, unsigned offset)
 		if (e->errors++ < 60) {
 			say("redwood-gl: %s: error %#x\n", eagl_slot_name(offset), error);
 		}
+		if (zink_behind && e->errors <= 8) {
+			say_kept("redwood-gl: pvr: %s: GL error %#x (frame %u)", eagl_slot_name(offset), error, e->frames);
+		}
 	}
 	if (slow_calls_us != 0) {
 		uint64_t now = now_us();
@@ -413,6 +616,11 @@ eagl_leave(struct eagl *e, unsigned offset)
 			say("tl: slow %s %llu at %llu, frame %u%s\n", eagl_slot_name(offset), now - call_began_us, now, e->frames + 1,
 			    e->in_frame ? "" : " (before its first draw)");
 		}
+	}
+	if (zink_behind) {
+		e->left_us = now_us();
+		e->left_slot = offset;
+		zink_unbind(e, false);
 	}
 }
 
@@ -626,6 +834,26 @@ surface_shared(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
 
+	if (share_planes && share_surfaces && !image->invert && IOSurfaceGetPlaneCount(surface) == 2 && image->plane < 2 &&
+	    image->type == GL_UNSIGNED_BYTE && (size_t)image->width == IOSurfaceGetWidthOfPlane(surface, image->plane) &&
+	    (size_t)image->height == IOSurfaceGetHeightOfPlane(surface, image->plane)) {
+		/*
+		 * (glyuv=1) the plane is the texture's memory: R8 for luma, GR88 for Cb,Cr. Asked for as luminance
+		 * (and alpha), it is read as that: red into red, green and blue, and green into alpha. Not made
+		 * (the import refused): the swizzle back as it was, and the plane copied as before.
+		 */
+		bool made = redwood_gl_surface_plane_texture(e->gl, IOSurfaceGetID(surface), (int)image->plane);
+		bool luminance = made && (image->format == 0x1909 || image->format == 0x190a);  /* GL_LUMINANCE, _ALPHA */
+
+		glTexParameteri(GL_TEXTURE_2D, 0x8e43, luminance ? 0x1903 : 0x1904);    /* GL_TEXTURE_SWIZZLE_G: red, or green */
+		glTexParameteri(GL_TEXTURE_2D, 0x8e44, luminance ? 0x1903 : 0x1905);    /* ..._B: red, or blue */
+		glTexParameteri(GL_TEXTURE_2D, 0x8e45, !luminance ? 0x1906 : image->format == 0x1909 ? 1 : 0x1904); /* ..._A: alpha; one; green */
+		if (made) {
+			image->shared = true;
+			e->shared++;
+			return true;
+		}
+	}
 	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
 	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
 	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
@@ -682,6 +910,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 	GLint row_length = 0, alignment = 4;
 	uint8_t *base, *flipped = NULL;
 	bool alpha_first = image->alpha_first && !planar && pixel == 4;
+	uint64_t began = now_us();
 
 	if (image->shared) {
 		return;
@@ -749,6 +978,14 @@ surface_to_texture(struct eagl *e, struct image *image)
 	image->seed = IOSurfaceGetSeed(surface);
 	e->uploads++;
 	e->upload_bytes += row * (size_t)image->height;
+	zk.uploads++;
+	zk.uploads_planar += planar;
+	zk.upload_bytes += row * (size_t)image->height;
+	zk.upload_us += now_us() - began;
+	zk.up_format = IOSurfaceGetPixelFormat(surface);
+	zk.up_plane = image->plane;
+	zk.up_width = image->width;
+	zk.up_height = image->height;
 }
 
 /* What has been drawn into a texture, into its IOSurface, unless it is there (frame_end() waits for it). */
@@ -786,9 +1023,21 @@ target_to_surface(struct eagl *e, struct image *image)
 		return;
 	}
 	if (image->shared) {
-		/* whoever looks at the surface's seed is to see that it has changed */
-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
-			IOSurfaceUnlock(surface, 0, NULL);
+		/*
+		 * whoever looks at the surface's seed is to see that it has changed. glwait=3: with AvoidSync this
+		 * lock is the kernel's mark "drawn once the GPU's jobs so far are done", which the display and every
+		 * other lock wait for, and is not waited for here (iokit/Kernel/MiniIOSurface.cpp lockCommon).
+		 */
+		uint32_t how = wait_for_frames == 3 ? kIOSurfaceLockAvoidSync : 0;
+
+		if (IOSurfaceLock(surface, how, NULL) == 0) {
+			IOSurfaceUnlock(surface, how, NULL);
+		} else if (how != 0) {
+			marks_refused++;        /* (not marked: waited for here, as with glwait=1) */
+			glFinish();
+			if (IOSurfaceLock(surface, 0, NULL) == 0) {
+				IOSurfaceUnlock(surface, 0, NULL);
+			}
 		}
 		return;
 	}
@@ -803,6 +1052,29 @@ target_to_surface(struct eagl *e, struct image *image)
 		glPixelStorei(GL_PACK_ALIGNMENT, 4);
 		if (!image->invert) {
 			glReadPixels(0, 0, image->width, image->height, GL_BGRA, GL_UNSIGNED_BYTE, base);
+		} else if (zink_behind) {
+			/*
+			 * Zink: every glReadPixels is work for the GPU that is waited for (a copy into memory this
+			 * program sees), some milliseconds each -- a row at a time, as below, a frame of the r1's
+			 * panel would be 640 of them. One read of the whole frame, turned over here.
+			 */
+			static uint8_t *whole;
+			static size_t whole_size;
+			size_t need = (size_t)image->width * 4 * (size_t)image->height;
+
+			if (whole_size < need) {
+				free(whole);
+				whole = malloc(need);
+				whole_size = whole != NULL ? need : 0;
+			}
+			if (whole != NULL) {
+				glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+				glReadPixels(0, 0, image->width, image->height, GL_BGRA, GL_UNSIGNED_BYTE, whole);
+				for (GLsizei y = 0; y < image->height; y++) {
+					memcpy(base + row * (size_t)(image->height - 1 - y), whole + (size_t)y * (size_t)image->width * 4,
+					    (size_t)image->width * 4);
+				}
+			}
 		} else {
 			for (GLsizei y = 0; y < image->height; y++) {
 				glReadPixels(0, y, image->width, 1, GL_BGRA, GL_UNSIGNED_BYTE, base + row * (size_t)(image->height - 1 - y));
@@ -1019,18 +1291,163 @@ frame_begin(struct eagl *e)
 }
 
 /*
+ * (glthreads=1) where glFlush's time goes: with Mesa's threaded context, glFlush waits for its driver
+ * thread ("gdrv": Zink and the PowerVR driver building the frame) and, the IOSurfaces being shared,
+ * for the submit thread ("zfq": pvr_driver_queue_submit, which waits for the GPU to finish the
+ * submission before). Each thread's processor time in the last 10 s (those over 1%), the frames'
+ * thread marked '*', and how idle the cores were: a thread short of time on busy cores is starved
+ * (mediaserverd), one with time to spare is waiting (the GPU).
+ * ponytail: 48 threads remembered, by ID; a program with more loses the rest's deltas.
+ */
+/* libproc's, which the iOS SDK has no header for (as src/cputop.c) */
+int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
+int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
+int proc_name(int pid, void *buffer, uint32_t buffersize);
+struct redwood_taskinfo {               /* sys/proc_info.h's proc_taskinfo (PROC_PIDTASKINFO, 4) */
+	uint64_t virtual_size, resident_size, total_user, total_system, threads_user, threads_system;
+	int32_t policy, faults, pageins, cow_faults, sent, received, mach_calls, unix_calls, csw, threads, running, priority;
+};
+
+/*
+ * (glthreads=1) the five programs that used the most processor time in the last 10 s, in percent of
+ * one core -- as many as this program may ask about (others' may be refused: then they are missing).
+ * ponytail: 256 processes remembered, by pid.
+ */
+static void
+programs_say(void)
+{
+	static struct { int pid; uint64_t ns; } seen[256];
+	static mach_timebase_info_data_t tb;
+	int pids[512], n, top_pid[5] = { 0 };
+	uint64_t top[5] = { 0 };
+	char line[190], name[34];
+	int used;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	n = proc_listpids(1, 0, pids, sizeof(pids)) / (int)sizeof(int);       /* PROC_ALL_PIDS */
+	for (int i = 0; i < n; i++) {
+		struct redwood_taskinfo t;
+		uint64_t ns, was;
+		int slot = 0;
+
+		if (pids[i] < 0 || proc_pidinfo(pids[i], 4, 0, &t, sizeof(t)) != (int)sizeof(t)) {
+			continue;
+		}
+		ns = (t.total_user + t.total_system) * tb.numer / tb.denom;      /* (Mach ticks on arm64) */
+		while (slot < 256 && seen[slot].pid != 0 && seen[slot].pid != pids[i] + 1) {
+			slot++;
+		}
+		if (slot == 256) {
+			continue;
+		}
+		was = seen[slot].pid == pids[i] + 1 && seen[slot].ns <= ns ? seen[slot].ns : ns;
+		seen[slot].pid = pids[i] + 1;           /* (+1: pid 0, the kernel, is someone too) */
+		seen[slot].ns = ns;
+		for (int k = 0; k < 5; k++) {
+			if (ns - was > top[k]) {
+				memmove(&top[k + 1], &top[k], sizeof(top[0]) * (size_t)(4 - k));
+				memmove(&top_pid[k + 1], &top_pid[k], sizeof(top_pid[0]) * (size_t)(4 - k));
+				top[k] = ns - was;
+				top_pid[k] = pids[i];
+				break;
+			}
+		}
+	}
+	used = snprintf(line, sizeof(line), "redwood-gl: programs (%% of a core, 10 s):");
+	for (int k = 0; k < 5 && top[k] != 0; k++) {
+		if (proc_name(top_pid[k], name, sizeof(name)) <= 0) {
+			strcpy(name, top_pid[k] == 0 ? "kernel" : "?");
+		}
+		used += snprintf(line + used, sizeof(line) - (size_t)used, " %.16s[%d] %llu", name, top_pid[k], top[k] / 100000000ull);
+	}
+	say_kept("%s", line);
+}
+
+static void
+threads_say(uint64_t home)
+{
+	static struct { uint64_t id, ns; } seen[48];
+	static uint64_t idle_was, all_was;
+	thread_act_array_t threads;
+	mach_msg_type_number_t count = 0, cpus_size;
+	processor_info_array_t cpus;
+	natural_t ncpu = 0;
+	uint64_t idle = 0, all = 0, sys = 0;
+	static uint64_t sys_was;
+	char line[190];
+	int used = 0;
+
+	if (host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &ncpu, &cpus, &cpus_size) == KERN_SUCCESS) {
+		for (natural_t c = 0; c < ncpu; c++) {
+			for (int s = 0; s < CPU_STATE_MAX; s++) {
+				all += (uint32_t)cpus[c * CPU_STATE_MAX + s];
+			}
+			idle += (uint32_t)cpus[c * CPU_STATE_MAX + CPU_STATE_IDLE];
+			sys += (uint32_t)cpus[c * CPU_STATE_MAX + CPU_STATE_SYSTEM];
+		}
+		vm_deallocate(mach_task_self(), (vm_address_t)cpus, cpus_size * sizeof(*cpus));
+	}
+	used = snprintf(line, sizeof(line), "redwood-gl: threads: %u cores %llu%% idle %llu%% kernel; ms:", ncpu,
+	    all > all_was ? (idle - idle_was) * 100 / (all - all_was) : 0, all > all_was ? (sys - sys_was) * 100 / (all - all_was) : 0);
+	idle_was = idle;
+	sys_was = sys;
+	all_was = all;
+	if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
+		return;
+	}
+	for (mach_msg_type_number_t i = 0; i < count; i++) {
+		struct thread_extended_info x;
+		struct thread_identifier_info ident;
+		mach_msg_type_number_t n = THREAD_EXTENDED_INFO_COUNT, m = THREAD_IDENTIFIER_INFO_COUNT;
+
+		if (thread_info(threads[i], THREAD_EXTENDED_INFO, (thread_info_t)&x, &n) == KERN_SUCCESS &&
+		    thread_info(threads[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ident, &m) == KERN_SUCCESS) {
+			uint64_t ns = x.pth_user_time + x.pth_system_time, was = 0;
+			unsigned slot = 0;
+
+			while (slot < 48 && seen[slot].id != 0 && seen[slot].id != ident.thread_id) {
+				slot++;
+			}
+			if (slot < 48) {
+				was = seen[slot].id == ident.thread_id ? seen[slot].ns : ns;
+				seen[slot].id = ident.thread_id;
+				seen[slot].ns = ns;
+			}
+			if (ns - was >= 100000000ull) {         /* 100 ms in 10 s */
+				if (used > (int)sizeof(line) - 30) {
+					say_kept("%s", line);
+					used = snprintf(line, sizeof(line), "redwood-gl: threads, more:");
+				}
+				used += snprintf(line + used, sizeof(line) - (size_t)used, " %.12s%s%llu", x.pth_name[0] ? x.pth_name : "?",
+				    ident.thread_id == home ? "*" : ":", (ns - was) / 1000000);
+			}
+		}
+		mach_port_deallocate(mach_task_self(), threads[i]);
+	}
+	vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(*threads));
+	say_kept("%s", line);
+	programs_say();
+}
+
+/*
  * glFlush, glFinish: what was drawn must be where the display takes it from. `finished`: the
  * library has been waited for already.
  */
 static void frame_functions(struct eagl *e);
+static void say_callers(const char *what);
+static bool callers_kept;      /* (glflush_from=) say_callers() says its line in the kept log */
 static void
 frame_end(struct eagl *e, bool finished)
 {
 	static unsigned unfollowed;
 	uint64_t before, waited, after;
+	bool drew_display;
 	unsigned copied = 0, in_place = 0;
 
 	clear_now(e);
+	e->frame_ended = zink_behind;           /* (the context is given back when this call ends: zink_unbind()) */
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
@@ -1042,7 +1459,9 @@ frame_end(struct eagl *e, bool finished)
 			in_place++;
 		}
 	}
-	if (in_place != 0 && !finished && wait_for_frames) {
+	if (wait_for_frames == 3) {
+		/* (glFlush has handed the jobs to the kernel: Mesa's flush waits for its submission when images are shared) */
+	} else if (in_place != 0 && !finished && wait_for_frames && (wait_for_frames != 2 || e->drew_display)) {
 		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
 	} else if (in_place != 0 && !finished && sync_frames) {
 		/*
@@ -1075,6 +1494,8 @@ frame_end(struct eagl *e, bool finished)
 	}
 	after = now_us();
 	e->in_frame = false;
+	drew_display = e->drew_display;
+	e->drew_display = false;
 	e->frames++;
 	if (latency_lines) {
 		/* "tl: g FRAME began US ended US DRAWS": microseconds of mach_absolute_time (tools/latency.py) */
@@ -1093,6 +1514,7 @@ frame_end(struct eagl *e, bool finished)
 		    after / 1000000, after / 1000 % 1000, e->draws, e->clears, e->line.surface, e->line.into_display, e->line.boxed ? "on" : "off", e->line.box[0], e->line.box[1],
 		    e->line.box[2], e->line.box[3], e->line.vrd, e->line.vrb, in_place, copied, e->line.solid_spans, e->line.blended_spans,
 		    e->line.solid_ends, e->line.blended_ends, e->line.other_spans, e->line.other_ends);
+		say("redwood-gl: f %u us %llu tex:%s\n", e->frames, after, e->line.tex);
 		bzero(&e->line, sizeof(e->line));
 		frame_functions(e);
 	}
@@ -1101,6 +1523,105 @@ frame_end(struct eagl *e, bool finished)
 		unfollowed++;
 		say("redwood-gl: frame %u: %u draws, and none into an IOSurface that is known here (framebuffer %u, texture %u)\n",
 		    e->frames, e->draws, e->framebuffer, e->colour);
+	}
+	if (zink_behind && e->home != thread_id()) {
+		e->home = thread_id();          /* (the thread that draws the frames keeps the context between calls: zink_bind()) */
+	}
+	if (zink_behind) {
+		/* every ten seconds, one line for the kernel to keep: is CoreAnimation drawing by the GPU, and how fast */
+		static uint64_t since, frame_us, wait_us, copy_us, flush_us, attach_us;
+		static unsigned frames, pictures_copied, pictures_in_place, errors_before;
+		static unsigned by_kind[3];             /* frames into a surface of the display's size; into others only; ended by a wait of CoreAnimation's own */
+		static uint64_t wait_by_kind[2];
+		static unsigned unwaited;               /* glwait=3: frames handed on with no wait here */
+
+		frames++;
+		unwaited += wait_for_frames == 3 && in_place != 0 && !finished;
+		by_kind[drew_display ? 0 : 1] += in_place != 0 || copied != 0;
+		wait_by_kind[drew_display ? 0 : 1] += in_place != 0 || copied != 0 ? waited - before : 0;
+		by_kind[2] += finished;
+		frame_us += after - e->began;
+		wait_us += waited - before;
+		copy_us += after - waited;
+		flush_us += e->flushing;
+		attach_us += e->attaching;
+		pictures_copied += copied;
+		pictures_in_place += in_place;
+		if (since == 0) {
+			since = after;
+		}
+		zk.frames++;
+		zk.presented += in_place != 0 || copied != 0;
+		if (since != 0 && after - since >= 10000000) {
+			uint32_t probe = 0;
+			int probed = 0;
+
+			say_kept("redwood-gl: pvr: %u frames in %llu s, %llu.%llu ms each: %llu.%llu waiting for the GPU, %llu.%llu "
+			    "copying out, %llu.%llu in glFlush, %llu.%llu attaching surfaces; %u with a picture in a surface (%u by "
+			    "the GPU, %u read back); %u GL errors; %u calls",
+			    frames, (after - since) / 1000000, frame_us / frames / 1000, frame_us / frames % 1000 / 100,
+			    wait_us / frames / 1000, wait_us / frames % 1000 / 100, copy_us / frames / 1000,
+			    copy_us / frames % 1000 / 100, flush_us / frames / 1000, flush_us / frames % 1000 / 100,
+			    attach_us / frames / 1000, attach_us / frames % 1000 / 100, zk.presented, pictures_in_place,
+			    pictures_copied, e->errors - errors_before, zk_calls);
+			/* which of the frames are the display's: two frames a picture on the panel, with the camera (glwait=2) */
+			say_kept("redwood-gl: pvr: frames into the display's size %u (%llu.%llu ms waiting each), into others only %u (%llu.%llu "
+			    "ms, the last %ux%u); %u ended by glFinish; glflush: %u glFlushes done, %u left out", by_kind[0], wait_by_kind[0] / (by_kind[0] + !by_kind[0]) / 1000,
+			    wait_by_kind[0] / (by_kind[0] + !by_kind[0]) % 1000 / 100, by_kind[1], wait_by_kind[1] / (by_kind[1] + !by_kind[1]) / 1000,
+			    wait_by_kind[1] / (by_kind[1] + !by_kind[1]) % 1000 / 100, zk.other_width, zk.other_height, by_kind[2],
+			    flushes_done, flushes_skipped);
+			if (flush_mid) {
+				say_kept("redwood-gl: glflush_mid: %u done, %u left out; %u chunks to an update's end, %u.%u on average, %u at most",
+				    flushes_done, flushes_skipped, mid_chunks, mid_chunks / (mid_updates + !mid_updates),
+				    mid_chunks * 10 / (mid_updates + !mid_updates) % 10, mid_chunks_max);
+				mid_chunks = mid_chunks_max = mid_updates = 0;
+			}
+			flushes_done = flushes_skipped = 0;
+			if (wait_for_frames == 3) {
+				/* (the waits for these are the kernel's: "MiniIOSurface: glwait=3" and MiniIOMobileFramebuffer's "waiting for the GPU") */
+				say_kept("redwood-gl: pvr: glwait=3: %u frames handed on not waited for; %u marks refused by the kernel (waited for here)",
+				    unwaited, marks_refused);
+				unwaited = marks_refused = 0;
+			}
+			memset(by_kind, 0, sizeof(by_kind));
+			memset(wait_by_kind, 0, sizeof(wait_by_kind));
+			say_kept("redwood-gl: pvr: the context was handed to a thread %u times in that (the frames' thread %llu)",
+			    e->binds, e->home);
+			if (thread_lines) {
+				threads_say(e->home);
+			}
+			e->binds = 0;
+			zk_calls = 0;
+			say_kept("redwood-gl: pvr: surfaces: %u attached (%u refused, reason %u), last %ux%u row %u: %u mirrored, %u "
+			    "shared, %u copies (import no %u: stage %u error %#x); texImageIOSurface %u; fb onto a surface's texture %u",
+			    zk.attach, zk.attach_no, zk.attach_why, zk.width, zk.height, zk.row, zk.mirrored, zk.shared, zk.copies,
+			    zk.import_no, zk.import_stage, zk.import_error, zk.teximage, zk.fb_target);
+			/* the pictures shown from surfaces (a camera's preview: '420f', two planes) copied into textures, and what that cost here */
+			say_kept("redwood-gl: pvr: shown surfaces: texImageIOSurface %u shared, %u copied; %u uploads (%u planar), %llu KiB, %llu.%llu "
+			    "ms here; last '%.4s' plane %u %dx%d", zk.tex_shared, zk.tex_copied, zk.uploads, zk.uploads_planar, zk.upload_bytes >> 10,
+			    zk.upload_us / 1000, zk.upload_us % 1000 / 100, (const char *)&(uint32_t){ __builtin_bswap32(zk.up_format) },
+			    zk.up_plane, zk.up_width, zk.up_height);
+			/* what is in the middle of the display's picture, in the surface's own memory */
+			if (zk.display != NULL && IOSurfaceLock(zk.display, kIOSurfaceLockReadOnly, NULL) == 0) {
+				const uint8_t *base = IOSurfaceGetBaseAddress(zk.display);
+
+				if (base != NULL) {
+					memcpy(&probe, base + IOSurfaceGetBytesPerRow(zk.display) * (IOSurfaceGetHeight(zk.display) / 2) +
+					    IOSurfaceGetWidth(zk.display) / 2 * 4, 4);
+					probed = 1;
+				}
+				IOSurfaceUnlock(zk.display, kIOSurfaceLockReadOnly, NULL);
+			}
+			say_kept("redwood-gl: pvr: draws and clears: %u into a surface's texture, %u into another, %u with no framebuffer; "
+			    "a surface's framebuffer incomplete %u times (last status %#x); the display surface's middle pixel %s%08x",
+			    zk.draws_target, zk.draws_other, zk.draws_none, zk.incomplete, zk.status, probed ? "" : "(none drawn into) ",
+			    __builtin_bswap32(probe));
+			memset(&zk, 0, offsetof(__typeof__(zk), display));
+			since = after;
+			frames = pictures_copied = pictures_in_place = 0;
+			frame_us = wait_us = copy_us = flush_us = attach_us = 0;
+			errors_before = e->errors;
+		}
 	}
 	e->all_calls += e->calls;
 	e->all_draws += e->draws;
@@ -1139,6 +1660,17 @@ frame_end(struct eagl *e, bool finished)
 #define GL_BLEND                        0x0be2
 #endif
 /* (glframes=1) a draw of lines, into the display's picture or another: CoreAnimation fills glyphs span by span */
+/*
+ * A surface of the display's size: 1125 x 2436 (the iPhone X), 750 x 1000 (fbaspect=1), 375 x 500 (fbaspect=1
+ * fbscale=1). Until 14 November the per-frame lines (glframes=1) asked for 1000 x 2000 and never saw
+ * fbaspect's display at all.
+ */
+static bool
+display_sized(const struct image *image)
+{
+	return image->width >= 360 && image->height >= 480;
+}
+
 static void
 count_spans(struct eagl *e, GLenum mode, GLsizei count)
 {
@@ -1148,7 +1680,7 @@ count_spans(struct eagl *e, GLenum mode, GLsizei count)
 		return;
 	}
 	if (e->framebuffer == 0 || e->colour == 0 || (image = image_of(e, e->colour)) == NULL || !image->target ||
-	    image->width < 1000 || image->height < 2000) {
+	    !display_sized(image)) {
 		e->line.other_spans++;
 		e->line.other_ends += (unsigned)count;
 		return;
@@ -1169,9 +1701,41 @@ drawing(struct eagl *e)
 	struct image *image;
 
 	frame_begin(e);
+	if (zink_behind && zk_said_draw < 4) {
+		GLint really = -1;
+
+		zk_said_draw++;
+		glGetIntegerv(0x8ca6, &really);         /* GL_FRAMEBUFFER_BINDING */
+		say_kept("redwood-gl: pvr: a draw by thread %llu: the context is thread %llu's, EGL's current context here %p; the "
+		    "framebuffer bound: %d by OpenGL ES, %u as kept here (texture %u)", thread_id(), e->owner, redwood_gl_current(),
+		    really, e->framebuffer, e->colour);
+	}
+	zk.draws++;
+	if (e->framebuffer == 0) {
+		zk.draws_none++;
+	} else if (e->colour == 0 || (image = image_of(e, e->colour)) == NULL || !image->target) {
+		zk.draws_other++;
+	}
 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
+		zk.draws_target++;
+		if (zink_behind && !image->drawn) {
+			/* (the first draw of a frame into it: is it a framebuffer the GPU takes?) */
+			GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+
+			if (status != 0x8cd5) {         /* GL_FRAMEBUFFER_COMPLETE */
+				zk.incomplete++;
+				zk.status = status;
+			}
+			if (display_sized(image)) {
+				zk.display = image->surface;
+				e->drew_display = true;
+			} else {
+				zk.other_width = (unsigned)image->width;
+				zk.other_height = (unsigned)image->height;
+			}
+		}
 		image->drawn = image->painted = true;
-		if (frame_lines && image->width >= 1000 && image->height >= 2000) {
+		if (frame_lines && display_sized(image)) {
 			/* the display's picture (a surface of its size): where this frame first draws into it */
 			e->line.into_display++;
 			if (!e->line.taken) {
@@ -1199,6 +1763,16 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
 	glBindTexture(target, texture);
 	if (target == GL_TEXTURE_2D && e->unit < 8) {
 		e->bound[e->unit] = texture;
+	}
+	if (frame_lines && texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && !image->target &&
+	    (long)image->width * image->height >= 100000) {
+		size_t n = strlen(e->line.tex);
+		char one[48];
+		int k = snprintf(one, sizeof(one), " %u/%u %dx%d s%u", (unsigned)IOSurfaceGetID(image->surface), image->plane,
+		    (int)image->width, (int)image->height, (unsigned)IOSurfaceGetSeed(image->surface));
+		if (strstr(e->line.tex, one) == NULL && n + (size_t)k < sizeof(e->line.tex)) {
+			memcpy(e->line.tex + n, one, (size_t)k + 1);
+		}
 	}
 	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && !image->shared &&
 	    (!image->target ? IOSurfaceGetSeed(image->surface) != image->seed || surface_changed(e, image) :
@@ -3200,6 +3774,89 @@ my_glFlush(void *context)
 		eagl_trace("glFlush()\n");
 	}
 	clear_now(e);
+	if (flush_mid || flush_log_left != 0) {
+		size_t length = 0;
+		uintptr_t from = (uintptr_t)__builtin_return_address(0) -
+		    ((uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE);
+		bool last = from == FLUSH_END_CALLER;
+
+		if (flush_log_left != 0 && flush_from_us != 0 && now_us() >= flush_from_us) {
+			char what[80];
+
+			flush_log_left--;
+			snprintf(what, sizeof(what), "glFlush no %u since the end caller, at %llu, %s", flush_index, now_us(),
+			    e->drew_display ? "display drawn" : "display not drawn");
+			callers_kept = true;
+			say_callers(what);
+			callers_kept = false;
+		}
+		flush_index = last ? 0 : flush_index + 1;
+		if (flush_mid && e->in_frame && e->drew_display && !last && flush_run < 24) {
+			bool other = false;
+
+			for (unsigned i = 0; i < e->image_count && !other; i++) {
+				other = e->images[i].target && e->images[i].drawn && !display_sized(&e->images[i]);
+			}
+			if (!other) {
+				flush_run++;
+				flushes_skipped++;
+				EAGL_LEAVE(e, 0x2d8);
+				return;
+			}
+		}
+		if (flush_mid) {
+			flushes_done++;
+			mid_chunks += flush_run + 1;
+			mid_chunks_max = flush_run + 1 > mid_chunks_max ? flush_run + 1 : mid_chunks_max;
+			mid_updates++;
+			flush_run = 0;
+		}
+	}
+	if (flush_skips == 1 && flush_skip[0] == 2) {
+		/*
+		 * (glflush=2) a flush after which nothing outside this context can see anything new -- no IOSurface
+		 * drawn into since the last one, only CoreAnimation's own textures (blurs, offscreen passes), which it
+		 * reads in this context, where OpenGL ES keeps the order without a flush -- is left out. Each flush
+		 * costs a submission, and the PowerVR's driver waits for the GPU to finish the one before it.
+		 */
+		bool seen = false;
+
+		for (unsigned i = 0; i < e->image_count && !seen; i++) {
+			seen = e->images[i].target && e->images[i].drawn;
+		}
+		if (!seen) {
+			flushes_skipped++;
+			EAGL_LEAVE(e, 0x2d8);
+			return;
+		}
+		flushes_done++;
+	} else if (flush_skips != 0) {
+		/* (glflush=...) one from the middle of a frame: what is drawn stays queued for the frame's last flush */
+		size_t length = 0;
+		uintptr_t from = (uintptr_t)__builtin_return_address(0) -
+		    ((uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE);
+
+		for (unsigned i = 0; i < flush_skips; i++) {
+			if (from == flush_skip[i]) {
+				flushes_skipped++;
+				EAGL_LEAVE(e, 0x2d8);
+				return;
+			}
+		}
+		flushes_done++;
+	}
+	if (frame_lines) {
+		/* (glframes=1) who ends the frames: two glFlushes a swap -- which of CoreAnimation's functions asks for each (the first 40) */
+		static unsigned flushes;
+
+		if (flushes++ < 40) {
+			char what[80];
+
+			snprintf(what, sizeof(what), "glFlush %u (frame %u, %u draws, display %s)", flushes, e->frames + 1, e->draws,
+			    e->drew_display ? "drawn" : "not drawn");
+			say_callers(what);
+		}
+	}
 	began = now_us();
 	glFlush();
 	e->flushing += now_us() - began;
@@ -3377,11 +4034,6 @@ my_glCopyTexSubImage2D(void *context, GLenum target, GLint level, GLint x0, GLin
 	EAGL_LEAVE(e, 0x1c8);
 }
 
-extern const void *_dyld_get_shared_cache_range(size_t *length);
-
-/* Where the shared cache was built to be, before it was moved (as src/inject.c has it). */
-#define CACHE_BASE 0x180000000UL
-
 /* The callers of this call, as they would be in the cache as built: "ipsw a2s" names them. */
 static void
 say_callers(const char *what)
@@ -3409,7 +4061,7 @@ say_callers(const char *what)
 		}
 		used += (size_t)snprintf(line + used, sizeof(line) - used, " %#lx", callers[i] - slide);
 	}
-	say("redwood-gl: %s, asked for by%s\n", what, line);
+	(callers_kept ? say_kept : say)("redwood-gl: %s, asked for by%s\n", what, line);
 }
 
 /*
@@ -3549,7 +4201,10 @@ my_glFramebufferTexture2D(void *context, GLenum target, GLenum attachment, GLenu
 	EAGL_ENTER(e, 0x1530);
 	clear_now(e);
 	if (attachment == GL_COLOR_ATTACHMENT0 && target != GL_READ_FRAMEBUFFER) {
+		struct image *image = texture != 0 ? image_of(e, texture) : NULL;
+
 		e->colour = texture;
+		zk.fb_target += image != NULL && image->target;
 	}
 	if (eagl_tracing) {
 		eagl_trace("glFramebufferTexture2D(%#x, %#x, %#x, %u, %d)\n", target, attachment, to, texture, level);
@@ -3825,12 +4480,17 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 		say("redwood-gl: no context of API %lu\n", api);
 		return nil;
 	}
+	zink_behind = strstr(redwood_gl_library(), "Zink") != NULL;
 	if ((e->gl = redwood_gl_create((int)api)) == NULL || !redwood_gl_make_current(e->gl)) {
 		say("redwood-gl: %s gives no OpenGL ES %lu context\n", redwood_gl_library(), api);
+		if (zink_behind) {
+			say_kept("redwood-gl: pvr: NO OpenGL ES %lu context for CoreAnimation: the window server has no renderer", api);
+		}
 		free(e);
 		return nil;
 	}
 	current = e;
+	e->owner = thread_id();
 	e->object = self;
 	e->api = api;
 	e->table[0] = e;
@@ -3839,6 +4499,11 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 	say("redwood-gl: an OpenGL ES %lu context for CoreAnimation, by %s: %s; %s; shaders %s\n", api, redwood_gl_library(),
 	    (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER),
 	    (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
+	if (zink_behind) {
+		say_kept("redwood-gl: pvr: an OpenGL ES %lu context for CoreAnimation: %s; %s; made by thread %llu", api,
+		    (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER), thread_id());
+		zink_unbind(e, true);           /* (whoever uses it first takes it: zink_bind()) */
+	}
 	return self;
 }
 
@@ -3903,6 +4568,7 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	GLint texture = 0;
 	uint64_t began;
 
+	zk.teximage++;
 	(void)selector;
 	if (e == NULL || surface == NULL) {
 		return NO;
@@ -3912,6 +4578,9 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
 	if (target != GL_TEXTURE_2D || texture == 0 || (image = image_new(e, (GLuint)texture, surface)) == NULL) {
 		say("redwood-gl: -texImageIOSurface: target %#lx, texture %d: not done\n", target, texture);
+		if (zink_behind) {
+			zink_unbind(e, false);
+		}
 		return NO;
 	}
 	image->to = (GLenum)target;
@@ -3933,8 +4602,11 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
 	began = now_us();
 	if (!surface_shared(e, image)) {
+		zk.tex_copied++;
 		surface_changed(e, image);              /* (what it adds up to now) */
 		surface_to_texture(e, image);
+	} else {
+		zk.tex_shared++;
 	}
 	e->attaching += now_us() - began;
 	eagl_leave(e, 0x970);
@@ -3960,11 +4632,31 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	clear_now(e);
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
 	pixels = IOSurfaceGetPixelFormat(surface);
+	if (zink_behind && zk_said_attach < 4) {
+		zk_said_attach++;
+		say_kept("redwood-gl: pvr: -attachImage by thread %llu: the context is thread %llu's, EGL's current context here %p; "
+		    "the texture bound: %d by OpenGL ES, %u as kept here", thread_id(), e->owner, redwood_gl_current(), texture,
+		    e->bound[0]);
+	}
+	zk.attach++;
+	zk.width = (unsigned)IOSurfaceGetWidth(surface);
+	zk.height = (unsigned)IOSurfaceGetHeight(surface);
+	zk.row = (unsigned)IOSurfaceGetBytesPerRow(surface);
 	if (target != GL_TEXTURE_2D || texture == 0 || (pixels != 'BGRA' && pixels != 0) ||
 	    IOSurfaceGetBytesPerElement(surface) != 4 || IOSurfaceGetPlaneCount(surface) != 0 ||
 	    (image = image_new(e, (GLuint)texture, surface)) == NULL) {
+		zk.attach_no++;
+		zk.attach_why = target != GL_TEXTURE_2D ? 1 : texture == 0 ? 2 : (pixels != 'BGRA' && pixels != 0) ||
+		    IOSurfaceGetBytesPerElement(surface) != 4 || IOSurfaceGetPlaneCount(surface) != 0 ? 3 : 4;
 		say("redwood-gl: -attachImage: target %#lx, texture %d, an IOSurface of '%.4s': not done\n", target, texture,
 		    (const char *)&(uint32_t){ __builtin_bswap32(pixels) });
+		if (zink_behind && zk.attach_no <= 4) {
+			say_kept("redwood-gl: pvr: -attachImage REFUSED: target %#lx, texture bound %d, surface %ux%u format %#x, reason %u "
+			    "(1 target, 2 no texture bound, 3 format, 4 no room)", target, texture, zk.width, zk.height, pixels, zk.attach_why);
+		}
+		if (zink_behind) {
+			zink_unbind(e, false);
+		}
 		return NO;
 	}
 	image->target = true;
@@ -3997,6 +4689,22 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 		surface_to_texture(e, image);
 	}
 	e->attaching += now_us() - began;
+	if (image->mirror != 0) {
+		zk.mirrored++;
+	} else if (image->shared) {
+		zk.shared++;
+	} else {
+		zk.copies++;
+		zk.import_no++;
+		zk.import_stage = (unsigned)redwood_gl_surface_stage;
+		zk.import_error = (unsigned)redwood_gl_surface_error;
+	}
+	if (zink_behind && attached < 4) {
+		say_kept("redwood-gl: pvr: -attachImage: texture %d is IOSurface %u (%d x %d, %zu bytes a row)%s%s", texture,
+		    IOSurfaceGetID(surface), image->width, image->height, IOSurfaceGetBytesPerRow(surface),
+		    inverted ? ", drawn inverted" : "", image->shared ? ": its memory" :
+		    image->mirror != 0 ? ": a texture, copied into its memory by the GPU" : ": a copy, read back");
+	}
 	if (attached++ < 24) {
 		say("redwood-gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row)%s%s\n", texture,
 		    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, image->width, image->height,
@@ -4024,6 +4732,7 @@ my_dealloc(id self, SEL selector)
 		if (current == e) {
 			redwood_gl_make_current(NULL);
 			current = NULL;
+			e->owner = 0;
 		}
 		redwood_gl_destroy(e->gl);
 		free(e);
@@ -4116,6 +4825,29 @@ install(void)
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
+		if ((argument = strstr(arguments, "glflush=")) != NULL) {
+			char *end = (char *)argument + 8;
+
+			while (flush_skips < 8 && (flush_skip[flush_skips] = strtoull(end, &end, 16)) != 0) {
+				flush_skips++;
+				end += *end == ',';
+			}
+			/* (glflush=2: none by address, see my_glFlush) */
+			if (flush_skips == 1 && flush_skip[0] == 1) {
+				flush_skip[0] = 0x1884ad484;    /* (the state sync's first destination unit: the return from its call) */
+				flush_skip[1] = 0x1884ad4b0;    /* (... and each one after it) */
+				flush_skips = 2;
+			}
+			say("redwood-gl: glflush: %u places of QuartzCore's glFlushes left out, the first %#llx\n", flush_skips,
+			    flush_skip[0]);
+		}
+		if ((argument = strstr(arguments, "glflush_from=")) != NULL) {
+			flush_from_us = strtoull(argument + 13, NULL, 10) * 1000000 + 1;
+			flush_log_left = 150;
+		}
+		flush_mid = strstr(arguments, "glflush_mid=1") != NULL;
+		thread_lines = strstr(arguments, "glthreads=1") != NULL;
+		share_planes = strstr(arguments, "glyuv=1") != NULL;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
 		if ((argument = strstr(arguments, "glslow=")) != NULL) {
 			slow_calls_us = strtoull(argument + 7, NULL, 10);
@@ -4160,7 +4892,23 @@ install(void)
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
 			wait_for_frames = 0;
 		}
-		say("redwood-gl: a frame is waited for %s\n", wait_for_frames ? "here, before it is handed to the display" :
+		if (strstr(redwood_gl_library(), "Zink") != NULL) {
+			/*
+			 * The rabbit r1's PowerVR (src/gl_egl.c): the display's pictures are drawn into their surfaces
+			 * themselves -- the texture CoreAnimation draws into is the surface's memory, as on iOS -- and
+			 * not into a texture of this library's that the GPU then copies into the surface: that copy is a
+			 * second full-size picture for each of the display's two surfaces (11 MB each at 1125 x 2436,
+			 * and as much again while each is filled once), and a full-screen job of the GPU's every frame.
+			 * What made the copy necessary on the Mali -- the display taking a surface the GPU had not
+			 * finished -- is met here by waiting for the GPU before the frame is handed on (the kernel's
+			 * display driver knows nothing of this GPU's jobs). Boot-arg glblit=1: the copy, as before.
+			 */
+			blit_targets = strstr(arguments, "glblit=1") != NULL;
+			wait_for_frames = strstr(arguments, "glwait=0") != NULL ? 0 : strstr(arguments, "glwait=2") != NULL ? 2 :
+			    strstr(arguments, "glwait=3") != NULL && !blit_targets ? 3 : 1;     /* (3: the blit's lock comes before its flush) */
+		}
+		say("redwood-gl: a frame is waited for %s\n", wait_for_frames == 3 ? "by the display and the surface's readers (glwait=3)" :
+		    wait_for_frames ? "here, before it is handed to the display" :
 		    "by the display's driver, not here");
 		for (argument = arguments; (argument = strstr(argument, "glenv=")) != NULL; argument += 6) {
 			char setting[128];

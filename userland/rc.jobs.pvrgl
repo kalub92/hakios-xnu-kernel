@@ -1,0 +1,6 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# OpenGL ES by the PowerVR (the rabbit r1; build.sh PVR=gl, boot-arg pvr=6): Mesa's Zink over its Vulkan
+# driver, as the window server would have it with pvr_gl=1 -- a clear, a triangle, a texture, an IOSurface
+# drawn into, and how long a frame of the panel's size takes; see src/pvr_gl_test.c.
+/redwood/bin/rwtouch wait 10
+/redwood/bin/pvr_gl_test

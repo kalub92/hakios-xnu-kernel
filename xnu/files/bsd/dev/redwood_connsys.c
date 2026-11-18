@@ -89,6 +89,28 @@ connsys_ms(void)
 }
 
 /*
+ * Boot-arg connsys_soc=6765: the Rabbit r1's MT6765 with the PMIC MT6357, where MediaTek's platform file for it
+ * (common_main/platform/mt6765.c, include/mt6765.h of the same tree) and the MT6357's register map
+ * (include/linux/mfd/mt6357/registers.h) differ from the MT6768's and the MT6358's. Without it everything is as it
+ * was. What is the same in both platform files -- the pins (mt6765.h:46-52), SPM's and the RGU's bits, INFRA's
+ * remapping registers (:58-59), the EMI offsets, pda_dl_patch_flag (mt6765.c:183), the log rings (:231-238), the
+ * options (:1412-1423) -- is not asked about. The LDOs' registers are the MT6358's less 0x200, and DCXO_CW00/CW01
+ * are where they were (registers.h:305, 308); that header has registers and no bits, so the enable (bit 0 of a
+ * CON0) is taken to be where the MT6358 has it, and VCN33's voltage selection is not written at all.
+ */
+static bool connsys_6765;
+static uint32_t connsys_ip_ver = CONSYS_IP_VER_ID;     /* 0x10020300 on the MT6765 (mt6765.c:711) */
+static const struct connsys_pmic {
+	uint32_t vcn18_con0, vcn18_ana, vcn28_con0, vcn28_ana, vcn33_con0_bt, vcn33_con0_wifi, vcn33_ana;
+} connsys_mt6358 = {
+	0x1c58, 0x1e8c, 0x1d88, 0x1e14, 0x1d1c, 0x1d2a, 0x1e28,
+}, connsys_mt6357 = {
+	/* MT6357_LDO_VCN18_CON0 (registers.h:1132), VCN18_ANA_CON0 (:1313), LDO_VCN28_CON0 (:1258), VCN28_ANA_CON0 (:1285),
+	 * LDO_VCN33_CON0_0 (:1230), LDO_VCN33_CON0_1 (:1237), VCN33_ANA_CON0 (:1293) */
+	0x1a58, 0x1c44, 0x1b88, 0x1c0c, 0x1b1c, 0x1b2a, 0x1c1c,
+}, *connsys_pmic = &connsys_mt6358;
+
+/*
  * Step 2a (connsys_step=2), reading only: CONNSYS's supplies as LK leaves them -- the PMIC MT6358's
  * LDOs VCN18, VCN28 and VCN33 (two enables: Bluetooth's and Wi-Fi's), each its enable register and its
  * analog register with the voltage selection (include/linux/mfd/mt6358/registers.h of the MT6768's
@@ -143,11 +165,12 @@ connsys_pmic_read(uint32_t reg, uint32_t *value)
 static void
 connsys_power_report(void)
 {
-	static const struct { const char *name; uint32_t enable, analog; } ldo[] = {
-		{ "VCN18", 0x1c58, 0x1e8c },
-		{ "VCN28", 0x1d88, 0x1e14 },
-		{ "VCN33 (BT)", 0x1d1c, 0x1e28 },
-		{ "VCN33 (Wi-Fi)", 0x1d2a, 0x1e28 },
+	const struct connsys_pmic *p = connsys_pmic;
+	const struct { const char *name; uint32_t enable, analog; } ldo[] = {
+		{ "VCN18", p->vcn18_con0, p->vcn18_ana },
+		{ "VCN28", p->vcn28_con0, p->vcn28_ana },
+		{ "VCN33 (BT)", p->vcn33_con0_bt, p->vcn33_ana },
+		{ "VCN33 (Wi-Fi)", p->vcn33_con0_wifi, p->vcn33_ana },
 	};
 
 	connsys_pwrap = ml_io_map(PWRAP_PHYS, 0x1000);
@@ -199,26 +222,37 @@ connsys_pmic_update(uint32_t reg, uint32_t mask, uint32_t value)
  * would a patch that starts the radio's die with no clock. DCXO_CW00 is 0x788 and CW01 0x78e in the MT6358's map as
  * I read it: the bit is set only when 0x788 holds what Android printed (bit 5 aside), so that a wrong address is
  * read and said, never written. Boot-arg connsys_xo=0: left as it is.
+ *
+ * connsys_soc=6765: the MT6357 has DCXO_CW00 and CW01 at the same 0x788 and 0x78e (registers.h:305, 308) and
+ * mt6765.c turns the same buffer on (consys_clock_buffer_ctrl, :451-459), but what the r1's Android prints of
+ * DCXO_CW00 is not known here, nor is XO_EXTBUF2_EN_M's bit in the MT6357 (the header has no bits): read and said,
+ * and written only when boot-arg connsys_xo_cw00=0xN gives the value its dmesg has, on the MT6358's bit 5.
  */
 static void
 connsys_xo_wcn_on(void)
 {
-	uint32_t cw00 = 0, cw01 = 0, after = 0, wanted = 1;
+	uint32_t cw00 = 0, cw01 = 0, after = 0, wanted = 1, android = 0x4e1du;
 	bool known;
 
 	(void)PE_parse_boot_argn("connsys_xo", &wanted, sizeof(wanted));
+	if (connsys_6765) {
+		android = 0;
+		(void)PE_parse_boot_argn("connsys_xo_cw00", &android, sizeof(android));
+	}
 	if (!connsys_pmic_read(0x788, &cw00) || !connsys_pmic_read(0x78e, &cw01)) {
 		redwood_host_keep_add("connsys: step 3: XO_WCN: DCXO_CW00/CW01 not read (the wrapper did not answer)");
 		return;
 	}
-	known = (cw00 & ~0x20u) == (0x4e1du & ~0x20u);
+	known = android != 0 && (cw00 & ~0x20u) == (android & ~0x20u);
 	if (wanted != 0 && known && (cw00 & 0x20u) == 0) {
 		(void)connsys_pmic_update(0x788, 0x20u, 0x20u);
 		delay_for_interval(2, NSEC_PER_MSEC);
 	}
 	(void)connsys_pmic_read(0x788, &after);
 	redwood_host_keep_add("connsys: step 3: XO_WCN: DCXO_CW00 %#x CW01 %#x (%s) -> CW00 %#x, XO_EXTBUF2_EN_M %u%s", cw00, cw01,
-	    known ? "Android's boot value" : "NOT Android's 0x4e1d: not written", after, (after >> 5) & 1,
+	    known ? "Android's boot value" : !connsys_6765 ? "NOT Android's 0x4e1d: not written" :
+	    android != 0 ? "NOT connsys_xo_cw00's: not written" : "the r1's Android value not given, connsys_xo_cw00: not written",
+	    after, (after >> 5) & 1,
 	    wanted == 0 ? " (connsys_xo=0)" : "");
 }
 
@@ -228,11 +262,34 @@ connsys_xo_wcn_on(void)
  * regulator driver: VCN18 (fixed 1.8 V) and VCN33 to software control (their OP_EN registers = 1),
  * VCN33's voltage selection to 3.3 V (VCN33_ANA_CON0 bits 8-9 = 1; LK leaves 3, 3.5 V), its Bluetooth
  * and Wi-Fi enables, and VCN28 (fixed 2.8 V, for the efuse). Then all four read again.
+ *
+ * connsys_soc=6765: mt6765.c's consys_hw_vcn18_ctrl (:794-833) has the regulators' enables alone -- neither
+ * KERNEL_upmu_set_reg_value(PMIC_LDO_VCN18_OP_EN/VCN33_OP_EN, 1) of mt6768.c:828, 838 -- so no OP_EN is written;
+ * its 3.3 V is the regulator driver's (regulator_set_voltage, :811), whose selection bits in VCN33_ANA_CON0 are
+ * not in what was read here: left as LK has it, and said by the report after.
  */
 static void
 connsys_supplies_on(void)
 {
-	bool ok = connsys_pmic_write(0x1c5a, 1) &&              /* LDO_VCN18_OP_EN: SW */
+	const struct connsys_pmic *p = connsys_pmic;
+	bool ok;
+
+	if (connsys_6765) {
+		ok = connsys_pmic_update(p->vcn18_con0, 1, 1) &&        /* MT6357_LDO_VCN18_CON0: EN */
+		    /* VCN33_ANA_CON0 VOSEL: LK leaves 3 (3.5 V); Android's regulator has 3.3 V, selector 1
+		     * (Linux drivers/regulator/mt6357-regulator.c, vcn33_voltages and vcn33_idx; mask 0x300) */
+		    connsys_pmic_update(0x1c1c, 0x300, 0x100) &&
+		    connsys_pmic_update(p->vcn33_con0_bt, 1, 1) &&      /* LDO_VCN33_CON0_0: EN (Bluetooth's) */
+		    connsys_pmic_update(p->vcn33_con0_wifi, 1, 1) &&    /* LDO_VCN33_CON0_1: EN (Wi-Fi's) */
+		    connsys_pmic_update(p->vcn28_con0, 1, 1);           /* LDO_VCN28_CON0: EN */
+		delay(1000);
+		redwood_host_keep_add("connsys: step 3: MT6357: VCN18, VCN33 (3.3 V) and VCN28 turned on: %s",
+		    ok ? "written" : "THE WRAPPER DID NOT ANSWER");
+		connsys_power_report();
+		connsys_xo_wcn_on();
+		return;
+	}
+	ok = connsys_pmic_write(0x1c5a, 1) &&                   /* LDO_VCN18_OP_EN: SW */
 	    connsys_pmic_update(0x1c58, 1, 1) &&                /* LDO_VCN18_CON0: EN */
 	    connsys_pmic_write(0x1d1e, 1) &&                    /* LDO_VCN33_OP_EN: SW */
 	    connsys_pmic_update(0x1e28, 0x300, 0x100) &&        /* VCN33_ANA_CON0: VOSEL 3.3 V */
@@ -301,13 +358,24 @@ connsys_power_on(vm_offset_t spm)
 	(void)connsys_wait(spm, SPM_PWR_STATUS, 1u << 30, "off-domain power");
 	(void)connsys_wait(spm, SPM_PWR_STATUS_2ND, 1u << 30, "off-domain power, second part");
 	W(rgu, 0x18, (rd(rgu, 0x18) & ~(1u << 9)) | (0x88u << 24));          /* ap_sw_rst_b: let go */
-	/* the bus protections, through their CLR registers as spm_mtcmos_ctrl_conn_bus_prot does */
-	W(infra, 0x2a4, (1u << 14) | (1u << 16));
-	W(infra, 0x2a4, 1u << 13);
-	W(infra, 0x2ac, 1u << 18);
+	if (connsys_6765) {
+		/* (the MT6765's clk-*-pg.c was not read: as the hand-made branch of mt6765.c:607-625 -- AP to CONNSYS, bits 13
+		 * and 14 of INFRA+0x220, then CONNSYS to AP, bit 18 of +0x250, each read and written back) */
+		redwood_host_keep_add("connsys: step 4 [%u ms]: bus protection %#x and %#x before", connsys_ms(), rd(infra, 0x220), rd(infra, 0x250));
+		W(infra, 0x220, rd(infra, 0x220) & ~((1u << 13) | (1u << 14)));
+		delay(10);
+		W(infra, 0x250, rd(infra, 0x250) & ~(1u << 18));
+	} else {
+		/* the bus protections, through their CLR registers as spm_mtcmos_ctrl_conn_bus_prot does */
+		W(infra, 0x2a4, (1u << 14) | (1u << 16));
+		W(infra, 0x2a4, 1u << 13);
+		W(infra, 0x2ac, 1u << 18);
+	}
 	delay(10);
 	/* (run 307 wrote these two, unexplained, and Android's power-up -- spm_mtcmos_ctrl_conn_pwr/_bus_prot of
-	 * clk-mt6768-pg.c -- has neither: boot-arg connsys_spmx=0 leaves them out) */
+	 * clk-mt6768-pg.c -- has neither: boot-arg connsys_spmx=0 leaves them out. They are WMT's hand-made branch's:
+	 * CONSYS_SPM_APSRC and CONSYS_SPM_DDR_EN, "SPM apsrc/ddr_en hardware mask disable & wait cycle setting",
+	 * mt6768.c:666-667 and the same in mt6765.c:635-636) */
 	{
 		uint32_t spmx = 1;
 
@@ -337,12 +405,13 @@ connsys_power_on(vm_offset_t spm)
 		}
 		redwood_host_keep_add("connsys: step 4 [%u ms]: CONN_HIF_ON CPUPCR %#x", connsys_ms(), rd(ml_io_map(0x18007000u, 0x1000), 0x104));
 	}
-	for (unsigned n = 0; n < 10 && version != CONSYS_IP_VER_ID; n++) {
+	for (unsigned n = 0; n < 10 && version != connsys_ip_ver; n++) {
 		version = rd(misc, CONSYS_IP_VER);
 		delay(20000);
 	}
 	redwood_host_keep_add("connsys: step 4 [%u ms]: IP version %#x: %s", connsys_ms(), version,
-	    version == CONSYS_IP_VER_ID ? "CONNSYS LIVES (the MT6768's)" : "not the expected 0x10020501");
+	    version == connsys_ip_ver ? (connsys_6765 ? "CONNSYS LIVES (the MT6765's)" : "CONNSYS LIVES (the MT6768's)") :
+	    connsys_6765 ? "not the expected 0x10020300" : "not the expected 0x10020501");
 }
 
 /*
@@ -378,7 +447,20 @@ connsys_file(const char *name, uint32_t *size)
 	int left = 0;
 
 	snprintf(path, sizeof(path), "/fw/connsys/%s", name);
+	if (connsys_6765) {
+		/* the r1's /vendor/firmware has "_1_1" where the X6826B's has "_1a_1" (soc1_0_ram_mcu_1_1_hdr.bin,
+		 * WIFI_RAM_CODE_soc1_0_1_1.bin ...): every name asked for here and by redwood_mtkwifi.c comes through this */
+		for (const char *a = name; *a != 0; a++) {
+			if (strncmp(a, "_1a_1", 5) == 0) {
+				snprintf(path, sizeof(path), "/fw/connsys/%.*s_1_1%s", (int)(a - name), name, a + 5);
+				break;
+			}
+		}
+	}
 	if (vnode_lookup(path, 0, &vnode, context) != 0) {
+		if (connsys_6765) {
+			redwood_host_keep_add("connsys: %s: not there (connsys_soc=6765's name)", path);
+		}
 		return NULL;
 	}
 	VATTR_INIT(&attributes);
@@ -437,7 +519,8 @@ connsys_btif_dma_init(void)
 	*(volatile uint32_t *)(infra + 0x8c) = 1u << 18;        /* ifr_ap_dma ungated */
 	delay(10);
 	if (connsys_dma_tx == 0) {
-		connsys_dma_tx = ml_io_map(BTIF_TX_DMA_PHYS, 0x1000);
+		/* the r1 (MT6765): its device tree gives btif@1100c000 the TX channel at 0x11000880 */
+		connsys_dma_tx = ml_io_map(connsys_6765 ? 0x11000880u : BTIF_TX_DMA_PHYS, 0x1000);
 	}
 	if (connsys_dma_vff == 0) {
 		connsys_dma_vff = ml_io_map(BTIF_TX_VFF_PHYS, BTIF_TX_VFF_SIZE);
@@ -920,6 +1003,9 @@ connsys_btif_dump_state(const char *tag)
 static bool connsys_skip_foreign;       /* WMT answers: an event of another opcode than the command's is not its answer (firmware's own, e.g. 02 16 ..) */
 static unsigned connsys_answer_ms;      /* when not 0, how long the next answer may take in full mode (else 1 s) */
 
+static uint8_t connsys_last[32];        /* the last WMT answer (bt: lines) */
+static int connsys_last_len;
+
 static bool
 connsys_wmt(const char *what, const uint8_t *command, unsigned length, const uint8_t *expected, unsigned expected_length)
 {
@@ -996,6 +1082,8 @@ connsys_wmt(const char *what, const uint8_t *command, unsigned length, const uin
 	redwood_host_keep_add("connsys: step %u [%u ms]: %s", connsys_doing, connsys_ms(), line);
 	strlcat(connsys_said, " | ", sizeof(connsys_said));
 	strlcat(connsys_said, line, sizeof(connsys_said));
+	connsys_last_len = got < 0 ? 0 : got;
+	memcpy(connsys_last, answer, (size_t)connsys_last_len);
 	return got >= 0 && (unsigned)got >= expected_length && memcmp(answer, expected, expected_length) == 0;
 }
 
@@ -1223,6 +1311,8 @@ static void
 connsys_sw_init(void)
 {
 	static const uint8_t chip_id[] = { 0x01, 0x02, 0x05, 0x00, 0x11, 0x68, 0x67, 0x00, 0x00 };
+	/* (PLATFORM_SOC_CHIP 0x6765, mt6765.h:41, consys_soc_chipid_get) */
+	static const uint8_t chip_id_6765[] = { 0x01, 0x02, 0x05, 0x00, 0x11, 0x65, 0x67, 0x00, 0x00 };
 	static const uint8_t a_die[] = { 0x01, 0x02, 0x01, 0x00, 0x12 };
 	static const uint8_t a_die_said[] = { 0x02, 0x02, 0x05, 0x00, 0x00 };
 	static const uint8_t lte_coex[] = { 0x01, 0x10, 0x02, 0x00, 0x15, 0x01 };
@@ -1271,7 +1361,11 @@ connsys_sw_init(void)
 			delay(5000);                    /* (wmt_stp_wifi_lte_coex's osal_sleep_ms(5)) */
 		}
 		connsys_answer_ms = script[i].wait_ms;
-		ok = connsys_wmt(script[i].what, script[i].command, script[i].length, script[i].expected, script[i].expected_length);
+		if (connsys_6765 && script[i].command == chip_id) {
+			ok = connsys_wmt("set chip ID 0x6765", chip_id_6765, sizeof(chip_id_6765), script[i].expected, script[i].expected_length);
+		} else {
+			ok = connsys_wmt(script[i].what, script[i].command, script[i].length, script[i].expected, script[i].expected_length);
+		}
 		connsys_answer_ms = 0;
 		answered += ok;
 		if (!ok && script[i].must) {
@@ -1381,6 +1475,7 @@ bt_dump(const char *direction, const uint8_t *bytes, unsigned length, uint32_t *
  * LE_Read_Local_Supported_Features and gives up ("HCI initialization failed", run 615). The standard Core 5.2 bits of those
  * octets are set where the controller has none (OR, never cleared).
  */
+static bool bt_noext;                   /* boot-arg bt_noext=1: 0x204a is answered here, and its bit is clear in 0x1002's answer */
 static uint8_t bt_vsc_sub;              /* the first parameter of the last 0xfce2 command sent: its kind (0x0b, 0x1c: the antenna's, which have a byte in their answers; 0x15: LE features, which has none) */
 
 static unsigned
@@ -1454,6 +1549,16 @@ bt_quirks(uint8_t *packet, unsigned length)
 			packet[7 + 25 + i] |= le_commands[i];
 		}
 		packet[7 + 24] |= 0x60;         /* octet 24 bits 5, 6: Read and Write LE Host Support (run 616: WriteLeHostSupported, status 628) */
+		/*
+		 * r1 (MT6765, MT6631 rev 0x7279): octet 18 bit 3 (Write_Default_Erroneous_Data_Reporting, 0x0c5b) is clear, so bluetoothd's last init
+		 * step (initCmdWriteErroneousDataReportingCB; unlike host flow control it has no 0x2cd "unsupported (ignoring)" case) fails without
+		 * sending anything: reason 108 "HCI initialization failed" right after 0c31 (bt0, 2026-11-17). Set it: the command is then sent and
+		 * answered as done by the 0x0c5b case above.
+		 */
+		packet[7 + 18] |= 0x08;
+		if (bt_noext) {
+			packet[7 + 38] &= ~0x40;        /* octet 38 bit 6 = 0x204a, LE Read Periodic Advertiser List Size (octet 36 bit 1 is 0x2035; 0x2035 + 21 = 0x204a) */
+		}
 	}
 	return length;
 }
@@ -1816,6 +1921,43 @@ bt_ctl_deliver(const uint8_t *bytes, unsigned length)
 
 static uint8_t bt_frame[2048];
 
+static bool
+bt_arg(const char *name)
+{
+	uint32_t value = 0;
+
+	return PE_parse_boot_argn(name, &value, sizeof(value)) && value != 0;
+}
+
+/* a packet for the host: the ring, the readers, the kernel control */
+static void
+bt_to_host(const uint8_t *p, unsigned n)
+{
+	lck_mtx_lock(&bt_lock);
+	for (unsigned i = 0; i < n && bt_ring_count < BT_RING; i++) {
+		bt_ring[(bt_ring_head + bt_ring_count) % BT_RING] = p[i];
+		bt_ring_count++;
+	}
+	wakeup(&bt_ring_count);
+	selwakeup(&bt_sel);
+	lck_mtx_unlock(&bt_lock);
+	bt_ctl_deliver(p, n);
+}
+
+/* boot-arg bt_raw=1: up to 24 bytes of a frame, kept */
+static void
+bt_raw_log(const char *what, const uint8_t *p, unsigned n)
+{
+	char text[3 * 24 + 1];
+	unsigned m = n < 24 ? n : 24;
+
+	for (unsigned i = 0; i < m; i++) {
+		snprintf(text + 3 * i, 4, " %02x", p[i]);
+	}
+	text[3 * m] = 0;
+	redwood_host_keep_add("connsys: bt raw %s %u bytes:%s", what, n, text);
+}
+
 /* what is written is sent a packet at a time; what comes is put in the ring. Never returns. */
 static void
 bt_bridge(void)
@@ -1845,6 +1987,22 @@ bt_bridge(void)
 	bt_ctl_register();
 	redwood_btsk_init();
 	connsys_stp_task = 0;
+	/* boot-arg bt_idle_ms=N (default 0 = today's polling): sleep N ms (max 50) instead of 1 ms whenever nothing came in (receive returns -1) */
+	uint32_t idle_ms = 0;
+	(void)PE_parse_boot_argn("bt_idle_ms", &idle_ms, sizeof(idle_ms));
+	static uint8_t raw[2048];
+	const bool want_raw = bt_arg("bt_raw"), vsc_local = bt_arg("bt_vsc_local");
+	unsigned raw_said = 0;
+	bool commands_said = false;
+
+	{	/* default on (btB 2026-11-17: scanning works only with 0x204a kept from the controller); bt_noext=0 turns it off */
+		uint32_t v = 1;
+		(void)PE_parse_boot_argn("bt_noext", &v, sizeof(v));
+		bt_noext = v != 0;
+	}
+	if (idle_ms > 50) {
+		idle_ms = 50;
+	}
 	for (;;) {
 		int length;
 
@@ -1872,7 +2030,23 @@ bt_bridge(void)
 			if (n >= 5 && packet[0] == 1 && packet[1] == 0xe2 && packet[2] == 0xfc) {
 				bt_vsc_sub = packet[4];
 			}
+			if (bt_noext && n == 4 && memcmp(packet, "\x01\x4a\x20\x00", 4) == 0) {
+				static const uint8_t size_done[] = { 0x04, 0x0e, 0x05, 0x01, 0x4a, 0x20, 0x00, 0x10 };
+
+				bt_dump("out", packet, n, &bt_said_packets_out);
+				bt_to_host(size_done, sizeof(size_done));       /* the controller never sees 0x204a */
+				continue;
+			}
 			bt_dump("out", packet, n, &bt_said_packets_out);
+			if (vsc_local && n >= 4 && packet[0] == 1 && (packet[2] >> 2) == 0x3f) {
+				/* the Command Complete bt_quirks makes of the controller's "unknown command" for it, without asking the controller */
+				uint8_t reply[7 + 64] = { 0x04, 0x0f, 0x04, 0x01, 0x01, packet[1], packet[2] };
+				unsigned m = bt_quirks(reply, 7);
+
+				bt_dump("in ", reply, m, &bt_said_packets_in);
+				bt_to_host(reply, m);
+				continue;
+			}
 			connsys_btif_wake();
 			connsys_stp_send(packet, n);
 		}
@@ -1902,19 +2076,27 @@ bt_bridge(void)
 		heard[0] = 0;
 		length = connsys_stp_receive(bt_frame, sizeof(bt_frame), heard, sizeof(heard), 2);
 		if (length > 0) {
-			length = (int)bt_quirks(bt_frame, (unsigned)length);
-			bt_dump("in ", bt_frame, (unsigned)length, &bt_said_packets_in);
-			lck_mtx_lock(&bt_lock);
-			for (int i = 0; i < length && bt_ring_count < BT_RING; i++) {
-				bt_ring[(bt_ring_head + bt_ring_count) % BT_RING] = bt_frame[i];
-				bt_ring_count++;
+			const unsigned raw_length = (unsigned)length;
+
+			if (want_raw) {
+				memcpy(raw, bt_frame, raw_length);
 			}
-			wakeup(&bt_ring_count);
-			selwakeup(&bt_sel);
-			lck_mtx_unlock(&bt_lock);
-			bt_ctl_deliver(bt_frame, (unsigned)length);
+			length = (int)bt_quirks(bt_frame, (unsigned)length);
+			if (want_raw) {
+				if (!commands_said && raw_length == 71 && memcmp(raw, "\x04\x0e\x44\x01\x02\x10\x00", 7) == 0) {
+					commands_said = true;
+					for (unsigned i = 0; i < 71; i += 24) {
+						bt_raw_log("0x1002", raw + i, 71 - i);       /* (24 of what is left, each line) */
+					}
+				} else if (raw_said < 40 && ((unsigned)length != raw_length || memcmp(raw, bt_frame, raw_length) != 0)) {
+					raw_said++;
+					bt_raw_log("(changed)", raw, raw_length);
+				}
+			}
+			bt_dump("in ", bt_frame, (unsigned)length, &bt_said_packets_in);
+			bt_to_host(bt_frame, (unsigned)length);
 		} else if (length < 0) {
-			delay_for_interval(1, NSEC_PER_MSEC);
+			delay_for_interval(idle_ms != 0 ? idle_ms : 1, NSEC_PER_MSEC);
 		}
 	}
 }
@@ -1963,13 +2145,52 @@ connsys_bt_start(void)
 	delay_for_interval(50, NSEC_PER_MSEC);
 	connsys_stp_task = 0;
 	good += connsys_wmt("HCI_Reset", reset, sizeof(reset), reset_done, sizeof(reset_done));
+	if (connsys_6765 && connsys_last_len >= 7) {
+		redwood_host_keep_add("bt: reset status %u", connsys_last[6]);
+	}
 	good += connsys_wmt("HCI Read_Local_Version_Information", version, sizeof(version), version_done, sizeof(version_done));
+	if (connsys_6765 && connsys_last_len >= 15) {
+		const uint8_t *a = connsys_last;
+
+		redwood_host_keep_add("bt: version HCI %u rev %#x LMP %u manuf %#x subver %#x", a[7], a[8] | (a[9] << 8), a[10],
+		    a[11] | (a[12] << 8), a[13] | (a[14] << 8));
+	}
 	good += connsys_wmt("HCI Read_BD_ADDR", address, sizeof(address), address_done, sizeof(address_done));
+	if (connsys_6765 && connsys_last_len >= 13) {
+		const uint8_t *a = connsys_last;
+
+		redwood_host_keep_add("bt: BD_ADDR %02x:%02x:%02x:%02x:%02x:%02x", a[12], a[11], a[10], a[9], a[8], a[7]);
+	}
 	good += connsys_wmt("HCI Read_Local_Supported_Features", features, sizeof(features), features_done, sizeof(features_done));
 	good += connsys_wmt("HCI Read_Buffer_Size", buffers, sizeof(buffers), buffers_done, sizeof(buffers_done));
 	good += connsys_wmt("HCI LE_Read_Buffer_Size", le_buffers, sizeof(le_buffers), le_buffers_done, sizeof(le_buffers_done));
+	if (connsys_6765) {
+		redwood_host_keep_add("bt: %u of 6 answered", good);
+	}
 	redwood_host_keep_add("connsys: step 20 [%u ms]: Bluetooth on; %u of 6 HCI commands answered as a controller answers", connsys_ms(), good);
 	connsys_firmware_said("after bt");
+	if (bt_arg("bt_probe")) {
+		static const struct { uint8_t c[11]; unsigned n; } probes[6] = {
+			{ { 0x01, 0x0b, 0x20, 0x07, 0x00, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00 }, 11 },
+			{ { 0x01, 0x0c, 0x20, 0x02, 0x01, 0x00 }, 6 },
+			{ { 0x01, 0x0c, 0x20, 0x02, 0x00, 0x00 }, 6 },
+			{ { 0x01, 0x4a, 0x20, 0x00 }, 4 },
+			{ { 0x01, 0x0b, 0x20, 0x07, 0x00, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00 }, 11 },
+			{ { 0x01, 0x03, 0x0c, 0x00 }, 4 },
+		};
+
+		for (unsigned i = 0; i < 6; i++) {
+			uint8_t expect[7] = { 0x04, 0x0e, (uint8_t)(i == 3 ? 5 : 4), 0x01, probes[i].c[1], probes[i].c[2], 0x00 };
+
+			(void)connsys_wmt("probe", probes[i].c, probes[i].n, expect, sizeof(expect));
+			/* 0x204a answers 04 0e 05 01 4a 20 00 <size>: the status is at [6] in both */
+			if (connsys_last_len >= 7) {
+				redwood_host_keep_add("bt: probe %u: opcode %02x%02x status %#x (%d bytes)", i + 1, connsys_last[5], connsys_last[4], connsys_last[6], connsys_last_len);
+			} else {
+				redwood_host_keep_add("bt: probe %u: no answer", i + 1);
+			}
+		}
+	}
 	if (want >= 2 && good == 6) {
 		/* iOS looks for the controller in the registry ("bluetooth"): without it BluetoothManager's attach fails with 9 and Settings' switch stays grey */
 		for (unsigned tries = 0; tries < 40 && !RedwoodBluetoothNode(); tries++) {
@@ -2012,7 +2233,10 @@ connsys_stp_full_mode(void)
 	connsys_chip_id_done = true;
 	delay_for_interval(10, NSEC_PER_MSEC);
 	if (connsys_step >= 9) {
-		connsys_wmt("WMT read 0xf0000000 (EMI+0)", emi_read, sizeof(emi_read), emi_read_done, sizeof(emi_read_done));
+		/* (connsys_soc=6765: the r1's soc1_0_ram_mcu_1_1_hdr.bin is another build, its first word not known here:
+		 * the answer's 12 bytes of header alone are compared and the word is in the line) */
+		connsys_wmt("WMT read 0xf0000000 (EMI+0)", emi_read, sizeof(emi_read), emi_read_done,
+		    connsys_6765 ? 12 : sizeof(emi_read_done));
 		delay_for_interval(10, NSEC_PER_MSEC);
 	}
 	/*
@@ -2212,7 +2436,11 @@ connsys_firmware_thread(__unused void *parameter, __unused wait_result_t result)
 		uint32_t afe = 1;
 
 		(void)PE_parse_boot_argn("connsys_afe", &afe, sizeof(afe));
-		if (afe != 0) {
+		if (connsys_6765) {
+			/* CONSYS_AFE_REG_SETTING 0 (mt6765.h:33): consys_afe_reg_setting is empty there (mt6765.c:768-792), and
+			 * its WBG is elsewhere (0x180B6000, +0x38) */
+			redwood_host_keep_add("connsys: step 5 [%u ms]: MT6765: no WBG PLL setting", connsys_ms());
+		} else if (afe != 0) {
 			vm_offset_t wbg = ml_io_map(0x180B3000u, 0x1000);
 			connsys_wbg = wbg;
 			uint32_t before = rd(wbg, 0x34);
@@ -2237,7 +2465,26 @@ connsys_firmware_thread(__unused void *parameter, __unused wait_result_t result)
 		uint32_t post = 1;
 
 		(void)PE_parse_boot_argn("connsys_post", &post, sizeof(post));
-		if (post != 0) {
+		if (post != 0 && connsys_6765) {
+			/*
+			 * mt6765.c's polling_consys_chipid has other things there (:735-759): the "mcu rom delsel setting", MCU+0x114
+			 * low half 0x17 (CONSYS_MCU_ROM_DELSEL_*, mt6765.h:79-80); in co-clock mode no stable time (#if 0, :744-749)
+			 * and bit 0 of 0x180C1204 cleared (:750-752; co_clock_flag=1 is the X6826B's WMT_SOC.cfg, the r1's not yet
+			 * read); MCU+0x150 bits 0, 15 and 21 SET (CONSYS_EMI_CTRL_VALUE, mt6765.h:81, :759); no toppose rollback.
+			 */
+			vm_offset_t misc_on_window = ml_io_map_unmappable(0x180C0000u, 0x4000, 0x7 /* VM_WIMG_IO */);
+			vm_offset_t misc_on = misc_on_window + 0x1000;
+			uint32_t delsel = rd(mcu, 0x114), ack = rd(misc_on, 0x204), emi = rd(mcu, 0x150);
+
+			*(volatile uint32_t *)(mcu + 0x114) = (delsel & 0xffff0000u) | 0x17u;
+			*(volatile uint32_t *)(misc_on + 0x204) = ack & ~1u;
+			*(volatile uint32_t *)(mcu + 0x150) = emi | (1u << 0) | (1u << 15) | (1u << 21);
+			__asm__ volatile ("dsb sy" ::: "memory");
+			redwood_host_keep_add("connsys: step 5 [%u ms]: as mt6765.c's polling_consys_chipid: ROM delsel (MCU+0x114) %#x -> %#x, "
+			    "ack mask %#x -> %#x, EMI control (MCU+0x150) %#x -> %#x", connsys_ms(), delsel, rd(mcu, 0x114), ack,
+			    rd(misc_on, 0x204), emi, rd(mcu, 0x150));
+			ml_io_unmap(misc_on_window, 0x4000);
+		} else if (post != 0) {
 			/* (a window taken back after: one more permanent one filled the kernel's 8 MB I/O map, and another driver's
 			 * later mapping panicked, "kmem_alloc ... failed with 3" -- runs 430-435; 16 KB aligned) */
 			vm_offset_t misc_on_window = ml_io_map_unmappable(0x180C0000u, 0x4000, 0x7 /* VM_WIMG_IO */);
@@ -2290,6 +2537,17 @@ redwood_connsys_init(void)
 		return;
 	}
 	connsys_step = step;
+	{
+		uint32_t soc = 0;
+
+		/* boot-arg connsys_soc=6765 (or 0x6765): the r1's MT6765 and MT6357, see connsys_6765 above */
+		if (PE_parse_boot_argn("connsys_soc", &soc, sizeof(soc)) && (soc == 6765 || soc == 0x6765)) {
+			connsys_6765 = true;
+			connsys_ip_ver = 0x10020300u;           /* mt6765.c:711 */
+			connsys_pmic = &connsys_mt6357;
+			redwood_host_keep_add("connsys: connsys_soc=6765: the MT6765's sequence and the MT6357's registers");
+		}
+	}
 	if (step >= 16) {
 		redwood_mtkwifi_net_early();
 	}
@@ -2331,6 +2589,7 @@ redwood_connsys_init(void)
 	misc = ml_io_map(MCU_TOP_MISC_OFF_PHYS, 0x1000);
 	mcu = ml_io_map(MCU_PHYS, 0x1000);
 	redwood_host_keep_add("connsys: step 1: IP version %#x (%s), configuration %#x, hardware %#x, firmware %#x",
-	    rd(misc, CONSYS_IP_VER), rd(misc, CONSYS_IP_VER) == CONSYS_IP_VER_ID ? "the MT6768's" : "NOT the expected 0x10020501",
+	    rd(misc, CONSYS_IP_VER), rd(misc, CONSYS_IP_VER) == connsys_ip_ver ? (connsys_6765 ? "the MT6765's" : "the MT6768's") :
+	    connsys_6765 ? "NOT the expected 0x10020300" : "NOT the expected 0x10020501",
 	    rd(misc, CONSYS_CONF_ID) & 0xF, rd(mcu, CONSYS_HW_ID) & 0xFFFF, rd(mcu, CONSYS_FW_ID) & 0xFFFF);
 }

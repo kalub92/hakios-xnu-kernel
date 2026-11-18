@@ -1,0 +1,27 @@
+; pvr_vk_test's fragment shader
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %in_col %out
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %in_col Location 0
+               OpDecorate %out Location 0
+       %void = OpTypeVoid
+     %fnvoid = OpTypeFunction %void
+      %float = OpTypeFloat 32
+       %vec3 = OpTypeVector %float 3
+       %vec4 = OpTypeVector %float 4
+%ptr_in_vec3 = OpTypePointer Input %vec3
+%ptr_out_vec4 = OpTypePointer Output %vec4
+     %in_col = OpVariable %ptr_in_vec3 Input
+        %out = OpVariable %ptr_out_vec4 Output
+    %float_1 = OpConstant %float 1
+       %main = OpFunction %void None %fnvoid
+      %entry = OpLabel
+          %c = OpLoad %vec3 %in_col
+          %r = OpCompositeExtract %float %c 0
+          %g = OpCompositeExtract %float %c 1
+          %b = OpCompositeExtract %float %c 2
+          %o = OpCompositeConstruct %vec4 %r %g %b %float_1
+               OpStore %out %o
+               OpReturn
+               OpFunctionEnd

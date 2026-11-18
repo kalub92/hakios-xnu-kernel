@@ -31,6 +31,7 @@
 #include <sys/dirent.h>
 #include <sys/errno.h>
 #include <sys/fcntl.h>
+#include <sys/ioccom.h>
 #include <sys/mount_internal.h>
 #include <sys/namei.h>
 #include <sys/proc.h>
@@ -1286,9 +1287,31 @@ ramfs_readlink(struct vnop_readlink_args *ap)
 	return uiomove(node->rn_target, (int)node->rn_size, ap->a_uio);
 }
 
+/*
+ * The free-space thresholds HFS and APFS answer by fsctl, in blocks of f_bsize. PhotoLibraryServices' PLVolumeInfo asks for them and,
+ * from a volume that does not answer, takes an iPhone's (very low 500 MB, low 700 MB, near low 1 GB, desired 1.2 GB): more than this
+ * whole filesystem (a quarter of memory), so the photo library refused every photo, "not enough space" (PHPhotosErrorDomain 3305).
+ * Ours are fractions of the filesystem's own size.
+ */
 static int
-ramfs_ioctl(__unused struct vnop_ioctl_args *ap)
+ramfs_ioctl(struct vnop_ioctl_args *ap)
 {
+	uint64_t max = RAMFS_MP(vnode_mount(ap->a_vp))->rm_max_pages;
+
+	switch (ap->a_command) {
+	case _IOR('h', 27, u_int32_t):  /* HFSIOC_GET_VERY_LOW_DISK */
+		*(u_int32_t *)ap->a_data = (u_int32_t)(max / 64);
+		return 0;
+	case _IOR('h', 28, u_int32_t):  /* HFSIOC_GET_LOW_DISK */
+		*(u_int32_t *)ap->a_data = (u_int32_t)(max / 32);
+		return 0;
+	case _IOR('J', 18, u_int32_t):  /* APFSIOC_GET_NEAR_LOW_DISK */
+		*(u_int32_t *)ap->a_data = (u_int32_t)(max * 3 / 64);
+		return 0;
+	case _IOR('h', 29, u_int32_t):  /* HFSIOC_GET_DESIRED_DISK */
+		*(u_int32_t *)ap->a_data = (u_int32_t)(max / 16);
+		return 0;
+	}
 	return ENOTTY;
 }
 

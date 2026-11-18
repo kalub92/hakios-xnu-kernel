@@ -67,6 +67,9 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define APART_HUNDREDTHS        3000
 
 static volatile uint32_t *pwrap;
+/* the MT6358's by default; the MT6357 (r1_batt=1) moves these (r1batt_thread) */
+static uint32_t adc_rqst = MT6358_AUXADC_RQST0, adc_reg = MT6358_AUXADC_ADC0, car_reg = MT6358_FGADC_CAR_CON0;
+static uint16_t adc_bit = 1;
 
 static bool
 pwrap_wait(uint32_t state)
@@ -131,10 +134,10 @@ batadc_convert(void)
 	static bool said;
 	uint16_t raw = 0;
 
-	if (pmic_write(MT6358_AUXADC_RQST0, 1)) {
+	if (pmic_write(adc_rqst, adc_bit)) {
 		/* the last conversion's "ready" may still be up: the converter is given its time before the look */
 		delay_for_interval(3, NSEC_PER_MSEC);
-		if (pmic_until(MT6358_AUXADC_ADC0, 0x8000, 0x8000, 50, &raw)) {
+		if (pmic_until(adc_reg, 0x8000, 0x8000, 50, &raw)) {
 			return raw & 0x7fff;
 		}
 	}
@@ -162,7 +165,7 @@ gauge_latch(int16_t *current, uint32_t *charge)
 	con1 &= (uint16_t)~(FGADC_CON1_READ | FGADC_CON1_CLEAR | FGADC_CON1_LATCHED);
 	ok = pmic_write(MT6358_FGADC_CON1, con1 | FGADC_CON1_READ) &&
 	    pmic_until(MT6358_FGADC_CON1, FGADC_CON1_LATCHED, FGADC_CON1_LATCHED, 100, &got) &&
-	    pmic_read(MT6358_FGADC_CUR_CON0, &cur) && pmic_read(MT6358_FGADC_CAR_CON0, &low) && pmic_read(MT6358_FGADC_CAR_CON1, &high);
+	    pmic_read(MT6358_FGADC_CUR_CON0, &cur) && pmic_read(car_reg, &low) && pmic_read(car_reg + 2, &high);
 	/* let go, whatever happened */
 	(void)pmic_write(MT6358_FGADC_CON1, con1 | FGADC_CON1_CLEAR);
 	(void)pmic_until(MT6358_FGADC_CON1, FGADC_CON1_LATCHED, 0, 100, &got);
@@ -309,12 +312,251 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 	}
 }
 
+/*
+ * The rabbit r1's battery (boot-arg r1_batt=1): an MT6357, 1000 mAh, 4.4 V, 10 mOhm shunt. Registers from the Linux port's
+ * mt6357-gauge.c / auxadc6357.c / registers.h; none of it has been read on this hardware, so every raw value is logged ("r1batt:").
+ *  - HWCID 0x8, 0x57xx for an MT6357. Anything else: nothing is touched.
+ *  - Voltage: the gauge's ISENSE channel (the device tree: "stock battery voltage is ISENSE, not BATADC"), RQST0 0x110e bit 1,
+ *    result ADC1 0x108a, ratio 3 over 1 of 1.8 V / 32768.
+ *  - Current: FGADC_CUR_CON0 0xd8a, ones' complement, 3.14331 x count in 0.1 mA over 10 mOhm, negative out of the cell.
+ *    Counter: CAR_CON0/1 0xd12/0xd14 (bits 30:11 of the pair, sign 31). Both only if FGADC_CON0 bit 0 says the gauge is on.
+ *  - Percentage: the voltage's own curve (percent_of), unloaded. Charger: CHR_CON0 0xb88 bit 5 is a guess; the raw register is logged.
+ */
+static void
+r1batt_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	uint16_t id = 0, con0 = 0;
+	int32_t kept_mv = 0, r1_mv_off = 65, shown = -1;   /* +65 mV: ISENSE read 4326-4336 where Android showed 4392-4398 */
+
+	/* no efuse gain/offset in the MT6357 ADC reference (auxadc6357.c: fixed 1800 mV vref), so the default is the +65 mV measured against Android's reading: r1_batt_mv_off= (mV, may be negative) */
+	PE_parse_boot_argn("r1_batt_mv_off", &r1_mv_off, sizeof(r1_mv_off));
+	adc_rqst = 0x110e;
+	adc_reg = 0x108a;
+	car_reg = 0x0d12;
+	adc_bit = 2;
+	pwrap = (volatile uint32_t *)ml_io_map(PWRAP_BASE, 0x1000);
+	if (!pmic_read(0x0008, &id) || (id & 0xff00) != 0x5700) {
+		printf("r1batt: HWCID %#x is not an MT6357 (0x57xx), or the PMIC does not answer: left alone\n", id);
+		return;
+	}
+	(void)pmic_read(0x0d08, &con0);
+	printf("r1batt: HWCID %#x; FGADC_CON0 %#x: gauge %s; mV offset %d\n", id, con0, (con0 & 1) ? "on" : "off, no current", r1_mv_off);
+	delay_for_interval(20000, NSEC_PER_MSEC);
+	for (unsigned looks = 0;; looks++, delay_for_interval(10000, NSEC_PER_MSEC)) {
+		struct redwood_battery_state b = { .size = sizeof(b) };
+		int32_t sum = 0, good = 0, mv, ma = 0, percent;
+		uint16_t chr = 0;
+		int16_t gauge = 0;
+		uint32_t charge = 0;
+		bool charger, current = false;
+
+		for (unsigned i = 0; i < 4; i++) {
+			int32_t counts = batadc_convert();
+
+			if (counts >= 0) {
+				sum += counts;
+				good++;
+			}
+		}
+		if (good == 0) {
+			continue;
+		}
+		mv = (int32_t)((int64_t)(sum / good) * COUNT_NV / 1000000);
+		if (mv < 2500 || mv > 4700) {
+			printf("r1batt: ISENSE %d counts would be %d mV: not a cell's voltage, not given\n", sum / good, mv);
+			continue;
+		}
+		(void)pmic_read(0x0b88, &chr);
+		charger = chr & CHR_CON0_CHRDET;
+		(void)pmic_read(0x0d08, &con0);
+		if (con0 & 1) {
+			current = gauge_latch(&gauge, &charge);
+		}
+		if (current) {
+			int32_t mag = (gauge & 0x8000) ? 0xffff - (uint16_t)gauge : (uint16_t)gauge;
+
+			ma = (int32_t)((int64_t)mag * 314331 / 1000000);        /* 0.1 mA x 3.14331, then to mA */
+			ma = (gauge & 0x8000) ? -ma : ma;
+		}
+		mv += r1_mv_off;
+		kept_mv = kept_mv == 0 ? mv : (kept_mv * 3 + mv) / 4;
+		/* a 4.4 V cell rests at about 4.35 V full: stretch the curve above 3985 mV so 4350 reads as FULL_MV */
+		percent = percent_of(kept_mv > 3985 ? 3985 + (kept_mv - 3985) * (FULL_MV - 3985) / (4350 - 3985) : kept_mv);
+		/* on the charger, full and nearly no current: 100 % (the cell is topped up; its voltage sags under the charger's taper) */
+		bool terminated = charger && kept_mv >= 4380 && current && ma > -100 && ma < 100;
+
+		if (terminated) {
+			percent = 10000;
+		}
+		/* low-pass: after the first reading at most 1 % per 30 s, never up while discharging, never down while charging */
+		if (shown < 0 || terminated) {
+			shown = percent;
+		} else if (looks % 3 == 0 && percent != shown && (percent > shown ? charger : !charger)) {
+			shown += percent > shown ? (percent - shown < 100 ? percent - shown : 100) : -(shown - percent < 100 ? shown - percent : 100);
+		}
+		percent = shown;
+		b.percent_hundredths = percent;
+		b.voltage_uv = mv * 1000;
+		b.current_ua = ma * 1000;
+		b.temperature_hundredths = 2500;
+		b.present = 1;
+		b.external = charger;
+		b.status = !charger ? 2 : percent >= 9950 ? 4 : (current && ma <= 0) ? 3 : 1;
+		redwood_battery_report(&b);
+		if (looks < 6 || (looks % 6) == 0) {
+			printf("r1batt: HWCID %#x %d.%02d%%, ISENSE %d counts = %d mV (offset %d), CHR_CON0 %#x (charger %s), FGADC_CON0 %#x, status %d; current %#x = %d mA, counter %#x%s\n",
+			    id, percent / 100, percent % 100, sum / good, mv, r1_mv_off, chr, charger ? "in" : "out", con0, b.status,
+			    (uint16_t)gauge, ma, charge, current ? "" : " (no current)");
+		}
+	}
+}
+
+/*
+ * RTC (boot-arg r1_rtc, GenericARMPE.cpp): the MT6357's time counter, base 0x588. BBPU (0x588) is only read
+ * (CBUSY bit 6); never written here, nor PDN1/PDN2 (0x5b4/0x5b6), AL_* (0x5a0-0x5ae), or base+0x50/0x52.
+ * The log lines are stashed until redwood_mtkbatt_init (findBootEpoch runs before the log is kept).
+ */
+extern void redwood_host_keep_add(const char *format, ...) __printflike(1, 2);
+#define RTC_BBPU        0x588
+#define RTC_WRTGR       0x5c2
+#define RTC_TC(i)       (0x592 + 2 * (i))       /* SEC MIN HOU DOM DOW MTH YEA */
+static const uint16_t rtc_mask[7] = { 0x3f, 0x3f, 0x1f, 0x1f, 0x7, 0xf, 0x7f };
+static uint32_t rtc_base = 1968;
+static char rtc_stash[6][200];
+static uint32_t rtc_stashed;
+static bool rtc_flushed;
+
+void redwood_rtc_say(const char *format, ...) __printflike(1, 2);
+void
+redwood_rtc_say(const char *format, ...)
+{
+	char line[200];
+	va_list ap;
+
+	va_start(ap, format);
+	vsnprintf(line, sizeof(line), format, ap);
+	va_end(ap);
+	if (rtc_flushed) {
+		redwood_host_keep_add("%s", line);
+	} else if (rtc_stashed < 6) {
+		strlcpy(rtc_stash[rtc_stashed++], line, sizeof(rtc_stash[0]));
+	}
+}
+
+static bool
+rtc_pwrap(void)
+{
+	if (pwrap == NULL) {
+		pwrap = (volatile uint32_t *)ml_io_map(PWRAP_BASE, 0x1000);
+	}
+	return pwrap != NULL;
+}
+
+static uint64_t
+days_from_civil(uint32_t y, uint32_t m, uint32_t d)
+{
+	y -= m <= 2;
+	uint32_t era = y / 400, yoe = y - era * 400;
+	uint32_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+	uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	return (uint64_t)era * 146097 + doe - 719468;
+}
+
+static bool
+rtc_regs(uint16_t v[7], uint16_t *bbpu)
+{
+	for (int i = 0; i < 7; i++) {
+		if (!pmic_read(RTC_TC(i), &v[i])) {
+			return false;
+		}
+	}
+	return pmic_read(RTC_BBPU, bbpu);
+}
+
+bool
+redwood_rtc_read(uint64_t *epoch)
+{
+	uint16_t v[7], bbpu = 0, sec2;
+
+	if (!rtc_pwrap() || !rtc_regs(v, &bbpu)) {
+		redwood_rtc_say("r1rtc: the PMIC does not answer");
+		return false;
+	}
+	if (pmic_read(RTC_TC(0), &sec2) && sec2 < v[0] && !rtc_regs(v, &bbpu)) {  /* a carry between the reads */
+		return false;
+	}
+	redwood_rtc_say("r1rtc: raw SEC %u MIN %u HOU %u DOM %u DOW %u MTH %#x YEA %u BBPU %#x",
+	    v[0], v[1], v[2], v[3], v[4], v[5], v[6], bbpu);
+	uint32_t year = (v[6] >= 56 && v[6] <= 99) ? 1968 + v[6] : (v[6] >= 124 && v[6] <= 127) ? 1900 + v[6] : 0;
+	uint32_t mon = v[5] & 0xf;
+	if (year < 2024 || year > 2099 || mon < 1 || mon > 12 || v[3] < 1 || v[3] > 31 || (v[2] & 0x1f) > 23 ||
+	    (v[1] & 0x3f) > 59 || (v[0] & 0x3f) > 59) {
+		redwood_rtc_say("r1rtc: not a time of day: not used");
+		return false;
+	}
+	rtc_base = year - v[6];
+	*epoch = days_from_civil(year, mon, v[3] & 0x1f) * 86400 + (v[2] & 0x1f) * 3600 + (v[1] & 0x3f) * 60 + (v[0] & 0x3f);
+	redwood_rtc_say("r1rtc: %04u-%02u-%02u %02u:%02u:%02u UTC (base %u) = %llu", year, mon, v[3] & 0x1f, v[2] & 0x1f,
+	    v[1] & 0x3f, v[0] & 0x3f, rtc_base, *epoch);
+	return true;
+}
+
+bool
+redwood_rtc_write(uint64_t epoch)
+{
+	uint64_t days = epoch / 86400, rem = epoch % 86400;
+	uint16_t want[7], old, got, bbpu = 0;
+	clock_sec_t s0, s1;
+	clock_usec_t u0, u1;
+	bool trig, mismatch = false;
+	uint32_t z = (uint32_t)days + 719468, era = z / 146097, doe = z - era * 146097;
+	uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365, doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	uint32_t mp = (5 * doy + 2) / 153, d = doy - (153 * mp + 2) / 5 + 1, m = mp < 10 ? mp + 3 : mp - 9;
+	uint32_t y = yoe + era * 400 + (m <= 2);
+
+	if (y < 2024 || y - rtc_base > (rtc_base == 1968 ? 99u : 127u) || !rtc_pwrap()) {
+		redwood_rtc_say("r1rtc: set %llu: year %u does not fit (base %u): not written", epoch, y, rtc_base);
+		return false;
+	}
+	want[0] = rem % 60; want[1] = rem / 60 % 60; want[2] = rem / 3600; want[3] = d;
+	want[4] = (days + 4) % 7 + 1; want[5] = m; want[6] = y - rtc_base;
+	for (int i = 0; i < 7; i++) {
+		if (!pmic_read(RTC_TC(i), &old) || !pmic_write(RTC_TC(i), (old & ~rtc_mask[i]) | want[i])) {
+			redwood_rtc_say("r1rtc: set %llu: register %d not written", epoch, i);
+			return false;
+		}
+	}
+	trig = pmic_write(RTC_WRTGR, 1);
+	clock_get_system_microtime(&s0, &u0);
+	do {
+		delay_for_interval(10, NSEC_PER_USEC);
+		clock_get_system_microtime(&s1, &u1);
+	} while ((!pmic_read(RTC_BBPU, &bbpu) || (bbpu & (1u << 6))) && (s1 - s0) * 1000000ULL + u1 - u0 < 1000000);
+	for (int i = 0; i < 7; i++) {
+		mismatch |= !pmic_read(RTC_TC(i), &got) || (got & rtc_mask[i]) != want[i];
+	}
+	redwood_rtc_say("r1rtc: set %llu: trigger %s, CBUSY clear after %u us, read-back %s", epoch, trig ? "ok" : "timeout",
+	    (uint32_t)((s1 - s0) * 1000000ULL + u1 - u0), mismatch ? "MISMATCH" : "ok");
+	return !mismatch;
+}
+
 void
 redwood_mtkbatt_init(void)
 {
 	uint32_t level = 0;
 	thread_t thread;
 
+	rtc_flushed = true;
+	for (uint32_t i = 0; i < rtc_stashed; i++) {
+		redwood_host_keep_add("%s", rtc_stash[i]);
+	}
+
+	if (PE_parse_boot_argn("r1_batt", &level, sizeof(level)) && level == 1) {
+		if (kernel_thread_start(r1batt_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		}
+		return;
+	}
 	if (!PE_parse_boot_argn("mtkbatt", &level, sizeof(level)) || level < 1) {
 		return;
 	}

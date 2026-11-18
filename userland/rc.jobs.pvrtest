@@ -1,0 +1,6 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# The first work the PowerVR does for a program (the rabbit r1; build.sh PVR=1, boot-arg pvr=6): Vulkan
+# by Mesa's driver -- a cleared picture, a triangle, a compute shader -- told in the log; see
+# src/pvr_vk_test.c. A little after the start, when the kernel's own check of the GPU (pvr=6) is over.
+/redwood/bin/rwtouch wait 10
+/redwood/bin/pvr_vk_test

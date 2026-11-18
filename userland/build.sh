@@ -8,9 +8,12 @@
 #                    on /redwood. Rebuilt every time.
 #                      RC=<file>    etc/rc: rc.launchd (default) hands process 1 to the iOS launchd
 #                                   after init's checks; rc.ios runs a few iOS programs and halts
+#                      BT=1         Bluetooth runs: bin/bt_test, and its line (in the background) in etc/rc.jobs; with
+#                                   RC=rc.launchd.aks (bin/aks_restore, bin/tolog) and the jobs of docs/bluetooth-x6826b.md
 #                      JOBS="..."   labels of the stock iOS launchd jobs to load (default: IOS_JOBS)
 #                      REST=1       ... and the rest of them, started only when asked for (see mkjobs.py)
 #                      WIFID=1      ... and wifid, iOS's Wi-Fi daemon (see below at IOS_JOBS)
+#                      WIDGETS=1    ... and chronod, the widgets' daemon (left out for the CPU, see IOS_JOBS)
 #                      OSLOG="..."  labels of the jobs whose os_log output goes to the console ("all": every
 #                                   one of JOBS; default: only the window server, which says little)
 #                      INJECT="..." the programs started with a library of ours, "LIBRARY NAME..." per line
@@ -31,6 +34,17 @@
 #                                   and nothing changes (src/inject.c, opengl_es()).
 #                                   GL=test: only the library and bin/gl_test (a triangle, src/gl_test.c;
 #                                   RC_JOBS=rc.jobs.gltest runs it); the window server stays as it is.
+#                      PVR=1        with Mesa's Vulkan driver for the PowerVR (the rabbit r1; tools/mk-mesa-pvr.sh
+#                                   fetches and builds it) as lib/libvulkan_powervr_mesa.dylib (11 MB, 1.7 MB as
+#                                   the image keeps it) and bin/pvr_vk_test (src/pvr_vk_test.c: a cleared picture,
+#                                   a triangle and a compute shader by the GPU, told in the log;
+#                                   RC_JOBS=rc.jobs.pvrtest runs it). Wants the kernel's boot-arg pvr=6.
+#                                   PVR=gl: and OpenGL ES by it -- Mesa's Zink over the Vulkan driver, with EGL:
+#                                   lib/libgallium-26.3.0.dylib (14.5 MB, 3.2 as the image keeps it), libEGL.1 and
+#                                   libGLESv2.2 --, lib/libredwood-gl.dylib made with src/gl_egl.c in the place of
+#                                   src/gl_osmesa.c, and bin/pvr_gl_test (src/pvr_gl_test.c; RC_JOBS=rc.jobs.pvrgl
+#                                   runs it). The window server draws with it only with the boot-arg pvr_gl=1
+#                                   (src/inject.c, opengl_es()). Not beside GL=1, whose libredwood-gl it replaces.
 #                      METAL=1      with the Metal driver (src/redwoodmetal.m over src/metal) as the bundle
 #                                   lib/RedwoodMetal.bundle, bin/metal_props and bin/metal_drv_test. Wants GL=1 (on
 #                                   the Mali the driver compiles through libOSMesa, lib/libredwoodair.dylib) and
@@ -95,10 +109,16 @@ IOS_JOBS=${JOBS-"
 	com.apple.syslogd com.apple.distnoted.xpc.daemon com.apple.diagnosticd com.apple.fseventsd
 	com.apple.containermanagerd com.apple.containermanagerd.system com.apple.runningboardd
 	com.apple.backboardd com.apple.mobile.usermanagerd com.apple.mobilegestalt.xpc com.apple.lsd
-	com.apple.powerd com.apple.analyticsd com.apple.logd_helper
+	com.apple.powerd com.apple.logd_helper
 	com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
-	com.apple.SpringBoard com.apple.chronod com.apple.sleepd com.apple.mediaremoted
+	com.apple.SpringBoard com.apple.sleepd com.apple.mediaremoted
 "}
+# (not com.apple.analyticsd: it dies 0.2 s after every start and launchd starts it again every 10 s, for ever
+# -- persist3.log; with no server CoreAnalytics' events are dropped. MORE_JOBS=com.apple.analyticsd for it.)
+# WIDGETS=1: chronod as well, and with it the widgets: it starts every widget extension at once (two dozen,
+# each drawing its timelines with the processor, src/redwoodmetal.m) -- all four cores busy for minutes after
+# boot, run g1. Without it the Today view's and gallery's widgets stay empty; the home screen is untouched.
+[ -n "$WIDGETS" ] && IOS_JOBS="$IOS_JOBS com.apple.chronod"
 # (com.apple.mediaremoted: without it SpringBoard's MediaRemote spins in its XPC handler -- two of the four
 # cores on an idle home screen once mediaserverd runs, and the widgets with it; run 328-329, 400% -> 14%)
 # WIFID=1: iOS's own Wi-Fi daemon as well, for Settings to have a Wi-Fi to show: the kernel answers it in
@@ -207,6 +227,12 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework CoreGraphics \
 			-framework CoreImage -framework IOKit -framework Metal -framework OpenGLES \
 			-lMobileGestalt -o obj/metal_test src/metal_test.m
+		# (BT runs: the system bag made once, as a restore would, src/aks_restore.c; and tolog, for rc.launchd.aks)
+		$DYN -framework CoreFoundation -framework IOKit -o obj/aks_restore src/aks_restore.c &&
+			{ ${LDID:-ldid} -Ssrc/aks_restore.entitlements obj/aks_restore 2>/dev/null ||
+			  echo "build.sh: no ldid: aks_restore is unsigned, and the kernel will not let it make the bag"; }
+		$DYN -o obj/tolog src/tolog.c
+		$DYN -o obj/logto src/logto.c
 		if [ -n "$METAL" ]; then
 			# the bundle Metal's discovery opens (step 3: <MetalPluginName>.bundle under
 			# /System/Library/Extensions, -[NSBundle classNamed:] then wants the class out of it),
@@ -223,7 +249,6 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 				-lc++ -I../tools/mesa/air -Isrc -o obj/RedwoodMetal src/redwoodmetal.m \
 				obj/metal/air.o obj/metal/buffer.o obj/metal/log.o obj/metal/texture.o obj/metal/blit.o obj/metal/draw.o obj/metal/command.o obj/metal/recipes.o obj/metal/import.o obj/metal/perf.o obj/metal/plib.o obj/metal/shape.o obj/metal/argenc.o obj/metal/run.o obj/metal/worker.o obj/metal/surfaces.o obj/metal/render.o obj/metal/compute.o obj/metal/cmdbuf.o obj/metal/pipeline.o obj/metal/drawable.o
 			$DYN -framework CoreFoundation -framework IOKit -o obj/metal_props src/metal_props.c
-			$DYN -o obj/tolog src/tolog.c
 			$DYN -o obj/psgrep src/psgrep.c
 			$DYN -framework Foundation -framework IOKit -framework Metal -lobjc \
 				-o obj/metal_drv_test src/metal_drv_test.m
@@ -293,6 +318,29 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			# it, and it is copied in when it is there.
 			[ -f $M/air_run ] && cp $M/air_run obj/air_run
 		fi
+		if [ -n "$PVR" ]; then
+			# the PowerVR's Vulkan driver and the program that tries it (Mesa says beside the library what
+			# it was built from, as above; the program takes Vulkan's headers from Mesa's sources)
+			P=../xnu-deps/build/pvr-mesa
+			[ "$(cat $P/out/built-from 2>/dev/null)" = "$(cat ../tools/mk-mesa-pvr.sh ../tools/mesa/pvr/*.patch ../tools/mesa/redwood-drm/* | sha256)" ] ||
+				../tools/mk-mesa-pvr.sh
+			H=$(cat ../tools/mk-mesa-pvr.sh ../tools/mesa/pvr/*.patch ../tools/mesa/redwood-drm/* | sha256)
+			$DYN -I$P/src/mesa-26.3.0/include -o obj/pvr_vk_test src/pvr_vk_test.c
+			if [ "$PVR" = gl ]; then
+				[ -z "$GL" ] || { echo "build.sh: PVR=gl and GL=$GL both make lib/libredwood-gl.dylib: one of them" >&2; exit 1; }
+				# OpenGL ES over it: Zink with EGL, and the table of functions that hands CoreAnimation's calls
+				# to them (as above for libOSMesa, with src/gl_egl.c for the contexts)
+				[ "$(cat $P/out/built-from-zink 2>/dev/null)" = "$H" ] || ZINK=1 ../tools/mk-mesa-pvr.sh
+				./mkeagl.py src/eagl_slots.txt $P/out/gl.xml $P/out/exported-gl.txt src/eagl.c > obj/eagl_gen.h
+				$DYN -dynamiclib -install_name /redwood/lib/libredwood-gl.dylib -Iobj -framework CoreFoundation \
+					-framework IOKit -framework IOSurface -lobjc $P/out/libEGL.1.dylib $P/out/libGLESv2.2.dylib \
+					-o obj/libredwood-gl.dylib src/eagl.c src/gl_egl.c
+				$DYN -framework CoreFoundation -framework IOSurface $P/out/libEGL.1.dylib $P/out/libGLESv2.2.dylib \
+					-o obj/pvr_gl_test src/pvr_gl_test.c src/gl_egl.c
+				cp $P/out/libEGL.1.dylib $P/out/libGLESv2.2.dylib $P/out/libgallium-26.3.0.dylib obj/
+			fi
+			cp $P/out/libvulkan_powervr_mesa.dylib obj/
+		fi
 	fi
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/cputop obj/nullxpc obj/mg_test root/bin/
 	[ -n "$BT" ] && [ -f obj/bt_test ] && cp obj/bt_test root/bin/     # (src/bt_test.m: CoreBluetooth's scan, for Bluetooth runs)
@@ -306,10 +354,12 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/font_test ] && cp obj/font_test root/bin/
 	[ -f obj/metal_test ] && cp obj/metal_test root/bin/
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
+	[ -f obj/logto ] && cp obj/logto root/bin/
 	[ -f obj/fbgrab ] && cp obj/fbgrab root/bin/
 	[ -f obj/battery_test ] && cp obj/battery_test root/bin/
 	[ -f obj/keychain_test ] && cp obj/keychain_test root/bin/
 	[ -f obj/wifipw_test ] && cp obj/wifipw_test root/bin/
+	case "$BT$RC" in *aks*|1*) cp obj/aks_restore obj/tolog root/bin/;; esac   # (rc.launchd.aks and BT=1 runs; the image is small)
 	[ -f obj/sound_test ] && cp obj/sound_test root/bin/
 	[ -f obj/torch_test ] && cp obj/torch_test root/bin/
 	[ -f obj/camera_test ] && cp obj/camera_test root/bin/
@@ -364,6 +414,22 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		cp obj/gl_test root/bin/
 		[ -f obj/air_run ] && cp obj/air_run root/bin/
 		[ "$GL" = test ] || cp obj/libredwood-gl.dylib root/lib/
+	fi
+	if [ -n "$PVR" ]; then
+		# PVR_SYS=1 (the r1: its boot partition has no room for 26 MB of Mesa beside Android's kernel): the two
+		# big libraries live in the system image as /fw/pvr/ and the small image has links to them
+		rm -f root/lib/libvulkan_powervr_mesa.dylib root/lib/libgallium-26.3.0.dylib
+		# (PVR_VK_RD=1: the Vulkan driver in the small image after all -- 1.7 MB as zlib -- so a changed driver
+		# runs without writing the system image; libgallium stays /fw/pvr's)
+		if [ -n "$PVR_SYS" ] && [ -z "$PVR_VK_RD" ]; then ln -s /fw/pvr/libvulkan_powervr_mesa.dylib root/lib/libvulkan_powervr_mesa.dylib
+		else cp obj/libvulkan_powervr_mesa.dylib root/lib/; fi
+		cp obj/pvr_vk_test root/bin/
+		if [ "$PVR" = gl ]; then
+			cp obj/libEGL.1.dylib obj/libGLESv2.2.dylib obj/libredwood-gl.dylib root/lib/
+			if [ -n "$PVR_SYS" ]; then ln -s /fw/pvr/libgallium-26.3.0.dylib root/lib/libgallium-26.3.0.dylib
+			else cp obj/libgallium-26.3.0.dylib root/lib/; fi
+			cp obj/pvr_gl_test root/bin/
+		fi
 	fi
 	# a program is not started with a library that is not there: it would not start at all
 	echo "$INJECT" | while read -r library names; do
@@ -425,6 +491,11 @@ with open(path, 'w') as f:
 	fi
 	cp ${RC:-rc.launchd} root/etc/rc
 	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
+	# BT=1: the Bluetooth scan (src/bt_test.m) in the background, its output in the kernel's log
+	# logto=IP:PORT in the boot-args: the kernel log over UDP (src/logto.c checks the argument itself, ends at once without it)
+	# (first: the lines before it may run for minutes)
+	{ echo '/redwood/bin/logto &'; cat root/etc/rc.jobs; } > root/etc/rc.jobs.new && mv root/etc/rc.jobs.new root/etc/rc.jobs
+	[ -n "$BT" ] && echo '/redwood/bin/tolog /redwood/bin/bt_test 120 &' >> root/etc/rc.jobs
 	# QUIET=1: launchd's own standard error goes nowhere (src/init.c). It says a few thousand
 	# lines about its own business in the first minutes and pushes everything else out of the
 	# kernel's log; the daemons keep their own standard error on the console all the same.
@@ -629,6 +700,10 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# the Infinix's CONNSYS firmware (Wi-Fi, Bluetooth), the phone's own /vendor/firmware taken off it through root
 	# into ../xnu-deps/build/connsys-fw (never in the repository): /fw/connsys, where bsd/dev/redwood_connsys.c reads
 	# it once the root is mounted (connsys_step=5)
+	if [ -d ../xnu-deps/build/pvr-mesa/out ]; then        # (PVR_SYS=1 above: the small image's links point here)
+		mkdir -p sysroot/fw/pvr
+		cp ../xnu-deps/build/pvr-mesa/out/libvulkan_powervr_mesa.dylib ../xnu-deps/build/pvr-mesa/out/libgallium-26.3.0.dylib sysroot/fw/pvr/
+	fi
 	if [ -d ../xnu-deps/build/connsys-fw/firmware ]; then
 		mkdir -p sysroot/fw/connsys
 		cp ../xnu-deps/build/connsys-fw/firmware/* sysroot/fw/connsys/

@@ -55,6 +55,7 @@
 
 /* where what is said goes: the standard error, which is the console's for SpringBoard (an application's is nowhere) */
 static int say_fd = 2;
+static void display_links_say(void);
 static int say_kept;            /* the wallpaper's layers (com.redwood.wallpaper_layers): said as lines the kernel keeps */
 
 static void
@@ -69,6 +70,9 @@ say(const char *format, ...)
 	va_end(ap);
 	line[0] = '!';
 	if (say_kept) {
+		if (say_kept == 2 && !strstr(line, " window ") && !strstr(line, "ANIMATIONS") && !strstr(line, "displaylink")) {
+			return;         /* com.redwood.layers: the windows' commit counts and animated layers only */
+		}
 		size_t keep = strnlen(line, 199);
 
 		while (keep > 1 && line[keep - 1] == '\n') {
@@ -123,7 +127,7 @@ watch_main_loop(void)
 	size_t size = sizeof(args) - 1;
 	const char *arg;
 
-	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (arg = strstr(args, "touch_lat=1")) == NULL ||
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (arg = strstr(args, "tl_a=1")) == NULL ||
 	    (arg != args && arg[-1] != ' ')) {
 		return;
 	}
@@ -445,6 +449,32 @@ plain_vibrancy(void)
 	}
 	CFPreferencesSetAppValue(CFSTR("BSUIVibrancyEffectViewDisabled"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
 	say("redwood: SpringBoard: no GPU draws, vibrant views are plain (the lock screen's clock is white)\n");
+}
+
+/*
+ * Boot-arg reduce_transparency=1 (or =0): Settings' Reduce Transparency on (off), written at SpringBoard's start to
+ * com.apple.Accessibility's EnhancedBackgroundContrastEnabled, which UIAccessibilityIsReduceTransparencyEnabled
+ * (_AXSEnhanceBackgroundContrastEnabled) reads: UIKit's materials (dock, folders, Control Center, app chrome) are
+ * drawn solid instead of blurred. For runs that compare from boot. Unsaid: left as it is -- the setting persists,
+ * so =0 is what turns a =1 run's setting off again.
+ */
+static void keep_line(const char *format, ...) __printflike(1, 2);
+
+static void
+reduce_transparency(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	const char *arg;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (arg = strstr(args, "reduce_transparency=")) == NULL) {
+		return;
+	}
+	CFPreferencesSetValue(CFSTR("EnhancedBackgroundContrastEnabled"), arg[20] == '1' ? kCFBooleanTrue : kCFBooleanFalse,
+	    CFSTR("com.apple.Accessibility"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+	CFPreferencesSynchronize(CFSTR("com.apple.Accessibility"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+	notify_post("com.apple.accessibility.cache.enhance.background.contrast");       /* (libAccessibility's cache, if it has read it already) */
+	keep_line("redwood: Reduce Transparency %s (boot-arg reduce_transparency)", arg[20] == '1' ? "on" : "off");
 }
 
 /* ---- the side button's long press ---------------------------------------------------------------- */
@@ -861,6 +891,7 @@ layers(void)
 	for (long i = 0; windows != NULL && i < SEND(long, windows, "count"); i++) {
 		web_views(SEND1(id, windows, "objectAtIndex:", long, i), 0);
 	}
+	display_links_say();
 	say("redwood: layers%s: end\n", layers_of);
 }
 
@@ -912,6 +943,106 @@ status_bar_provider(void)
 		}
 	}
 	keep_line("redwood: status bar: no class answers visualProviderSubclassForScreen:visualProviderInfo:");
+}
+
+/*
+ * The home screen's grid on a short screen (fbaspect=1: 375 x 500 points). SpringBoardHome picks a
+ * "screen type" by the screen's size (_SBHScreenTypeLookup) -- there is none of 500 points -- and
+ * -[SBHDefaultIconListLayoutProvider makeLayoutForIconLocation:] fills the root's
+ * SBIconListGridLayoutConfiguration from that type's metrics (getRootMetrics: 4 columns, 6 rows, the
+ * iPhone X's portrait insets 71,27,206,27 on a list as tall as the screen). SBIconListView fits those
+ * 6 rows into 500 points and the rows overlap. Here the root's layout gets 3 rows and insets for
+ * 500 points: 44 of status bar + 16 above the first row; below the last row the iPhone X's 206 less
+ * 10 (dock, home indicator, search pill and the last row's labels). 3 x 60 of icons in 244 points
+ * leaves 32 between rows, as on an iPhone (4 rows would leave 1: the labels would still be covered).
+ * The icon model reads its rows from the same layout (-[SBHIconManager
+ * iconModel:maxRowCountForListInRootFolderWithInterfaceOrientation:]), so icons that no longer fit
+ * go to the next pages. Only where the screen is under 600 points tall; boot-arg sb_grid=ROWS,TOP,BOTTOM
+ * to tune it on the phone, sb_grid=0 to leave iOS's grid.
+ */
+typedef struct { double top, left, bottom, right; } edge_insets;
+typedef struct { double width, height; } size_2d;
+
+static id (*original_make_layout)(id self, SEL selector, id location);
+
+/* what the icon lists on screen ended up as: rows x columns, insets, and where their first icons are (once, 40 s after the layout) */
+static void
+say_icon_lists_in(id view)
+{
+	id subviews = SEND(id, view, "subviews");
+
+	if (class_respondsToSelector(object_getClass(view), sel_registerName("iconRowsForCurrentOrientation"))) {
+		struct { double x, y, w, h; } frame = SEND(typeof(frame), view, "frame"), icon[6] = { 0 };
+		edge_insets insets = class_respondsToSelector(object_getClass(view), sel_registerName("layoutInsetsForOrientation:")) ?
+		    SEND1(edge_insets, view, "layoutInsetsForOrientation:", long, 1) : (edge_insets){ -1, -1, -1, -1 };
+		long n = SEND(long, subviews, "count");
+
+		for (long i = 0; i < n && i < 6; i++) {
+			icon[i] = SEND(typeof(frame), SEND1(id, subviews, "objectAtIndex:", long, i), "frame");
+		}
+		keep_line("redwood: icon list %s %gx%g: %ldx%ld, insets %g,%g,%g,%g; %ld icons at y %g,%g,%g,%g,%g,%g (%gx%g)",
+		    object_getClassName(view), frame.w, frame.h, SEND(long, view, "iconRowsForCurrentOrientation"),
+		    SEND(long, view, "iconColumnsForCurrentOrientation"), insets.top, insets.left, insets.bottom, insets.right, n,
+		    icon[0].y, icon[1].y, icon[2].y, icon[3].y, icon[4].y, icon[5].y, icon[0].w, icon[0].h);
+		return;
+	}
+	for (long i = 0; i < SEND(long, subviews, "count"); i++) {
+		say_icon_lists_in(SEND1(id, subviews, "objectAtIndex:", long, i));
+	}
+}
+
+static void
+say_icon_lists(void)
+{
+	id windows = ((id (*)(Class, SEL, BOOL, BOOL))objc_msgSend)(objc_getClass("UIWindow"),
+	    sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:"), 1, 1);
+
+	for (long i = 0; windows != NULL && i < SEND(long, windows, "count"); i++) {
+		say_icon_lists_in(SEND1(id, windows, "objectAtIndex:", long, i));
+	}
+}
+
+static id
+make_layout(id self, SEL selector, id location)
+{
+	id layout = original_make_layout(self, selector, location);
+	id screen = SEND(id, objc_getClass("UIScreen"), "mainScreen");
+	struct { double x, y, w, h; } bounds = screen ? SEND(typeof(bounds), screen, "bounds") : (typeof(bounds)){ 0 };
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	const char *arg;
+	long rows = 3;
+	double top = 60, bottom = 196;
+	id config;
+	edge_insets was, insets;
+	long was_rows;
+	if (layout == NULL || location == NULL || (!SEND1(BOOL, location, "isEqualToString:", id, (id)CFSTR("SBIconLocationRoot")) &&
+	    !SEND1(BOOL, location, "isEqualToString:", id, (id)CFSTR("SBIconLocationRootWithWidgets"))) ||
+	    bounds.h <= 0 || bounds.h >= 600 || !class_respondsToSelector(object_getClass(layout), sel_registerName("layoutConfiguration"))) {
+		return layout;
+	}
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (arg = strstr(args, "sb_grid=")) != NULL &&
+	    (arg == args || arg[-1] == ' ')) {
+		sscanf(arg + 8, "%ld,%lf,%lf", &rows, &top, &bottom);
+		if (rows <= 0) {
+			return layout;
+		}
+	}
+	config = SEND(id, layout, "layoutConfiguration");
+	was = SEND(edge_insets, config, "portraitLayoutInsets");
+	was_rows = SEND(long, config, "numberOfPortraitRows");
+	insets = (edge_insets){ top, 27, bottom, 27 };
+	SEND1(void, config, "setNumberOfPortraitRows:", unsigned long, (unsigned long)rows);
+	SEND1(void, config, "setPortraitLayoutInsets:", edge_insets, insets);
+	SEND1(void, config, "setListSizeForIconSpacingCalculation:", size_2d, ((size_2d){ bounds.w, bounds.h }));
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		say_icon_lists();
+	});
+	keep_line("redwood: home grid: %s %ldx%ld, insets %g,%g,%g,%g for %gx%g pt (iOS had %ldx%ld, %g,%g,%g,%g)",
+	    SEND(const char *, location, "UTF8String"), rows,
+	    SEND(long, config, "numberOfPortraitColumns"), insets.top, insets.left, insets.bottom, insets.right, bounds.w, bounds.h,
+	    was_rows, SEND(long, config, "numberOfPortraitColumns"), was.top, was.left, was.bottom, was.right);
+	return layout;
 }
 
 /*
@@ -1606,6 +1737,327 @@ show_camera_icon(unsigned seconds)
 	});
 }
 
+/*
+ * Boot-arg dl_dump=1 (what wakes SpringBoard 30 times a second in Camera after the home screen was swiped?): every CADisplayLink made through
+ * +displayLinkWithTarget:selector: is remembered (weakly) and com.redwood.layers says the live ones -- target, selector, paused, frame rate.
+ */
+static id display_links;
+static id (*original_display_link)(id self, SEL selector, id target, SEL action);
+static void dl_say(const char *what, id link, id target);
+static unsigned dl_lines;               /* kept lines about links: bounded */
+
+static id
+display_link_made(id self, SEL selector, id target, SEL action)
+{
+	id link = original_display_link(self, selector, target, action);
+
+	if (display_links != NULL && link != NULL) {
+		SEND1(void, display_links, "addObject:", id, link);
+		dl_say("created", link, target);
+		if (dl_lines < 60) {
+			keep_line("dl: created %p action %s", (void *)link, sel_getName(action));
+		}
+	}
+	return link;
+}
+
+static void
+display_links_say(void)
+{
+	id all = display_links ? SEND(id, display_links, "allObjects") : NULL;
+
+	for (long i = 0; all != NULL && i < SEND(long, all, "count"); i++) {
+		id link = SEND1(id, all, "objectAtIndex:", long, i);
+		say("redwood: layers: displaylink %p paused %d\n", (void *)link, (int)SEND(BOOL, link, "isPaused"));
+	}
+}
+
+static void wk_arm(void);
+static void (*original_dl_add)(id self, SEL selector, id runloop, id mode);
+static void (*original_dl_pause)(id self, SEL selector, BOOL paused);
+static void (*original_dl_invalidate)(id self, SEL selector);
+
+static void
+dl_say(const char *what, id link, id target)
+{
+	if (dl_lines++ < 60) {
+		keep_line("dl: %s %p target %s", what, (void *)link, target ? object_getClassName(target) : "-");
+	}
+}
+
+static void
+dl_add(id self, SEL selector, id runloop, id mode)
+{
+	dl_say("addToRunLoop", self, NULL);
+	original_dl_add(self, selector, runloop, mode);
+}
+
+static void
+dl_pause(id self, SEL selector, BOOL paused)
+{
+	dl_say(paused ? "paused" : "RESUMED", self, NULL);
+	original_dl_pause(self, selector, paused);
+}
+
+static void
+dl_invalidate(id self, SEL selector)
+{
+	dl_say("invalidate", self, NULL);
+	original_dl_invalidate(self, selector);
+}
+
+/*
+ * Boot-arg wk_trace=1: what keeps SpringBoard awake. The main run loop's wakes are counted and said every 5 s ("wk: 5 s N wakes M <40 ms"); the first
+ * few wakes under 40 ms after the one before, a thread of ours stops the main thread a little after the wake and says its stack (symbols), with the
+ * run loop's activities seen so far this turn (T timers, S sources, B before waiting). Armed by com.redwood.wktrace (rc.jobs, once Camera is up).
+ */
+static volatile int wk_armed;
+static volatile uint32_t wk_wakes, wk_short;
+static uint64_t wk_last;
+static char wk_acts[24];
+static unsigned wk_acts_n;
+static dispatch_semaphore_t wk_sem;
+static volatile unsigned wk_taken, wk_pending;
+static volatile uint64_t wk_gap_us;
+
+static void
+wk_observer(__unused CFRunLoopObserverRef observer, CFRunLoopActivity activity, __unused void *info)
+{
+	if (activity == kCFRunLoopAfterWaiting) {
+		uint64_t now = mach_absolute_time() * timebase.numer / timebase.denom / 1000;
+
+		wk_acts_n = 0;
+		if (!wk_armed) {
+			return;
+		}
+		wk_wakes++;
+		if (now - wk_last < 40000) {
+			wk_short++;
+			if (wk_taken + wk_pending < 8 && !wk_pending) {
+				wk_pending = 1;
+				wk_gap_us = now - wk_last;
+				dispatch_semaphore_signal(wk_sem);
+			}
+		}
+		wk_last = now;
+	} else if (wk_acts_n < sizeof(wk_acts) - 1) {
+		wk_acts[wk_acts_n++] = activity == kCFRunLoopBeforeTimers ? 'T' : activity == kCFRunLoopBeforeSources ? 'S' : 'B';
+		wk_acts[wk_acts_n] = 0;
+	}
+}
+
+static void *
+wk_thread(__unused void *argument)
+{
+	static const useconds_t delays[] = { 300, 900, 1800, 3500, 600, 1300, 2500, 200 };
+	uint32_t last_wakes = 0, last_short = 0;
+	unsigned lines = 0;
+
+	pthread_setname_np("redwood wake trace");
+	for (;;) {
+		if (dispatch_semaphore_wait(wk_sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) != 0) {
+			if (wk_armed && lines++ < 30) {
+				keep_line("wk: 5 s %u wakes %u <40 ms", wk_wakes - last_wakes, wk_short - last_short);
+			}
+			last_wakes = wk_wakes;
+			last_short = wk_short;
+			continue;
+		}
+		useconds_t delay = delays[wk_taken % 8];
+		uintptr_t pcs[18];
+		unsigned n = 0;
+		char acts[24];
+		arm_thread_state64_t state;
+		mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+
+		usleep(delay);
+		if (thread_suspend(sb_main_thread) != KERN_SUCCESS) {
+			wk_pending = 0;
+			continue;
+		}
+		memcpy(acts, wk_acts, sizeof(acts));
+		if (thread_get_state(sb_main_thread, ARM_THREAD_STATE64, (thread_state_t)&state, &count) == KERN_SUCCESS) {
+			uintptr_t fp = (uintptr_t)arm_thread_state64_get_fp(state);
+
+			pcs[n++] = (uintptr_t)arm_thread_state64_get_pc(state);
+			pcs[n++] = (uintptr_t)arm_thread_state64_get_lr(state) & 0x0000000fffffffffULL;
+			for (; n < 18 && fp != 0 && (fp & 7) == 0; ) {
+				uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
+
+				pcs[n++] = ret & 0x0000000fffffffffULL;
+				if (next <= fp) {
+					break;
+				}
+				fp = next;
+			}
+		}
+		thread_resume(sb_main_thread);
+		acts[sizeof(acts) - 1] = 0;
+		keep_line("wk: #%u gap %lluus +%uus acts %s: %u frames", wk_taken, (unsigned long long)wk_gap_us, delay, acts, n);
+		for (unsigned i = 0; i < n; i += 3) {
+			char text[3][64] = { "", "", "" };
+
+			for (unsigned k = 0; k < 3 && i + k < n; k++) {
+				Dl_info info;
+
+				if (dladdr((void *)pcs[i + k], &info) && info.dli_sname != NULL) {
+					snprintf(text[k], sizeof(text[k]), "%.50s", info.dli_sname);
+				} else {
+					snprintf(text[k], sizeof(text[k]), "%#lx", (unsigned long)pcs[i + k] - (unsigned long)slide);
+				}
+			}
+			keep_line("wk#%u %u %s < %s < %s", wk_taken, i, text[0], text[1], text[2]);
+		}
+		wk_taken++;
+		wk_pending = 0;
+	}
+	return NULL;
+}
+
+static void
+wk_arm(void)
+{
+	wk_taken = 0;
+	wk_pending = 0;
+	wk_wakes = wk_short = 0;
+	wk_armed = 1;
+	keep_line("wk: armed");
+}
+
+static void
+display_link_hook(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	Class link_class = objc_getClass("CADisplayLink");
+	Method method = class_getClassMethod(link_class, sel_registerName("displayLinkWithTarget:selector:"));
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (strstr(args, "dl_dump=1") == NULL && strstr(args, "wk_trace=1") == NULL) ||
+	    method == NULL) {
+		return;
+	}
+	display_links = SEND(id, (id)objc_getClass("NSHashTable"), "weakObjectsHashTable");
+	original_display_link = (id (*)(id, SEL, id, SEL))method_setImplementation(method, (IMP)display_link_made);
+	original_dl_add = (void (*)(id, SEL, id, id))method_setImplementation(class_getInstanceMethod(link_class,
+	    sel_registerName("addToRunLoop:forMode:")), (IMP)dl_add);
+	original_dl_pause = (void (*)(id, SEL, BOOL))method_setImplementation(class_getInstanceMethod(link_class,
+	    sel_registerName("setPaused:")), (IMP)dl_pause);
+	original_dl_invalidate = (void (*)(id, SEL))method_setImplementation(class_getInstanceMethod(link_class,
+	    sel_registerName("invalidate")), (IMP)dl_invalidate);
+	keep_line("dl: display link hooks installed (made/addToRunLoop/setPaused/invalidate)");
+	if (strstr(args, "wk_trace=1") != NULL) {
+		static int token;
+		pthread_t thread;
+		CFRunLoopObserverRef observer;
+
+		mach_timebase_info(&timebase);
+		sb_main_thread = mach_thread_self();
+		wk_sem = dispatch_semaphore_create(0);
+		observer = CFRunLoopObserverCreate(NULL, kCFRunLoopAfterWaiting | kCFRunLoopBeforeTimers | kCFRunLoopBeforeSources |
+		    kCFRunLoopBeforeWaiting, true, LONG_MIN, wk_observer, NULL);
+		CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
+		pthread_create(&thread, NULL, wk_thread, NULL);
+		pthread_detach(thread);
+		notify_register_dispatch("com.redwood.wktrace", &token, dispatch_get_main_queue(), ^(__unused int t) {
+			wk_arm();
+		});
+		keep_line("wk: wake trace ready");
+	}
+}
+
+
+/*
+ * Boot-arg nomm=1 / hidehome=1 (tests of the 59 Hz swaps in Camera after the home screen was swiped): 4 s and 20 s after Camera is opened, every
+ * animation whose key says MatchMove is removed from all windows' layers (nomm), or the home screen's and wallpaper's windows are hidden (hidehome).
+ */
+static int mm_removed;
+
+static void
+mm_layer(id layer)
+{
+	id keys = SEND(id, layer, "animationKeys"), sublayers = SEND(id, layer, "sublayers");
+
+	for (long i = 0; keys != NULL && i < SEND(long, keys, "count"); i++) {
+		id key = SEND1(id, keys, "objectAtIndex:", long, i);
+		const char *name = text_of(key);
+
+		if (name != NULL && strstr(name, "MatchMove") != NULL) {
+			SEND1(void, layer, "removeAnimationForKey:", id, key);
+			mm_removed++;
+		}
+	}
+	for (long i = 0; sublayers != NULL && i < SEND(long, sublayers, "count"); i++) {
+		mm_layer(SEND1(id, sublayers, "objectAtIndex:", long, i));
+	}
+}
+
+static void
+mm_test(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	Class window = objc_getClass("UIWindow");
+	SEL all = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
+	id windows;
+	bool nomm, hide;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) {
+		return;
+	}
+	nomm = strstr(args, "nomm=1") != NULL;
+	hide = strstr(args, "hidehome=1") != NULL;
+	bool hide_all = strstr(args, "hidehome=2") != NULL;
+	if ((!nomm && !hide && !hide_all) || window == NULL) {
+		return;
+	}
+	windows = ((id (*)(Class, SEL, BOOL, BOOL))objc_msgSend)(window, all, 1, 1);
+	for (long i = 0; windows != NULL && i < SEND(long, windows, "count"); i++) {
+		id w = SEND1(id, windows, "objectAtIndex:", long, i);
+		const char *cls = object_getClassName(w);
+
+		if (nomm) {
+			mm_layer(SEND(id, w, "layer"));
+		}
+		if ((hide_all && strcmp(cls, "SBRootSceneWindow") != 0 && strstr(cls, "StatusBar") == NULL) || hide && (strstr(cls, "Wallpaper") != NULL || strstr(cls, "SBHomeScreenWindow") != NULL || strcmp(cls, "SBWindow") == 0)) {
+			((void (*)(id, SEL, BOOL))objc_msgSend)(w, sel_registerName("setHidden:"), YES);
+			keep_line("mm: hid window %s", cls);
+		}
+	}
+	keep_line("mm: %d MatchMove animations removed so far", mm_removed);
+}
+
+/*
+ * Boot-arg nopill=1 (a test of frames per picture): MTLumaDodgePillView (the home indicator) is hidden whenever it is laid out, so its luma-sampling
+ * backdrop is not rendered. Found by name, no address check.
+ */
+static void (*original_pill_layout)(id self, SEL selector);
+
+static void
+pill_layout(id self, SEL selector)
+{
+	original_pill_layout(self, selector);
+	((void (*)(id, SEL, BOOL))objc_msgSend)(self, sel_registerName("setHidden:"), YES);
+}
+
+static void
+no_pill(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	Class cls = objc_getClass("MTLumaDodgePillView");
+	Method method = cls ? class_getInstanceMethod(cls, sel_registerName("layoutSubviews")) : NULL;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || strstr(args, "nopill=1") == NULL) {
+		return;
+	}
+	if (method == NULL) {
+		keep_line("nopill: no -[MTLumaDodgePillView layoutSubviews]");
+		return;
+	}
+	original_pill_layout = (void (*)(id, SEL))method_setImplementation(method, (IMP)pill_layout);
+	keep_line("nopill: MTLumaDodgePillView hidden");
+}
+
 __attribute__((constructor))
 static void
 redwood_springboard_init(void)
@@ -1672,12 +2124,17 @@ redwood_springboard_init(void)
 	snapshot_format = replace_method_of_kind('+', "XBApplicationSnapshotManifestImpl", "_outputFormatForSnapshot:",
 	    0x1f1c91480UL, (IMP)snapshot_output_format);
 	plain_vibrancy();
+	reduce_transparency();
+	no_pill();
+	display_link_hook();
 	original_lock_long_press = (void (*)(id, SEL, id))replace_method("SBLockHardwareButton", "longPress:", 0x1c4f6ab44UL,
 	    (IMP)lock_long_press);
 	poster_switcher = replace_method("SBMainDisplayPolicyAggregator", "_allowsCapabilityPosterSwitcherWithExplanation:",
 	    0x1c507e0fcUL, (IMP)poster_switcher_allowed);
 	original_switcher_wallpaper_overlay = (void (*)(id, SEL))replace_method("SBAppSwitcherPageView",
 	    "_createOrDestroyWallpaperOverlayView", 0x1c4af7860UL, (IMP)switcher_wallpaper_overlay);
+	original_make_layout = (id (*)(id, SEL, id))replace_method("SBHDefaultIconListLayoutProvider", "makeLayoutForIconLocation:",
+	    0x1c4539588UL, (IMP)make_layout);
 	/*
 	 * Battery hooks on UIDevice: these are the methods every app and SpringBoard itself calls, so
 	 * hooking them here in the SpringBoard process covers both the status bar and any app that
@@ -1772,7 +2229,9 @@ redwood_springboard_init(void)
 		unlock();
 	});
 	notify_register_dispatch("com.redwood.layers", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		say_kept = 2;
 		layers();
+		say_kept = 0;
 	});
 	/* the same of the wallpaper's windows alone, kept to the end of the log (the black behind the icons, 27 October) */
 	notify_register_dispatch("com.redwood.wallpaper_layers", &token, dispatch_get_main_queue(), ^(__unused int t) {
@@ -1780,8 +2239,50 @@ redwood_springboard_init(void)
 		layers();
 		layers_wallpaper_only = say_kept = 0;
 	});
+	/* com.redwood.bltest (rc.jobs, bltest=1): the brightness API as the slider uses it: 0.10, 0.90, 0.30, two seconds apart */
+	notify_register_dispatch("com.redwood.bltest", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		bool (*available)(void) = dlsym(RTLD_DEFAULT, "BKSDisplayBrightnessIsBrightnessLevelControlAvailable");
+		void (*set)(float, int) = dlsym(RTLD_DEFAULT, "BKSDisplayBrightnessSet");
+
+		keep_line("r1bl-test: available %d", available ? available() : -1);
+		if (set == NULL) {
+			return;
+		}
+		set(0.10f, 1);
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			set(0.90f, 1);
+		});
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			set(0.30f, 1);
+		});
+	});
 	notify_register_dispatch("com.redwood.switcher", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		switcher();
+	});
+	/* com.redwood.camera: Camera.app opened by its bundle id, wherever its icon is (rc.jobs' autotest) */
+	notify_register_dispatch("com.redwood.camera", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		id app = SEND(id, objc_getClass("UIApplication"), "sharedApplication");
+		BOOL ok = ((BOOL (*)(id, SEL, id, BOOL))objc_msgSend)(app, sel_registerName("launchApplicationWithIdentifier:suspended:"),
+		    (id)CFSTR("com.apple.camera"), NO);
+
+		keep_line("redwood: camera launched by bundle id: %d", ok);
+	});
+	/* com.redwood.settings: Settings opened by its bundle id (rc.jobs' settings=1) */
+	notify_register_dispatch("com.redwood.settings", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		id app = SEND(id, objc_getClass("UIApplication"), "sharedApplication");
+		BOOL ok = ((BOOL (*)(id, SEL, id, BOOL))objc_msgSend)(app, sel_registerName("launchApplicationWithIdentifier:suspended:"),
+		    (id)CFSTR("com.apple.Preferences"), NO);
+
+		keep_line("redwood: settings launched by bundle id: %d", ok);
+	});
+	/* (nomm=1 / hidehome=1: rc.jobs posts com.redwood.wktrace when Camera is up, so its lines are in the kept tail) */
+	notify_register_dispatch("com.redwood.wktrace", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			mm_test();
+		});
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			mm_test();
+		});
 	});
 	/*
 	 * Belt-and-suspenders unlock. The user can always swipe up to open the home screen -- that

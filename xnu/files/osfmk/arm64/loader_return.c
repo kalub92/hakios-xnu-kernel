@@ -53,11 +53,17 @@ extern void redwood_wifi_quiesce(void);
 extern void redwood_adsp_stop(void);
 extern void redwood_adsp_quiesce(void);
 extern void redwood_ddr_quiesce(void);
+extern void redwood_r1_stop(void);               /* bsd/dev/redwood_cpufreq.c: what r1_cpufreq raised, put back (an orderly end only) */
+extern void redwood_r1_dram_restore(void);       /* bsd/dev/redwood_cpufreq.c: r1_dram= taken back (an MMIO write) */
+extern void redwood_r1_gpu_restore(void);        /* bsd/dev/redwood_pvr.c: r1_gpu='s VCORE vote taken back (an MMIO write) */
 extern void redwood_haptic_quiesce(void);
+extern void redwood_md_quiesce(void);          /* bsd/dev/redwood_md.c: MD1 off again, if r1_md=2 left it on */
 extern void redwood_torch_quiesce(void);
 extern void redwood_camera_quiesce(void);
 extern void redwood_mic_quiesce(void);
 extern void redwood_ufs_quiesce(void);
+extern char redwood_host_keep[];
+extern uint32_t redwood_host_keep_len;
 extern void redwood_var_save_on_return(void);   /* bsd/dev/redwood_ufs.c: the data volume into the flash */
 void loader_checkpoint(uint64_t n);
 
@@ -288,6 +294,11 @@ loader_jump(uint64_t reason, uint64_t code)
 	}
 	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)loader_sound));
 	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)loader_sound + 16));
+	/* ... and the lines kept for the host (bsd/dev/redwood_mali.c): the last ones are said just before this */
+	for (uintptr_t p = (uintptr_t)redwood_host_keep & ~63UL; p < (uintptr_t)redwood_host_keep + redwood_host_keep_len; p += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (p));
+	}
+	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)&redwood_host_keep_len));
 	__asm__ volatile ("dsb sy");
 
 	register uint64_t r_ttbr0 __asm__("x0") = static_kvtophys(loader_l1);
@@ -380,6 +391,9 @@ loader_return(void)
 	redwood_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	redwood_adsp_quiesce();         /* nor the audio DSP */
 	redwood_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
+	redwood_r1_dram_restore();      /* the r1's DRAM level and GPU VCORE requests, if r1_dram=/r1_gpu= made them, taken back */
+	redwood_r1_gpu_restore();
+	redwood_md_quiesce();           /* the modem's MD1 domain off again, if r1_md=2 powered it */
 	redwood_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
 	redwood_torch_quiesce();        /* the flashlight off, if it was lit */
 	redwood_camera_quiesce();       /* the camera powered down, if it was powered up */
@@ -446,6 +460,7 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 		redwood_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
 		redwood_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
 		redwood_adsp_stop();            /* and the audio DSP */
+		redwood_r1_stop();              /* and the r1's cores' clocks and rails, if r1_cpufreq raised them */
 	}
 	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
 	    cpu_xcall((int)cpu, loader_return_test, (void *)(uintptr_t)(as_panic ? 2 : 1)) == KERN_SUCCESS) {

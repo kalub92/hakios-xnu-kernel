@@ -1,0 +1,26 @@
+		interrupts = <GIC_SPI 125 IRQ_TYPE_LEVEL_LOW>;
+		nvmem = <&efuse>;
+		nvmem-names = "mtk_efuse";
+		nvmem-cells = <&efuse_segment>;
+		nvmem-cell-names = "efuse_segment_cell";
+	};
+
+	dramc@1022a000 {
+		compatible = "mediatek,dramc";
+		reg = <0 0x1022a000 0 0x2000>, /* DRAMC AO CHA */
+			<0 0x10232000 0 0x2000>, /* DRAMC AO CHB */
+			<0 0x1022c000 0 0x1000>, /* DRAMC NAO CHA */
+			<0 0x10234000 0 0x1000>, /* DRAMC NAO CHB */
+			<0 0x10228000 0 0x2000>, /* DDRPHY AO CHA */
+			<0 0x10230000 0 0x2000>, /* DDRPHY AO CHB */
+			<0 0x1022e000 0 0x1000>, /* DDRPHY NAO CHA */
+			<0 0x10236000 0 0x1000>; /* DDRPHY NAO CHB */
+	};
+
+	gce: gce@10238000 {
+		compatible = "mediatek,gce", "syscon";
+		reg = <0 0x10238000 0 0x4000>;
+		interrupts = <GIC_SPI 154 IRQ_TYPE_LEVEL_LOW>,
+			<GIC_SPI 155 IRQ_TYPE_LEVEL_LOW>;
+		g3d_config_base = <0x13000000 0 0xffff0000>;
+		mmsys_config_base = <0x14000000 1 0xffff0000>;

@@ -87,12 +87,14 @@ __pycache__/
 !/xnu-deps/build/lzbitmap/libzbitmap.c
 !/xnu-deps/build/lzbitmap/libzbitmap.h
 /tools/android/f2fs-resize
+/tools/android/r1camdump
 
 # build output of the bare-metal loader
 /mtkloader/camjn1.h
 /mtkloader/camrx.h
 /xnu/files/bsd/dev/redwood_mtkcam_jn1.h
 /xnu/files/bsd/dev/redwood_mtkcam_rx.h
+/xnu/files/bsd/dev/redwood_r1cam_hi846.h
 /mtkloader/*.bin
 /mtkloader/*.bin.gz
 /mtkloader/*.gz

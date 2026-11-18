@@ -1,0 +1,7 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# The photo library's free-space answer (RC_JOBS=rc.jobs.space, with r1cam=4): the data volume's df, then Camera.app opened
+# as rc.jobs.camera opens it and its shutter tapped twice (inject_media.c: "THE PHOTO IS IN THE LIBRARY" or "REFUSED").
+/redwood/bin/sound_test springboard
+/redwood/bin/tolog /var/jb/bin/df -k /private/var /private/var/mobile/Media
+/redwood/bin/rwtouch wait 30 swipe 0.5 0.985 0.5 0.3 200 wait 10 tap 0.845 0.36 wait 8 tap 0.845 0.36 wait 80 tap 0.5 0.887 wait 15 tap 0.5 0.887 wait 60
+/redwood/bin/tolog /var/jb/bin/df -k /private/var/mobile/Media

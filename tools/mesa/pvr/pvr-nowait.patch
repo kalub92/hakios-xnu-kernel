@@ -1,0 +1,112 @@
+--- a/src/imagination/vulkan/pvr_arch_queue.c
++++ b/src/imagination/vulkan/pvr_arch_queue.c
+@@ -35,6 +35,8 @@
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
+ #include <unistd.h>
+ #include <vulkan/vulkan.h>
+ 
+@@ -967,11 +969,21 @@
+          if (!(signal_stage_src & BITFIELD_BIT(i)) && i != PVR_JOB_TYPE_QUERY)
+             continue;
+ 
+-         if (!queue->last_job_signal_sync[i])
++#ifdef __APPLE__
++         /* Darwin on redwood (PVR_NOWAIT=1, pvr_driver_queue_submit()): a stage that ran nothing in this
++          * submission still has the earlier ones' work to wait for, in its next_job_wait_sync.
++          */
++         struct vk_sync *const last = queue->last_job_signal_sync[i]
++                                         ? queue->last_job_signal_sync[i]
++                                         : queue->next_job_wait_sync[i];
++#else
++         struct vk_sync *const last = queue->last_job_signal_sync[i];
++#endif
++         if (!last)
+             continue;
+ 
+          signal_waits[wait_count++] = (struct vk_sync_wait){
+-            .sync = queue->last_job_signal_sync[i],
++            .sync = last,
+             .stage_mask = ~(VkPipelineStageFlags2)0,
+             .wait_value = 0,
+          };
+@@ -1058,16 +1070,69 @@
+    struct pvr_device *device = driver_queue->device;
+    VkResult result;
+ 
+-   result = pvr_clear_last_submits_syncs(driver_queue);
+-   if (result != VK_SUCCESS)
+-      return result;
++#ifdef __APPLE__
++   /* Darwin on redwood, boot-arg glenv=PVR_NOWAIT=1 (the default now, =0 turns it off): the processor does not wait here for the GPU to
++    * finish the submission before (pvr_clear_last_submits_syncs()) -- with Zink every glFlush waited for
++    * it, so the window server never built a frame while the GPU drew the last. Instead every stage's
++    * first job of this submission waits on the GPU for all of the earlier ones' (the same order, kept
++    * by the firmware), and their syncs go once their fences have been handed on.
++    */
++   static int nowait = -1;
+ 
+-   if (submit->wait_count) {
+-      result = pvr_process_queue_waits(driver_queue,
+-                                       submit->waits,
+-                                       submit->wait_count);
++   if (nowait < 0) {
++      /* on unless PVR_NOWAIT=0 */
++      nowait = !getenv("PVR_NOWAIT") || atoi(getenv("PVR_NOWAIT")) != 0;
++      mesa_logi("pvr: PVR_NOWAIT=%d: submissions %s", nowait, nowait ? "not waited for" : "waited for");
++   }
++
++   if (nowait) {
++      struct vk_sync *old[PVR_JOB_TYPE_MAX * 2];
++      uint32_t old_count = 0, wait_count = submit->wait_count;
++
++      for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
++         if (driver_queue->next_job_wait_sync[i])
++            old[old_count++] = driver_queue->next_job_wait_sync[i];
++         if (driver_queue->last_job_signal_sync[i])
++            old[old_count++] = driver_queue->last_job_signal_sync[i];
++         driver_queue->next_job_wait_sync[i] = NULL;
++         driver_queue->last_job_signal_sync[i] = NULL;
++      }
++
++      STACK_ARRAY(struct vk_sync_wait, waits, submit->wait_count + old_count);
++      if (!waits)
++         return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++      memcpy(waits, submit->waits, sizeof(*waits) * submit->wait_count);
++      for (uint32_t i = 0; i < old_count; i++) {
++         waits[wait_count++] = (struct vk_sync_wait){
++            .sync = old[i],
++            .stage_mask = ~(VkPipelineStageFlags2)0,
++            .wait_value = 0,
++         };
++      }
++
++      result = wait_count ? pvr_process_queue_waits(driver_queue, waits, wait_count) : VK_SUCCESS;
++      STACK_ARRAY_FINISH(waits);
++
++      for (uint32_t i = 0; i < old_count; i++)
++         vk_sync_destroy(&device->vk, old[i]);
++
+       if (result != VK_SUCCESS)
+          return result;
++   } else
++#endif
++   {
++      result = pvr_clear_last_submits_syncs(driver_queue);
++      if (result != VK_SUCCESS)
++         return result;
++
++      if (submit->wait_count) {
++         result = pvr_process_queue_waits(driver_queue,
++                                          submit->waits,
++                                          submit->wait_count);
++         if (result != VK_SUCCESS)
++            return result;
++      }
+    }
+ 
+    struct pvr_suspended_data suspended_data = {0};

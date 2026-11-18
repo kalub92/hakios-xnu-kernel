@@ -42,6 +42,8 @@ extern unsigned glGetError(void);
  */
 #define WINDOW  16
 
+int redwood_gl_surface_stage, redwood_gl_surface_error;         /* (src/gl_egl.c says why a surface was not shared; here nobody does) */
+
 struct redwood_gl {
 	OSMesaContext context;
 	unsigned char window[WINDOW * WINDOW * 4];
@@ -80,6 +82,12 @@ redwood_gl_destroy(struct redwood_gl *gl)
 	free(gl);
 }
 
+void *
+redwood_gl_current(void)
+{
+	return NULL;            /* (OSMesa keeps that to itself) */
+}
+
 const char *
 redwood_gl_library(void)
 {
@@ -91,6 +99,15 @@ redwood_gl_library(void)
  * kernel's GPU driver makes a buffer of the surface's memory). The drivers that draw in memory
  * of their own with this processor are not asked: they refuse every time.
  */
+int
+redwood_gl_surface_plane_texture(struct redwood_gl *gl, uint32_t surface, int plane)
+{
+	(void)gl;
+	(void)surface;
+	(void)plane;
+	return 0;               /* (planes: Zink's only, gl_egl.c) */
+}
+
 int
 redwood_gl_surface_texture(struct redwood_gl *gl, uint32_t surface)
 {

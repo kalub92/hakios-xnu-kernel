@@ -70,6 +70,7 @@ static uint32_t touch_head, touch_tail;        /* read from head, add at tail */
 #define EXIT_HOLD_MS    1500
 
 extern void loader_return(void);
+extern void redwood_r1_stop(void);      /* redwood_cpufreq.c: what r1_cpufreq raised, put back */
 
 static thread_call_t exit_call;
 static uint32_t fingers_down;           /* one bit for each finger a driver says is down */
@@ -79,6 +80,7 @@ exit_hold_elapsed(__unused thread_call_param_t p0, __unused thread_call_param_t 
 {
 	printf("\n--- %d fingers held on the screen for %d ms: back to the loader ---\n", EXIT_FINGERS, EXIT_HOLD_MS);
 	redwood_adreno_stop();
+	redwood_r1_stop();
 	loader_return();
 }
 
@@ -218,6 +220,7 @@ redwood_input_init(void)
 	redwood_virtio_input_init();
 	redwood_goodix_init();
 	redwood_tcm_init();
+	redwood_hyn_init();
 	redwood_buttons_init();
 	redwood_mtkkeys_init();
 	redwood_battery_init();
@@ -225,10 +228,14 @@ redwood_input_init(void)
 	redwood_net_init();
 	redwood_adreno_init();
 	redwood_mali_init();
+	redwood_pvr_init();
 	redwood_connsys_init();
+	redwood_md_init();
 	redwood_scp_init();
 	redwood_mtkcam_init();
+	redwood_r1cam_init();
 	redwood_mtkbatt_init();
+	redwood_mtkaudio_init();
 	redwood_wifi_init();
 	redwood_adsp_init();
 }
@@ -241,6 +248,12 @@ void
 redwood_pwrap_lock(void)
 {
 	lck_mtx_lock(&redwood_pwrap_mtx);
+}
+
+bool
+redwood_pwrap_trylock(void)
+{
+	return lck_mtx_try_lock(&redwood_pwrap_mtx);
 }
 
 void

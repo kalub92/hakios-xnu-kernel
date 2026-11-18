@@ -50,6 +50,7 @@
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/uio.h>
+#include <sys/redwood_emmc.h>
 #include <sys/redwood_input.h>
 #include <libkern/crc.h>
 #include <vm/memory_types.h>
@@ -200,7 +201,9 @@ static LCK_MTX_DECLARE(ufs_write_mtx, &ufs_lck_grp);
 #define VAR_SAVE_MS        20000        /* at most this long on the way out (var_save_ms=N) */
 
 static volatile int ufs_var_save = VAR_SAVE_NONE;
-static int ufs_var_busy_pid;
+static int ufs_var_generation;          /* what the saver says it saved (VAR_SAVE_DONE | gen << 8); 0: it failed */
+extern void redwood_host_keep_add(const char *format, ...) __printflike(1, 2);  /* redwood_mali.c: said, and kept for the host */
+int ufs_var_busy_pid;                    /* also the claim on /dev/remmc_var (redwood_emmc.c) */
 
 /* ufs_write=1 and the one partition it is for: everything else answers EROFS as it always did */
 static int ufs_write_part = -1;
@@ -240,7 +243,8 @@ ufs_sysctl_var_save(__unused struct sysctl_oid *oidp, __unused void *arg1, __unu
 	}
 	if (value == VAR_SAVE_IDLE && ufs_var_save != VAR_SAVE_WANTED) {
 		ufs_var_save = VAR_SAVE_IDLE;           /* a saver is there; it is the one that will be asked */
-	} else if (value == VAR_SAVE_DONE && ufs_var_save == VAR_SAVE_WANTED) {
+	} else if ((value & 0xff) == VAR_SAVE_DONE && ufs_var_save == VAR_SAVE_WANTED) {
+		ufs_var_generation = value >> 8;
 		ufs_var_save = VAR_SAVE_DONE;           /* and it has finished: the way out may go on */
 	} else if (value == VAR_SAVE_NONE) {
 		ufs_var_save = VAR_SAVE_NONE;
@@ -291,7 +295,7 @@ ufs_sysctl_var_busy(__unused struct sysctl_oid *oidp, __unused void *arg1, __unu
 }
 
 SYSCTL_PROC(_kern_redwood, OID_AUTO, var_busy, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
-    ufs_sysctl_var_busy, "I", "the claim a writer of /dev/rufs_darwin must hold: 1 takes it, 0 gives it back");
+    ufs_sysctl_var_busy, "I", "the claim a writer of /dev/rufs_darwin or /dev/remmc_var must hold: 1 takes it, 0 gives it back");
 
 /*
  * Native blocks [lba, lba + count) of partition part, one request of at most the buffer's size:
@@ -902,25 +906,35 @@ static const struct cdevsw ufs_cdevsw = {
 void
 redwood_var_save_on_return(void)
 {
-	uint32_t ms = VAR_SAVE_MS;
-	uint64_t waited = 0;
+	uint32_t ms = VAR_SAVE_MS, asked_for = 0;
+	uint64_t waited = 0, started = mach_absolute_time(), ns;
 
-	if (!ufs_ready || ufs_write_part < 0 || ufs_var_save != VAR_SAVE_IDLE) {
+	if (!((ufs_ready && ufs_write_part >= 0) || redwood_emmc_var_on()) || ufs_var_save != VAR_SAVE_IDLE) {
+		if (PE_parse_boot_argn("var_store", &asked_for, sizeof(asked_for)) && asked_for == 1) {
+			redwood_host_keep_add("var_store: exit save FAILED: no saver registered (state %d), nothing saved", ufs_var_save);
+		}
+		redwood_emmc_var_stop();
 		return;
 	}
 	PE_parse_boot_argn("var_save_ms", &ms, sizeof(ms));
-	printf("var_store: the run is ending: the data volume is asked for\n");
+	redwood_host_keep_add("var_store: the run is ending: the data volume is asked for");
 	ufs_var_save = VAR_SAVE_WANTED;
 	while (ufs_var_save != VAR_SAVE_DONE && waited < ms) {
 		IOSleep(20);
-		waited += 20;
+		waited += 20;           /* counted, not timed: the real time is below */
 	}
-	if (ufs_var_save == VAR_SAVE_DONE) {
-		/* what it made of it is in its own lines: this only says it answered */
-		printf("var_store: the saver has finished after %llu ms\n", waited);
+	absolutetime_to_nanoseconds(mach_absolute_time() - started, &ns);
+	if (ufs_var_save != VAR_SAVE_DONE) {
+		redwood_host_keep_add("var_store: exit save FAILED: the saver did not answer in %llu ms: the store keeps what it had",
+		    ns / NSEC_PER_MSEC);
+	} else if (ufs_var_generation == 0) {
+		redwood_host_keep_add("var_store: exit save FAILED after %llu ms: the saver says it came to nothing (its lines say why)",
+		    ns / NSEC_PER_MSEC);
 	} else {
-		printf("var_store: the saver did not answer in %u ms: the store keeps what it had\n", ms);
+		redwood_host_keep_add("var_store: exit save done: generation %d is in the flash, after %llu ms",
+		    ufs_var_generation, ns / NSEC_PER_MSEC);
 	}
+	redwood_emmc_var_stop();        /* r1: no eMMC write in flight as the loader takes over */
 }
 
 /* ---- the check: the partitions there are images of, hashed as the loader hashes them ---- */

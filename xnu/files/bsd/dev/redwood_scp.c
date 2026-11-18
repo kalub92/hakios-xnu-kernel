@@ -34,6 +34,8 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void redwood_keep(const char *format, ...) __printflike(1, 2);
 extern void delay(int usec);
+extern int32_t redwood_r1_accel[3];
+extern uint32_t redwood_r1_accel_count;
 
 #define SCP_CFG_PHYS            0x105C0000u
 #define SCP_A_TO_HOST_REG       0x1C
@@ -480,7 +482,10 @@ accel_sample(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int
 {
 	char text[64] = "none";
 
-	if (scp_fifo != 0) {
+	if (redwood_r1_accel_count && scp_fifo == 0) {  /* the r1's ICM-42607P (redwood_hyn.c) */
+		snprintf(text, sizeof(text), "%d %d %d %u", redwood_r1_accel[0], redwood_r1_accel[1], redwood_r1_accel[2],
+		    redwood_r1_accel_count);
+	} else if (scp_fifo != 0) {
 		uint32_t wp = ((volatile uint32_t *)scp_fifo)[1], at = 16 + (wp >= 44 ? wp - 44 : 0);
 
 		snprintf(text, sizeof(text), "%d %d %d %u", *(volatile int32_t *)(scp_fifo + at + 12),

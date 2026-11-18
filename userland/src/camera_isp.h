@@ -41,6 +41,7 @@ struct isp {
 	uint32_t        asked_lines, asked_gain, asked_frame_lines;     /* what AE asked for last */
 	bool            asked;
 	uint32_t        max_frame_lines;        /* the longest frame AE may ask for (0: twice the shortest) */
+	bool            rot180;         /* the picture turned half a way round (the front camera, r1cam_front_rot=2): isp_render_nv12 / isp_render_bgra */
 };
 
 void isp_init(struct isp *isp);
@@ -72,5 +73,14 @@ void isp_render_full_nv12(const struct isp *isp, const struct redwood_camera_fra
  */
 bool isp_lsc_from_flat(struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw, float *min_ratio);
 void isp_set_ccm(struct isp *isp, const float m[9]);
+/*
+ * A camera's own tuning, kept in a file: its colour matrix and its lens shading (camera_test raw ... flat makes one from a flat
+ * field). isp_tuning_load takes the first there is of ISP_TUNING_FILE (written on the phone) and ISP_TUNING_IMAGE (put into the
+ * image); without either nothing changes.
+ */
+#define ISP_TUNING_FILE         "/private/var/redwood-camera.tune"
+#define ISP_TUNING_IMAGE        "/redwood/etc/camera.tune"
+bool isp_tuning_load(struct isp *isp);
+bool isp_tuning_save(const struct isp *isp, const char *path);
 
 #endif

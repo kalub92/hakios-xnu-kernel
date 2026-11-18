@@ -42,7 +42,11 @@ void redwood_input_init(void);
 void redwood_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
 void redwood_tcm_init(void);            /* boot-arg touchscreen=2: the Infinix's OmniVision TD4160 */
+void redwood_hyn_init(void);            /* boot-arg touchscreen=3: the rabbit r1's Hynitron */
+void redwood_mtkaudio_init(void);       /* boot-arg mtkaudio=N: the rabbit r1's speaker; 1 reads its registers, 2 plays what iOS plays, 3 and 4 test it first */
 void redwood_mali_init(void);            /* boot-arg mali=1: the Infinix's Mali-G52 brought up */
+void redwood_r1cam_init(void);          /* boot-arg r1cam=N: the rabbit r1's camera (Hi846); 1 reads its power state, 2 powers it and reads its ID, 3 captures frames, 4 serves /dev/redwood-camera */
+void redwood_pvr_init(void);            /* boot-arg pvr=N: the rabbit r1's PowerVR GE8320; 1 reads its power state, 2 powers and identifies it, 3 loads and starts its firmware */
 void redwood_mtkkeys_init(void);         /* boot-arg buttons=2: the Infinix's power and volume keys */
 void redwood_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
 void redwood_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
@@ -81,8 +85,11 @@ void redwood_adreno_stop(void);         /* before that, where the ending is no p
 void redwood_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
 void redwood_scp_init(void);            /* boot-arg scp_step=N: the MT6768's SCP (the sensor hub), steps 1 to N */
 void redwood_connsys_init(void);        /* boot-arg connsys_step=N: the Infinix's CONNSYS (Wi-Fi/BT), steps 1 to N */
+void redwood_md_quiesce(void);          /* on the way back to the loader: MD1 powered down again if r1_md=2 left it on */
+void redwood_md_init(void);             /* boot-arg r1_md=1: MD1 modem power/protection/clock-gate state, read only */
 void redwood_pwrap_lock(void);          /* the MT6358 PMIC wrapper (0x1000d000) takes one transaction at a time: the camera, the keys/GPU-voltage and CONNSYS drivers each hold this for a whole one */
 void redwood_pwrap_unlock(void);
+bool redwood_pwrap_trylock(void);      /* for the run's end: the other CPUs are stopped and the holder may never let go */
 void redwood_mtkbatt_init(void);        /* boot-arg mtkbatt=1: the Infinix's battery from the PMIC's BATADC, to iOS's power source */
 void redwood_mtkcam_init(void);         /* boot-arg mtkcam=1: the Infinix's main camera (S5K JN1), one capture into memory, then all off */
 /* CONNSYS's memory (Android's consys-reserve-memory), and the AP's the Wi-Fi's DMA and BTIF's FIFO use (its

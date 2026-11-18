@@ -73,6 +73,11 @@ enum {
 };
 
 #define kSurfaceLockReadOnly    1u
+#define kSurfaceLockAvoidSync   2u
+/* boot-arg glwait=3 (userland/src/eagl.c): the window server does not wait for its frames; see lockCommon */
+static TUNABLE(uint32_t, gGLWait, "glwait", 1);
+extern "C" uint64_t redwood_pvr_last_fence(void);
+extern "C" void CleanPoC_DcacheRegion(vm_offset_t va, size_t length);
 
 #define MINISURF_TABLE_SIZE     16384
 #define MINISURF_MAX_DIMENSION  16384
@@ -926,7 +931,7 @@ class IOSurfaceRootUserClient : public IOUserClient
 	IOReturn trapUnlock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapDetach(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapRelease(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
-	IOReturn lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut);
+	IOReturn lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut, bool unlock = false);
 	IOReturn useCountCommon(uint32_t sid, uint32_t category, int delta);
 
 public:
@@ -1769,17 +1774,54 @@ IOSurfaceRootUserClient::trapDecrementUseCount(void * p1, void * p2, void * p3, 
  * command buffers, so a snapshot of an application or a widget that backboardd drew into a surface
  * was read by SpringBoard half drawn -- parts of other frames in the closing Settings and an empty
  * weather widget in the user's video. The same wait the display makes (MiniIOSurfaceDrawn).
+ *
+ * Boot-arg glwait=3: the window server (eagl.c) no longer waits for the PowerVR at the end of a frame.
+ * Its write lock (and unlock) with kIOSurfaceLockAvoidSync after the frame's glFlush -- by which Mesa
+ * has handed the frame's jobs to the kernel -- marks the surface drawn once every job so far is done,
+ * and is not waited for itself; every other lock, and the display (show()), waits for that mark.
  */
 IOReturn
-IOSurfaceRootUserClient::lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut)
+IOSurfaceRootUserClient::lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut, bool unlock)
 {
 	struct minisurf_client_ref * ref;
 	uint32_t seed = 0;
 	MiniIOSurface * drawn = MiniIOSurfaceCopy(sid);
 
 	if (drawn != NULL) {
-		bool done = MiniIOSurfaceDrawn(drawn, 500);
+		bool mark = gGLWait == 3 && (options & (kSurfaceLockAvoidSync | kSurfaceLockReadOnly)) == kSurfaceLockAvoidSync;
+		uint64_t began = mach_absolute_time();
+		bool done = mark || MiniIOSurfaceDrawn(drawn, 500);
 		static uint32_t told;
+
+		if (mark) {
+			drawn->pvrFence = redwood_pvr_last_fence();
+		}
+		if (gGLWait == 3) {
+			/* every ten seconds: the marks, the locks that had to wait for one, and those that gave up (ponytail: counters not locked, for the eye) */
+			static uint64_t since, waitedNs;
+			static uint32_t marks, waits, late;
+			uint64_t now = mach_absolute_time(), ns;
+
+			absolutetime_to_nanoseconds(now - began, &ns);
+			marks += mark;
+			if (!mark && drawn->pvrFence != 0 && ns >= 100 * NSEC_PER_USEC) {
+				waits++;
+				waitedNs += ns;
+			}
+			if (!done && late++ == 0) {
+				IOLog("MiniIOSurface: glwait=3: a lock of surface %u gave up waiting for the GPU after 500 ms (said once)\n", sid);
+			}
+			absolutetime_to_nanoseconds(now - since, &ns);
+			if (since == 0 || ns >= 10 * NSEC_PER_SEC) {
+				if (since != 0) {
+					IOLog("MiniIOSurface: glwait=3: 10 s: %u frames marked, %u locks waited for the GPU (%llu.%llu ms each), %u gave up so far\n",
+					    marks, waits, waitedNs / (waits + !waits) / NSEC_PER_MSEC, waitedNs / (waits + !waits) / 100000 % 10, late);
+				}
+				since = now;
+				marks = waits = 0;
+				waitedNs = 0;
+			}
+		}
 
 		/* (for the snapshots of the closing animation: what a reader of a whole-screen surface finds) */
 		if (told < 40 && drawn->info.width == 750 && drawn->info.height == 1624 && drawn->pixels() != NULL &&
@@ -1799,6 +1841,16 @@ IOSurfaceRootUserClient::lockCommon(uint32_t sid, uint32_t options, user_addr_t 
 			}
 			IOLog("MiniIOSurface: surface %u read-locked, the GPU %s; on average red %u green %u blue %u\n", sid,
 			    done ? "done with it" : "NOT done after 500 ms", sum[0] / n, sum[1] / n, sum[2] / n);
+		}
+		/*
+		 * A planar picture written by the processor (the camera's software ISP, '420f') is read by the
+		 * PowerVR straight from memory (eagl.c glyuv=1), and the GPU does not see the processor's caches:
+		 * what was written is cleaned out to memory when the writer lets go. Unclean, the preview showed
+		 * green blocks -- chroma not yet in memory. ponytail: planar surfaces only; BGRA ones a processor
+		 * draws would need it too, at 3 MB a frame, if they ever show the same.
+		 */
+		if (unlock && !(options & kSurfaceLockReadOnly) && drawn->info.planeCount > 0 && drawn->kpixels != NULL) {
+			CleanPoC_DcacheRegion((vm_offset_t) drawn->kpixels, drawn->info.allocSize);
 		}
 		MiniIOSurfaceDrop(drawn);
 	}
@@ -1832,7 +1884,7 @@ IOSurfaceRootUserClient::trapLock(void * p1, void * p2, void * p3, void * p4, vo
 IOReturn
 IOSurfaceRootUserClient::trapUnlock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
 {
-	return lockCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, (user_addr_t) (uintptr_t) p3);
+	return lockCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, (user_addr_t) (uintptr_t) p3, true);
 }
 
 /*

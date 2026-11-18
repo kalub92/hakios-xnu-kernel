@@ -215,6 +215,7 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 }
 
 extern "C" bool redwood_mali_wait(uint64_t seq, uint64_t timeout_ns);
+extern "C" bool redwood_pvr_wait_upto(uint64_t fence, uint64_t ms);
 
 bool
 MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
@@ -232,6 +233,9 @@ MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 		return false;
 	}
 	if (surface->maliSeq != 0 && !redwood_mali_wait(surface->maliSeq, milliseconds * NSEC_PER_MSEC)) {
+		return false;
+	}
+	if (surface->pvrFence != 0 && !redwood_pvr_wait_upto(surface->pvrFence, milliseconds)) {
 		return false;
 	}
 

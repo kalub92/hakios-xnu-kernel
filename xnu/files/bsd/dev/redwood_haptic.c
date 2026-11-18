@@ -816,6 +816,200 @@ gain_for(uint32_t peak)
 	return (uint8_t)(peak >= third ? top : low + (top - low) * peak / third);
 }
 
+static bool
+make_node(const struct cdevsw *sw)
+{
+	int major = cdevsw_add(-1, (struct cdevsw *)(uintptr_t)sw);
+
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic") == NULL) {
+		say("haptic: /dev/redwood-haptic cannot be made\n");
+		return false;
+	}
+	return true;
+}
+
+/* ---- r1_vibr=1|2: the r1's vibration motor (MT6357 VIBR LDO through the PMIC wrapper) ---------------- */
+
+#define R1_PWRAP_BASE           0x1000d000ULL
+#define R1_WACS2_CMD            0xc20
+#define R1_WACS2_RDATA          0xc24
+#define R1_WACS2_VLDCLR         0xc28
+#define R1_FSM(r)               (((r) >> 16) & 7u)
+#define VIBR_CON0               0x1b08          /* bit 0: enable */
+#define VIBR_CON1               0x1b16          /* bit 15: status */
+#define VIBR_ANA_CON0           0x1c2c          /* bits 11:8: voltage select */
+#define VIBR_VSEL_MASK          0xf00
+#define VIBR_MAX_ON_US          2000000
+#define VIBR_TOLD               24
+
+static volatile uint32_t *r1_pwrap;
+static uint32_t r1_vibr_level;
+static bool r1_motor_ever_on;
+static unsigned r1_events, r1_capped;
+
+static bool
+r1_pwrap_wait(uint32_t state)
+{
+	for (uint32_t spin = 0; spin < 200000; spin++) {
+		if (R1_FSM(r1_pwrap[R1_WACS2_RDATA / 4]) == state) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+r1_rd_raw(uint32_t reg, uint16_t *value)
+{
+	bool ok = false;
+
+	if (r1_pwrap_wait(0)) {
+		r1_pwrap[R1_WACS2_CMD / 4] = (reg >> 1) << 16;
+		if (r1_pwrap_wait(6)) {
+			*value = (uint16_t)r1_pwrap[R1_WACS2_RDATA / 4];
+			r1_pwrap[R1_WACS2_VLDCLR / 4] = 1;
+			ok = true;
+		}
+	}
+	return ok;
+}
+
+static bool
+r1_wr_raw(uint32_t reg, uint16_t value)
+{
+	if (!r1_pwrap_wait(0)) {
+		return false;
+	}
+	r1_pwrap[R1_WACS2_CMD / 4] = (1u << 31) | ((reg >> 1) << 16) | value;
+	return r1_pwrap_wait(0);
+}
+
+static bool
+r1_pmic_read(uint32_t reg, uint16_t *value)
+{
+	bool ok;
+
+	redwood_pwrap_lock();
+	ok = r1_rd_raw(reg, value);
+	redwood_pwrap_unlock();
+	return ok;
+}
+
+static bool
+r1_pmic_write(uint32_t reg, uint16_t value)
+{
+	bool ok;
+
+	redwood_pwrap_lock();
+	ok = r1_wr_raw(reg, value);
+	redwood_pwrap_unlock();
+	return ok;
+}
+
+static int
+r1vibr_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	heard_us = 0;
+	return 0;
+}
+
+static const struct cdevsw r1vibr_cdevsw = {
+	.d_open = haptic_open, .d_close = r1vibr_close, .d_read = eno_rdwrt, .d_write = haptic_write,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+/* the motor on at voltage index vsel, or off; read back and told (the first VIBR_TOLD events); false on a mismatch (it is then off) */
+static bool
+vibr_set(bool on, unsigned vsel)
+{
+	uint16_t c0 = 0, c1 = 0, ana = 0;
+
+	if (on) {
+		(void)r1_pmic_read(VIBR_ANA_CON0, &ana);
+		(void)r1_pmic_write(VIBR_ANA_CON0, (uint16_t)((ana & ~VIBR_VSEL_MASK) | (vsel << 8)));
+		(void)r1_pmic_read(VIBR_CON0, &c0);
+		(void)r1_pmic_write(VIBR_CON0, c0 | 1);
+		r1_motor_ever_on = true;
+	} else {
+		(void)r1_pmic_read(VIBR_CON0, &c0);
+		(void)r1_pmic_write(VIBR_CON0, c0 & ~1);
+	}
+	(void)r1_pmic_read(VIBR_CON0, &c0);
+	(void)r1_pmic_read(VIBR_CON1, &c1);
+	(void)r1_pmic_read(VIBR_ANA_CON0, &ana);
+	if (r1_events++ < VIBR_TOLD) {
+		say("r1vibr: %s vsel %u: CON0 %#x CON1 %#x (status %u) ANA %#x\n", on ? "on" : "off", vsel, c0, c1, (c1 >> 15) & 1, ana);
+	}
+	if ((c0 & 1) != (on ? 1u : 0u) || (on && ((ana & VIBR_VSEL_MASK) >> 8) != vsel)) {
+		say("r1vibr: read-back mismatch (CON0 %#x ANA %#x): off, stopped\n", c0, ana);
+		(void)r1_pmic_write(VIBR_CON0, c0 & ~1);
+		return false;
+	}
+	return true;
+}
+
+static void
+r1vibr_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	uint16_t id = 0, c0 = 0, c1 = 0, ana = 0;
+	uint32_t min_ms = 40, forced = 0;
+	uint64_t on_since = 0, rest_until = 0;
+	bool on = false;
+
+	r1_pwrap = (volatile uint32_t *)ml_io_map(R1_PWRAP_BASE, 0x1000);
+	if (!r1_pmic_read(0x0008, &id) || (id & 0xff00) != 0x5700) {
+		say("r1vibr: HWCID %#x not MT6357: left alone\n", id);
+		goto done;
+	}
+	PE_parse_boot_argn("r1_vibr_min_ms", &min_ms, sizeof(min_ms));
+	if (PE_parse_boot_argn("r1_vibr_vsel", &forced, sizeof(forced)) && forced != 5 && forced != 9 && forced != 11) {
+		forced = 0;
+	}
+	(void)r1_pmic_read(VIBR_CON0, &c0);
+	(void)r1_pmic_read(VIBR_CON1, &c1);
+	(void)r1_pmic_read(VIBR_ANA_CON0, &ana);
+	say("r1vibr: HWCID %#x CON0 %#x CON1 %#x ANA_CON0 %#x; min %u ms, vsel %u (0: by strength)\n", id, c0, c1, ana, min_ms, forced);
+	if (c0 & 1) {
+		(void)r1_pmic_write(VIBR_CON0, c0 & ~1);
+		say("r1vibr: CON0 bit 0 was set: cleared\n");
+	}
+	if (r1_vibr_level >= 2) {
+		bool ok = vibr_set(true, 9);
+
+		wait_ms(200);
+		if (!vibr_set(false, 9) || !ok) {
+			goto done;
+		}
+		say("r1vibr: self-test buzz done\n");
+	}
+	say("r1vibr: THE MOTOR BUZZES WHAT IOS PLAYS ON ITS ACTUATOR (/dev/redwood-haptic)\n");
+	for (;;) {
+		uint64_t now = now_us();
+		bool active = heard_us != 0 && now - heard_us < ACTIVE_US;
+
+		if (!on && active && now >= rest_until) {
+			if (!vibr_set(true, forced ? forced : (heard_peak >= 32767 / 3 ? 11 : 9))) {
+				break;
+			}
+			on = true;
+			on_since = now;
+		} else if (on && ((!active && now - on_since >= (uint64_t)min_ms * 1000) || now - on_since > VIBR_MAX_ON_US)) {
+			if (now - on_since > VIBR_MAX_ON_US) {
+				r1_capped++;
+				rest_until = now + VIBR_MAX_ON_US;
+			}
+			if (!vibr_set(false, 0)) {
+				break;
+			}
+			on = false;
+		}
+		wait_ms(4);
+	}
+done:
+	thread_terminate(current_thread());
+}
+
 static void
 serve(void)
 {
@@ -823,10 +1017,8 @@ serve(void)
 	uint64_t since = 0, rest_until = 0, last_look = 0, tap_onset = 0, followed = 0;
 	uint8_t playing_gain = 0;
 	unsigned follows = 0;                   /* how often the vibration playing now has changed strength */
-	int major = cdevsw_add(-1, &haptic_cdevsw);
 
-	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic") == NULL) {
-		say("haptic: /dev/redwood-haptic cannot be made\n");
+	if (!make_node(&haptic_cdevsw)) {
 		return;
 	}
 	say("haptic: THE MOTOR PLAYS WHAT IOS PLAYS ON ITS ACTUATOR (/dev/redwood-haptic) from here on, until the run ends\n");
@@ -979,6 +1171,12 @@ redwood_haptic_init(void)
 {
 	thread_t thread;
 
+	if (PE_parse_boot_argn("r1_vibr", &r1_vibr_level, sizeof(r1_vibr_level)) && r1_vibr_level >= 1) {
+		if (make_node(&r1vibr_cdevsw) && kernel_thread_start(r1vibr_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		}
+		return;
+	}
 	if (!PE_parse_boot_argn("haptic", &level, sizeof(level)) || level == 0) {
 		return;
 	}
@@ -994,6 +1192,20 @@ redwood_haptic_init(void)
 void
 redwood_haptic_quiesce(void)
 {
+	if (r1_motor_ever_on) {
+		uint16_t c0 = 0;
+		bool locked = redwood_pwrap_trylock();
+
+		/* (written even when the lock is not ours: the other CPUs are stopped, and the motor off matters most) */
+		if (!r1_rd_raw(VIBR_CON0, &c0)) {
+			c0 = 0;
+		}
+		(void)r1_wr_raw(VIBR_CON0, c0 & ~1);
+		if (locked) {
+			redwood_pwrap_unlock();
+		}
+		say("r1vibr: at the run's end: motor off (lock %s); %u events, %u cut at 2000 ms\n", locked ? "taken" : "NOT taken", r1_events, r1_capped);
+	}
 	if (released && tlmm != 0) {
 		leaving = true;
 		reset_pin(false);

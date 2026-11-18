@@ -1,0 +1,1160 @@
+--- a/meson.build
++++ b/meson.build
+@@ -816,6 +816,19 @@
+   # dependencies (such as vk-runtime) linking to it
+   dep_libdrm = null_dep
+ endif
++if host_machine.system() == 'darwin' and host_machine.subsystem() == 'ios' and (with_imagination_vk or with_gallium_zink)
++  # Darwin on redwood: no DRM on this system. The PowerVR driver's requests go to the kernel's
++  # driver through a stand-in for libdrm (src/redwood-drm, put there by tools/mk-mesa-pvr.sh),
++  # a copy of which goes into every library that asks for libdrm: an archive that mk-mesa-pvr.sh
++  # makes before this is read (no target may be made this early in this file).
++  dep_libdrm = declare_dependency(
++    include_directories : include_directories('src/redwood-drm'),
++    link_args : [
++      join_paths(meson.project_source_root(), 'src/redwood-drm/libredwood_drm.a'),
++      '-framework', 'IOKit', '-framework', 'CoreFoundation',
++    ],
++  )
++endif
+ if dep_libdrm.found()
+   pre_args += '-DHAVE_LIBDRM'
+   if with_dri_platform == 'drm' and with_dri
+--- a/src/imagination/vulkan/meson.build
++++ b/src/imagination/vulkan/meson.build
+@@ -161,6 +161,7 @@
+       inc_src,
+     ],
+     dependencies : [
++      dep_libdrm.partial_dependency(compile_args : true, includes : true),
+       dep_valgrind,
+       idep_nir_headers,
+       idep_pco_uscgen_programs_headers,
+@@ -201,6 +202,8 @@
+   ],
+   c_args : pvr_flags,
+   link_args : [
++    # Darwin: the entry points the driver does not have are weak and stay undefined (as kosmickrisp's)
++    host_machine.system() == 'darwin' ? ['-Wl,-undefined,dynamic_lookup'] : [],
+     vulkan_icd_link_args,
+     ld_args_build_id,
+     ld_args_bsymbolic,
+--- a/src/imagination/vulkan/winsys/powervr/pvr_drm_bo.c
++++ b/src/imagination/vulkan/winsys/powervr/pvr_drm_bo.c
+@@ -237,7 +237,13 @@
+    off_t size;
+    int ret;
+ 
++#ifdef __APPLE__
++   /* (what comes in here is an IOSurface, and the "file descriptor" its ID: src/redwood-drm) */
++   struct redwood_drm_surface surface = { .surface = (uint32_t)fd };
++   size = redwood_drm_surface(ws->render_fd, &surface) ? (off_t)-1 : (off_t)surface.size;
++#else
+    size = lseek(fd, 0, SEEK_END);
++#endif
+    if (size == (off_t)-1)
+       return vk_error(NULL, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+ 
+@@ -309,6 +315,15 @@
+ 
+    assert(!bo->map);
+ 
++#ifdef __APPLE__
++   /* no mmap() on a device here: the kernel's driver maps the buffer, all of it (src/redwood-drm) */
++   (void)offset;
++   map = redwood_pvr_map(drm_ws->base.render_fd, drm_bo->handle, bo->size, addr);
++   if (map == MAP_FAILED) {
++      result = vk_errorf(NULL, VK_ERROR_MEMORY_MAP_FAILED, "mapping buffer %u failed", drm_bo->handle);
++      goto err_out;
++   }
++#else
+    result = pvr_drm_get_bo_mmap_offset(drm_ws, drm_bo->handle, &offset);
+    if (result != VK_SUCCESS)
+       goto err_out;
+@@ -322,6 +337,7 @@
+                      &map);
+    if (result != VK_SUCCESS)
+       goto err_out;
++#endif
+ 
+    VG(VALGRIND_MALLOCLIKE_BLOCK(map, bo->size, 0, true));
+ 
+@@ -341,7 +357,13 @@
+ 
+    assert(bo->map);
+ 
++#ifdef __APPLE__
++   redwood_pvr_unmap(bo->ws->render_fd, drm_bo->handle, bo->map);
++   /* (VK_EXT_map_memory_placed: the addresses stay taken, by nothing) */
++   result = reserve ? pvr_munmap(bo->map, bo->size, true) : VK_SUCCESS;
++#else
+    result = pvr_munmap(bo->map, bo->size, reserve);
++#endif
+ 
+    VG(VALGRIND_FREELIKE_BLOCK(bo->map, 0));
+ 
+--- a/src/imagination/vulkan/pvr_instance.c
++++ b/src/imagination/vulkan/pvr_instance.c
+@@ -17,6 +17,7 @@
+ #include <xf86drmMode.h>
+ 
+ #include "vk_alloc.h"
++#include "vk_common_entrypoints.h"
+ #include "vk_log.h"
+ 
+ #include "wsi_common.h"
+@@ -311,7 +312,12 @@
+    }
+ 
+    build_id_len = build_id_length(note);
++#ifdef __APPLE__
++   /* Darwin: the build's identity is the library's LC_UUID, 16 bytes and never a SHA-1's 20 */
++   if (build_id_len < 16) {
++#else
+    if (build_id_len < BUILD_ID_EXPECTED_HASH_LENGTH) {
++#endif
+       mesa_loge("Build-id too short. It needs to be a SHA.");
+       return false;
+    }
+@@ -460,6 +466,25 @@
+    return pvr_GetInstanceProcAddr(instance, pName);
+ }
+ 
++#ifdef __APPLE__
++/* Darwin on redwood: there is no Vulkan loader. The driver is the Vulkan library itself, for
++ * whoever opens it -- Zink (zink_screen.c) -- and so has the loader's two functions.
++ */
++PUBLIC
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++vkGetInstanceProcAddr(VkInstance instance, const char *pName)
++{
++   return pvr_GetInstanceProcAddr(instance, pName);
++}
++
++PUBLIC
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++vkGetDeviceProcAddr(VkDevice device, const char *pName)
++{
++   return vk_common_GetDeviceProcAddr(device, pName);
++}
++#endif
++
+ VkResult pvr_EnumerateInstanceLayerProperties(uint32_t *pPropertyCount,
+                                               VkLayerProperties *pProperties)
+ {
+@@ -468,5 +493,11 @@
+       return VK_SUCCESS;
+    }
+ 
++#ifdef __APPLE__
++   /* Darwin on redwood: no Vulkan loader is in front of this to answer for the layers. There are none. */
++   *pPropertyCount = 0;
++   return VK_SUCCESS;
++#else
+    return vk_error(NULL, VK_ERROR_LAYER_NOT_PRESENT);
++#endif
+ }
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -12,7 +12,9 @@
+ 
+ #include "pvr_physical_device.h"
+ 
++#ifndef __APPLE__ /* (major() and minor() are in sys/types.h) */
+ #include <sys/sysmacros.h>
++#endif
+ 
+ #include "git_sha1.h"
+ 
+--- a/include/drm-uapi/pvr_drm.h
++++ b/include/drm-uapi/pvr_drm.h
+@@ -6,8 +6,12 @@
+ 
+ #include "drm.h"
+ 
++#ifdef __APPLE__ /* Darwin on redwood: no Linux headers; drm.h has the types */
++#define _BITULL(x) (1ULL << (x))
++#else
+ #include <linux/const.h>
+ #include <linux/types.h>
++#endif
+ 
+ #if defined(__cplusplus)
+ extern "C" {
+--- a/src/util/log.c
++++ b/src/util/log.c
+@@ -311,7 +311,32 @@
+ 
+    fprintf(fp, "%s", msg);
+    fflush(fp);
++
++#ifdef __APPLE__
++   {
++      /* Darwin on redwood: a program's stderr is in no log. The kernel keeps the line
++       * (kern.redwood.say, "!" first) and says it again at its log's end; the first 48 only,
++       * which is half of what it keeps.
++       */
++      extern int sysctlbyname(const char *, void *, size_t *, void *, size_t);
++      static int said;
+ 
++      if (said < 48) {
++         char kept[200];
++         int n = snprintf(kept, sizeof(kept), "!%s", msg);
++
++         said++;
++         if (n > 1) {
++            if (n > (int)sizeof(kept) - 1)
++               n = (int)sizeof(kept) - 1;
++            if (kept[n - 1] == '\n')
++               n--;
++            sysctlbyname("kern.redwood.say", NULL, NULL, kept, n);
++         }
++      }
++   }
++#endif
++
+    if (msg != local_msg)
+       free(msg);
+ }
+--- a/src/vulkan/runtime/vk_image.c
++++ b/src/vulkan/runtime/vk_image.c
+@@ -23,7 +23,7 @@
+ 
+ #include "vk_image.h"
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE /* Darwin on redwood: an IOSurface comes in as a dma-buf does */
+ #include <drm-uapi/drm_fourcc.h>
+ #endif
+ 
+@@ -111,7 +111,7 @@
+       vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
+    image->wsi_legacy_scanout = wsi_info && wsi_info->scanout;
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE /* Darwin on redwood: an IOSurface comes in as a dma-buf does */
+    image->drm_format_mod = ((1ULL << 56) - 1) /* DRM_FORMAT_MOD_INVALID */;
+ #endif
+ 
+@@ -196,7 +196,7 @@
+    vk_object_free(device, alloc, image);
+ }
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE /* Darwin on redwood: an IOSurface comes in as a dma-buf does */
+ VKAPI_ATTR VkResult VKAPI_CALL
+ vk_common_GetImageDrmFormatModifierPropertiesEXT(UNUSED VkDevice device,
+                                                  VkImage _image,
+--- a/src/vulkan/runtime/vk_image.h
++++ b/src/vulkan/runtime/vk_image.h
+@@ -80,7 +80,7 @@
+    /* wsi_image_create_info::scanout */
+    bool wsi_legacy_scanout;
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE /* Darwin on redwood: an IOSurface comes in as a dma-buf does */
+    /* VK_EXT_drm_format_modifier
+     *
+     * Initialized by vk_image_create/init() to DRM_FORMAT_MOD_INVALID.  It's
+--- a/src/imagination/include/hwdef/rogue_hw_utils.h
++++ b/src/imagination/include/hwdef/rogue_hw_utils.h
+@@ -154,10 +154,9 @@
+    *x_out = DIV_ROUND_UP(width * scale_x, tile_samples_x);
+    *y_out = DIV_ROUND_UP(height * scale_y, tile_samples_y);
+ 
+-   if (PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format)) {
+-      assert(PVR_GET_FEATURE_VALUE(dev_info,
+-                                   simple_parameter_format_version,
+-                                   0U) == 2U);
++   /* (Darwin on redwood: only version 2 of the format has tiles in blocks of 2x2; the GE8320 has version 1) */
++   if (PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format) &&
++       PVR_GET_FEATURE_VALUE(dev_info, simple_parameter_format_version, 0U) == 2U) {
+       /* Align to a 2x2 tile block. */
+       *x_out = ALIGN_POT(*x_out, 2);
+       *y_out = ALIGN_POT(*y_out, 2);
+--- a/src/imagination/vulkan/pvr_arch_job_render.c
++++ b/src/imagination/vulkan/pvr_arch_job_render.c
+@@ -126,7 +126,25 @@
+ 
+    rogue_get_num_macrotiles_xy(dev_info, &info->mtiles_x, &info->mtiles_y);
+ 
+-   if (PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format)) {
++   if (PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format) &&
++       PVR_GET_FEATURE_VALUE(dev_info, simple_parameter_format_version, 0) == 1) {
++      /* Darwin on redwood, the GE8320 (and every 8XE core with version 1 of the simple parameter
++       * format): there is one macrotile (rogue_get_num_macrotiles_xy()), not sixteen, and one
++       * region header for a tile, not for four. The one macrotile has to be the whole render:
++       * sized as below for sixteen, a quarter of the width and of the height, the GPU drew the
++       * first two tiles of sixteen and no more (the r1, 13 November 2026). The kernel's driver
++       * makes the same sum for the registers it writes (TE_SCREEN, TE_MTILE1/2, MTILE_STRIDE,
++       * ISP_MTILE_SIZE) and has to make this one.
++       */
++      info->mtile_x1 = info->num_tiles_x;
++      info->mtile_y1 = info->num_tiles_y;
++      info->mtile_x2 = 0;
++      info->mtile_y2 = 0;
++      info->mtile_x3 = 0;
++      info->mtile_y3 = 0;
++      info->x_tile_max = info->num_tiles_x - 1;
++      info->y_tile_max = info->num_tiles_y - 1;
++   } else if (PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format)) {
+       assert(PVR_GET_FEATURE_VALUE(dev_info,
+                                    simple_parameter_format_version,
+                                    0) == 2);
+@@ -630,6 +648,16 @@
+    assert(width <= rogue_get_render_size_max_x(dev_info));
+    assert(height <= rogue_get_render_size_max_y(dev_info));
+    assert(layers > 0 && layers <= PVR_MAX_FRAMEBUFFER_LAYERS);
++
++#ifdef __APPLE__
++   /* Darwin on redwood: one that a finished render pass of this size gave back (pvr_rt_dataset.c) */
++   rt_dataset =
++      pvr_rt_dataset_pool_take(device, width, height, samples, layers);
++   if (rt_dataset) {
++      *rt_dataset_out = rt_dataset;
++      return VK_SUCCESS;
++   }
++#endif
+ 
+    pvr_arch_rt_mtile_info_init(dev_info, &mtile_info, width, height, samples);
+ 
+--- a/src/imagination/vulkan/pvr_arch_framebuffer.c
++++ b/src/imagination/vulkan/pvr_arch_framebuffer.c
+@@ -35,6 +35,18 @@
+ {
+    const uint32_t cache_line_size =
+       pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
++   /* Darwin on redwood, the GE8320 (version 1 of the simple parameter format): where the geometry
++    * ends is told in tiles of 16 pixels, not in blocks of 32 -- with 32 the GPU drew the first
++    * half of the tiles in each direction and no more, at every size (the r1, 13 November 2026).
++    * The region clip of a scissor (pvr_get_geom_region_clip_align_size()) is in 16 pixels on
++    * every core with tiles of 16 already.
++    */
++   const struct pvr_device_info *dev_info = &device->pdevice->dev_info;
++   const uint32_t clip_block_size =
++      PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format) &&
++            PVR_GET_FEATURE_VALUE(dev_info, simple_parameter_format_version, 0) == 1
++         ? 16U
++         : ROGUE_TA_STATE_TERMINATE0_CLIP_RIGHT_BLOCK_SIZE_IN_PIXELS;
+    uint32_t ppp_state[3];
+    VkResult result;
+ 
+@@ -43,16 +55,8 @@
+    }
+ 
+    pvr_csb_pack (&ppp_state[1], TA_STATE_TERMINATE0, term0) {
+-      term0.clip_right =
+-         DIV_ROUND_UP(
+-            width,
+-            ROGUE_TA_STATE_TERMINATE0_CLIP_RIGHT_BLOCK_SIZE_IN_PIXELS) -
+-         1;
+-      term0.clip_bottom =
+-         DIV_ROUND_UP(
+-            height,
+-            ROGUE_TA_STATE_TERMINATE0_CLIP_BOTTOM_BLOCK_SIZE_IN_PIXELS) -
+-         1;
++      term0.clip_right = DIV_ROUND_UP(width, clip_block_size) - 1;
++      term0.clip_bottom = DIV_ROUND_UP(height, clip_block_size) - 1;
+    }
+ 
+    pvr_csb_pack (&ppp_state[2], TA_STATE_TERMINATE1, term1) {
+--- a/src/imagination/vulkan/pvr_arch_device.c
++++ b/src/imagination/vulkan/pvr_arch_device.c
+@@ -1048,6 +1048,8 @@
+    simple_mtx_destroy(&device->rs_mtx);
+ 
+    pvr_device_dummy_rt_finish(device);
++   pvr_rt_dataset_pool_drain(device);
++   pvr_bo_cache_drain(device);
+    pvr_arch_border_color_table_finish(device);
+    pvr_robustness_buffer_finish(device);
+    pvr_spm_finish_scratch_buffer_store(device);
+--- a/src/imagination/vulkan/pvr_arch_spm.c
++++ b/src/imagination/vulkan/pvr_arch_spm.c
+@@ -592,17 +592,28 @@
+ 
+    memcpy(props.tile_buffer_addrs, tile_buffer_addrs, sizeof(tile_buffer_addrs));
+ 
+-   eot = pvr_usc_eot(device->pdevice->pco_ctx, &props, dev_info);
+-   usc_temp_count = pco_shader_data(eot)->common.temps;
++#ifdef __APPLE__
++   /* Darwin on redwood: one compiled before for the same properties, if there is (pvr_usc.c) */
++   const void *kept_data;
++   unsigned kept_size;
+ 
+-   /* TODO: Create a #define in the compiler code to replace the 16. */
+-   result = pvr_gpu_upload_usc(device,
+-                               pco_shader_binary_data(eot),
+-                               pco_shader_binary_size(eot),
+-                               16,
+-                               &spm_eot_state->usc_eot_program);
++   if (pvr_usc_eot_kept(device->pdevice->pco_ctx, &props, dev_info, &kept_data, &kept_size, &usc_temp_count)) {
++      result = pvr_gpu_upload_usc(device, kept_data, kept_size, 16, &spm_eot_state->usc_eot_program);
++   } else
++#endif
++   {
++      eot = pvr_usc_eot(device->pdevice->pco_ctx, &props, dev_info);
++      usc_temp_count = pco_shader_data(eot)->common.temps;
+ 
+-   ralloc_free(eot);
++      /* TODO: Create a #define in the compiler code to replace the 16. */
++      result = pvr_gpu_upload_usc(device,
++                                  pco_shader_binary_data(eot),
++                                  pco_shader_binary_size(eot),
++                                  16,
++                                  &spm_eot_state->usc_eot_program);
++
++      ralloc_free(eot);
++   }
+ 
+    if (result != VK_SUCCESS)
+       return result;
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -614,18 +614,31 @@
+          props.msaa_samples = 1;
+    }
+ 
+-   eot =
+-      pvr_usc_eot(device->pdevice->pco_ctx, &props, &device->pdevice->dev_info);
+-   usc_temp_count = pco_shader_data(eot)->common.temps;
++#ifdef __APPLE__
++   /* Darwin on redwood: one compiled before for the same properties, if there is (pvr_usc.c) */
++   const void *kept_data;
++   unsigned kept_size;
+ 
+-   result = pvr_cmd_buffer_upload_usc(cmd_buffer,
+-                                      pco_shader_binary_data(eot),
+-                                      pco_shader_binary_size(eot),
+-                                      4,
+-                                      &usc_eot_program);
++   if (pvr_usc_eot_kept(device->pdevice->pco_ctx, &props, &device->pdevice->dev_info, &kept_data, &kept_size,
++                        &usc_temp_count)) {
++      result = pvr_cmd_buffer_upload_usc(cmd_buffer, kept_data, kept_size, 4, &usc_eot_program);
++   } else
++#endif
++   {
++      eot = pvr_usc_eot(device->pdevice->pco_ctx,
++                        &props,
++                        &device->pdevice->dev_info);
++      usc_temp_count = pco_shader_data(eot)->common.temps;
+ 
+-   ralloc_free(eot);
++      result = pvr_cmd_buffer_upload_usc(cmd_buffer,
++                                         pco_shader_binary_data(eot),
++                                         pco_shader_binary_size(eot),
++                                         4,
++                                         &usc_eot_program);
+ 
++      ralloc_free(eot);
++   }
++
+    if (result != VK_SUCCESS)
+       return result;
+ 
+--- a/src/imagination/vulkan/pvr_usc.c
++++ b/src/imagination/vulkan/pvr_usc.c
+@@ -179,6 +179,102 @@
+       .fs.uses.olchk_skip = true,
+    };
+    return build_shader(ctx, b.shader, &data);
++}
++
++/*
++ * Darwin on redwood: end-of-tile programs kept.
++ *
++ * Every render pass has the compiler make two of these -- one when its render state is set up
++ * (pvr_arch_spm.c), one when its commands are ended (pvr_arch_cmd_buffer.c) --, and with dynamic
++ * rendering every pass is new: a window server's frame, the same pass into the same kind of
++ * picture sixty times a second, compiled the same two programs every time, which was most of
++ * what a frame cost this driver's side (the r1, 14 November 2026: 9 to 15 ms in glFlush for a
++ * frame of one render pass). What a program is made of is all in its properties; one made
++ * once is kept by them, for good -- PVR_EOT_KEPT of them, and past that they are compiled as
++ * before.
++ */
++#include "util/simple_mtx.h"
++
++#define PVR_EOT_KEPT 32
++
++struct pvr_eot_key {
++   const void *ctx;
++   unsigned emit_count;
++   unsigned msaa_samples;
++   unsigned num_output_regs;
++   uint32_t state_words[PVR_MAX_COLOR_ATTACHMENTS *
++                        ROGUE_NUM_PBESTATE_STATE_WORDS];
++   uint64_t tile_buffer_addrs[PVR_MAX_COLOR_ATTACHMENTS];
++};
++
++static struct {
++   struct pvr_eot_key key;
++   void *data;
++   unsigned size;
++   unsigned temps;
++} pvr_eot_kept[PVR_EOT_KEPT];
++static unsigned pvr_eot_kept_count;
++static simple_mtx_t pvr_eot_kept_mtx = SIMPLE_MTX_INITIALIZER;
++
++bool pvr_usc_eot_kept(pco_ctx *ctx,
++                      struct pvr_eot_props *props,
++                      const struct pvr_device_info *dev_info,
++                      const void **data_out,
++                      unsigned *size_out,
++                      unsigned *temps_out)
++{
++   struct pvr_eot_key key;
++   bool found = false;
++   pco_shader *eot;
++   void *data;
++
++   if (props->shared_words || props->emit_count > PVR_MAX_COLOR_ATTACHMENTS)
++      return false;
++
++   memset(&key, 0, sizeof(key));
++   key.ctx = ctx;
++   key.emit_count = props->emit_count;
++   key.msaa_samples = props->msaa_samples;
++   key.num_output_regs = props->num_output_regs;
++   memcpy(key.state_words,
++          props->state_words,
++          props->emit_count * ROGUE_NUM_PBESTATE_STATE_WORDS *
++             sizeof(key.state_words[0]));
++   memcpy(key.tile_buffer_addrs,
++          props->tile_buffer_addrs,
++          sizeof(key.tile_buffer_addrs));
++
++   simple_mtx_lock(&pvr_eot_kept_mtx);
++   for (unsigned i = 0; i < pvr_eot_kept_count && !found; i++) {
++      if (!memcmp(&pvr_eot_kept[i].key, &key, sizeof(key))) {
++         *data_out = pvr_eot_kept[i].data;
++         *size_out = pvr_eot_kept[i].size;
++         *temps_out = pvr_eot_kept[i].temps;
++         found = true;
++      }
++   }
++
++   if (!found && pvr_eot_kept_count < PVR_EOT_KEPT) {
++      eot = pvr_usc_eot(ctx, props, dev_info);
++      data = malloc(pco_shader_binary_size(eot));
++      if (data) {
++         memcpy(data, pco_shader_binary_data(eot), pco_shader_binary_size(eot));
++         pvr_eot_kept[pvr_eot_kept_count].key = key;
++         pvr_eot_kept[pvr_eot_kept_count].data = data;
++         pvr_eot_kept[pvr_eot_kept_count].size = pco_shader_binary_size(eot);
++         pvr_eot_kept[pvr_eot_kept_count].temps =
++            pco_shader_data(eot)->common.temps;
++         *data_out = data;
++         *size_out = pvr_eot_kept[pvr_eot_kept_count].size;
++         *temps_out = pvr_eot_kept[pvr_eot_kept_count].temps;
++         pvr_eot_kept_count++;
++         found = true;
++      }
++      ralloc_free(eot);
++   }
++   simple_mtx_unlock(&pvr_eot_kept_mtx);
++
++   return found;
+ }
+ 
+ /**
+--- a/src/imagination/vulkan/pvr_usc.h
++++ b/src/imagination/vulkan/pvr_usc.h
+@@ -36,6 +36,16 @@
+ 
+    uint64_t tile_buffer_addrs[PVR_MAX_COLOR_ATTACHMENTS];
+ };
++
++/* Darwin on redwood: the same, kept for the next render pass that ends its tiles the same way
++ * (pvr_usc.c). False: not kept, and pvr_usc_eot() is to be asked.
++ */
++bool pvr_usc_eot_kept(pco_ctx *ctx,
++                      struct pvr_eot_props *props,
++                      const struct pvr_device_info *dev_info,
++                      const void **data_out,
++                      unsigned *size_out,
++                      unsigned *temps_out);
+ 
+ nir_shader *pvr_usc_fs_pfo_passthrough_nir (pco_ctx *ctx);
+ 
+--- a/src/imagination/vulkan/pvr_bo.c
++++ b/src/imagination/vulkan/pvr_bo.c
+@@ -48,7 +48,9 @@
+ #include "pvr_winsys.h"
+ #include "util/macros.h"
+ #include "util/rb_tree.h"
++#include "util/os_time.h"
+ #include "util/simple_mtx.h"
++#include <string.h>
+ #include "util/u_debug.h"
+ #include "vk_alloc.h"
+ #include "vk_log.h"
+@@ -337,7 +339,230 @@
+  * \return VK_SUCCESS on success, or error code otherwise.
+  *
+  * \sa #pvr_bo_free()
++ */
++/*
++ * Darwin on redwood: buffers kept for the next who asks for the same.
++ *
++ * A render pass's control stream, the buffers the suballocators deal PDS and USC programs and
++ * state out of: made for a command buffer and given back when it is reset, some fourteen of them a
++ * frame for a window server, each of them a buffer made in the kernel, mapped for the GPU and for
++ * this program, and all of that undone again (the r1, 13 November 2026: 1599 made and 1558 closed
++ * in ten seconds, a tenth of that time). A buffer that is given back is kept here as it is --
++ * mapped -- and handed out, cleared, to whoever asks next for one of its heap, size and kind.
++ * Only buffers this program has mapped (which it can clear, as the kernel clears a new one), of
++ * no more than PVR_BO_CACHE_MOST bytes; PVR_BO_CACHE_BYTES of them at most, none longer than five
++ * seconds unused.
+  */
++#define PVR_BO_CACHE 128
++#define PVR_BO_CACHE_MOST (1024 * 1024)
++#define PVR_BO_CACHE_BYTES (32 * 1024 * 1024)
++#define PVR_BO_CACHE_NS 5000000000ll
++
++static struct {
++   struct pvr_bo *bo;
++   int64_t since;
++} pvr_bo_cache[PVR_BO_CACHE];
++static uint64_t pvr_bo_cache_bytes;
++static const struct pvr_device *pvr_bo_cache_closed;
++static simple_mtx_t pvr_bo_cache_mtx = SIMPLE_MTX_INITIALIZER;
++
++static void pvr_bo_free_now(struct pvr_device *device, struct pvr_bo *pvr_bo);
++
++/* Counters, said every ten seconds (the r1's own "pvr:" lines, through kern.redwood.say). */
++#include <stdlib.h>
++extern int sysctlbyname(const char *, void *, size_t *, void *, size_t);
++static struct {
++   uint32_t misses;
++   struct { uint64_t size, flags; uint32_t n; } kinds[32];
++   uint64_t cleared, cleared_ns;
++   int64_t said;
++} pvr_bo_stats;
++
++/* PVR_BO_CACHE_CLEAR=0: a buffer out of the cache is not cleared (anything else: it is). */
++static bool pvr_bo_cache_clears(void)
++{
++   static int clears = -1;
++
++   if (clears < 0) {
++      const char *const env = getenv("PVR_BO_CACHE_CLEAR");
++
++      clears = !(env && !strcmp(env, "0"));
++   }
++   return clears;
++}
++
++/* A buffer asked for: made past the cache when "miss". */
++static void pvr_bo_cache_say(bool miss, uint64_t size, uint64_t flags)
++{
++   const int64_t now = os_time_get_nano();
++   char line[300];
++   unsigned top[3] = { 32, 32, 32 };
++   int len;
++
++   simple_mtx_lock(&pvr_bo_cache_mtx);
++   if (miss) {
++      unsigned i = 0;
++
++      pvr_bo_stats.misses++;
++      while (i < 31 && pvr_bo_stats.kinds[i].n &&
++             !(pvr_bo_stats.kinds[i].size == size && pvr_bo_stats.kinds[i].flags == flags))
++         i++;
++      pvr_bo_stats.kinds[i].size = size;
++      pvr_bo_stats.kinds[i].flags = flags;
++      pvr_bo_stats.kinds[i].n++;
++   }
++   if (!pvr_bo_stats.said)
++      pvr_bo_stats.said = now;
++   if (now - pvr_bo_stats.said < 10000000000ll) {
++      simple_mtx_unlock(&pvr_bo_cache_mtx);
++      return;
++   }
++   for (unsigned k = 0; k < 3; k++)
++      for (unsigned i = 0; i < 32; i++)
++         if (pvr_bo_stats.kinds[i].n && i != top[0] && i != top[1] &&
++             (top[k] == 32 || pvr_bo_stats.kinds[i].n > pvr_bo_stats.kinds[top[k]].n))
++            top[k] = i;
++   len = snprintf(line, sizeof(line), "!MESA: pvr: 10 s: %u buffers made past the cache; top sizes/flags:",
++                  pvr_bo_stats.misses);
++   for (unsigned k = 0; k < 3; k++)
++      if (top[k] < 32)
++         len += snprintf(line + len, sizeof(line) - len, " %llu/%#llx x%u",
++                         (unsigned long long)pvr_bo_stats.kinds[top[k]].size,
++                         (unsigned long long)pvr_bo_stats.kinds[top[k]].flags, pvr_bo_stats.kinds[top[k]].n);
++   snprintf(line + len, sizeof(line) - len, "; cleared %llu bytes in %llu us",
++            (unsigned long long)pvr_bo_stats.cleared, (unsigned long long)(pvr_bo_stats.cleared_ns / 1000));
++   memset(&pvr_bo_stats, 0, sizeof(pvr_bo_stats));
++   pvr_bo_stats.said = now;
++   simple_mtx_unlock(&pvr_bo_cache_mtx);
++   sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
++}
++
++static struct pvr_bo *pvr_bo_cache_take(const struct pvr_device *device,
++                                        const struct pvr_winsys_heap *heap,
++                                        uint64_t size,
++                                        uint64_t alignment,
++                                        uint64_t flags)
++{
++   const int64_t now = os_time_get_nano();
++   struct pvr_bo *found = NULL;
++
++   size = ALIGN_POT(ALIGN_POT(size, alignment), device->ws->page_size);
++   /* (flags 0 -- no CPU access at all -- are kept too, as they are and not cleared: this program
++    * cannot reach them, the GPU is what writes them; any other flags without a mapping are left alone) */
++   if (flags && !(flags & PVR_BO_ALLOC_FLAG_CPU_MAPPED))
++      return NULL;
++   if (size > PVR_BO_CACHE_MOST)
++      return NULL;
++
++   simple_mtx_lock(&pvr_bo_cache_mtx);
++   for (unsigned i = 0; i < PVR_BO_CACHE && !found; i++) {
++      struct pvr_bo *const bo = pvr_bo_cache[i].bo;
++
++      /* (flags 0: the GPU may still be reading it a frame or two after it is given back: not before 100 ms) */
++      if (bo && (flags || now - pvr_bo_cache[i].since > 100000000ll) && bo->vma->heap == heap && bo->bo->size == size &&
++          bo->alloc_flags == flags && bo->bo->ws == device->ws &&
++          !(bo->vma->dev_addr.addr & (alignment - 1))) {
++         found = bo;
++         pvr_bo_cache[i].bo = NULL;
++         pvr_bo_cache_bytes -= size;
++      }
++   }
++   simple_mtx_unlock(&pvr_bo_cache_mtx);
++
++   if (found) {
++      /* (as new: the kernel's are cleared) */
++      if (found->bo->map && pvr_bo_cache_clears()) {
++         const int64_t t0 = os_time_get_nano();
++
++         memset(found->bo->map, 0, found->bo->size);
++         simple_mtx_lock(&pvr_bo_cache_mtx);
++         pvr_bo_stats.cleared += found->bo->size;
++         pvr_bo_stats.cleared_ns += os_time_get_nano() - t0;
++         simple_mtx_unlock(&pvr_bo_cache_mtx);
++      }
++      found->ref_count = 1;
++   }
++
++   return found;
++}
++
++/* True: kept. */
++static bool pvr_bo_cache_put(struct pvr_device *device, struct pvr_bo *pvr_bo)
++{
++   const int64_t now = os_time_get_nano();
++   struct pvr_bo *gone[PVR_BO_CACHE];
++   unsigned count = 0, oldest = 0;
++   bool kept = false;
++   int slot = -1;
++
++   if ((pvr_bo->alloc_flags ? (!(pvr_bo->alloc_flags & PVR_BO_ALLOC_FLAG_CPU_MAPPED) || !pvr_bo->bo->map) : false) ||
++       pvr_bo->bo->size > PVR_BO_CACHE_MOST || device->bo_store)
++      return false;
++
++   simple_mtx_lock(&pvr_bo_cache_mtx);
++   if (pvr_bo_cache_closed != device) {
++      for (unsigned i = 0; i < PVR_BO_CACHE; i++) {
++         if (pvr_bo_cache[i].bo && now - pvr_bo_cache[i].since > PVR_BO_CACHE_NS) {
++            gone[count++] = pvr_bo_cache[i].bo;
++            pvr_bo_cache_bytes -= pvr_bo_cache[i].bo->bo->size;
++            pvr_bo_cache[i].bo = NULL;
++         }
++      }
++
++      for (unsigned i = 0; i < PVR_BO_CACHE; i++) {
++         if (!pvr_bo_cache[i].bo) {
++            slot = i;
++            break;
++         }
++
++         if (pvr_bo_cache[i].since < pvr_bo_cache[oldest].since)
++            oldest = i;
++      }
++
++      if (slot < 0) {
++         gone[count++] = pvr_bo_cache[oldest].bo;
++         pvr_bo_cache_bytes -= pvr_bo_cache[oldest].bo->bo->size;
++         slot = oldest;
++      }
++
++      if (pvr_bo_cache_bytes + pvr_bo->bo->size <= PVR_BO_CACHE_BYTES) {
++         pvr_bo_cache[slot].bo = pvr_bo;
++         pvr_bo_cache[slot].since = now;
++         pvr_bo_cache_bytes += pvr_bo->bo->size;
++         kept = true;
++      } else {
++         pvr_bo_cache[slot].bo = NULL;
++      }
++   }
++   simple_mtx_unlock(&pvr_bo_cache_mtx);
++
++   for (unsigned i = 0; i < count; i++)
++      pvr_bo_free_now(device, gone[i]);
++
++   return kept;
++}
++
++/* All of them given back for good, and none kept from here on: the device is going. */
++void pvr_bo_cache_drain(struct pvr_device *device)
++{
++   struct pvr_bo *gone[PVR_BO_CACHE];
++   unsigned count = 0;
++
++   simple_mtx_lock(&pvr_bo_cache_mtx);
++   pvr_bo_cache_closed = device;
++   for (unsigned i = 0; i < PVR_BO_CACHE; i++) {
++      if (pvr_bo_cache[i].bo && pvr_bo_cache[i].bo->bo->ws == device->ws) {
++         gone[count++] = pvr_bo_cache[i].bo;
++         pvr_bo_cache_bytes -= pvr_bo_cache[i].bo->bo->size;
++         pvr_bo_cache[i].bo = NULL;
++      }
++   }
++   simple_mtx_unlock(&pvr_bo_cache_mtx);
++
++   for (unsigned i = 0; i < count; i++)
++      pvr_bo_free_now(device, gone[i]);
++}
++
+ VkResult pvr_bo_alloc(struct pvr_device *device,
+                       struct pvr_winsys_heap *heap,
+                       uint64_t size,
+@@ -348,6 +490,15 @@
+    struct pvr_bo *pvr_bo;
+    VkResult result;
+ 
++#ifdef __APPLE__
++   pvr_bo = pvr_bo_cache_take(device, heap, size, alignment, flags);
++   pvr_bo_cache_say(!pvr_bo, size, flags);
++   if (pvr_bo) {
++      *pvr_bo_out = pvr_bo;
++      return VK_SUCCESS;
++   }
++#endif
++
+    pvr_bo = pvr_bo_alloc_bo(device);
+    if (!pvr_bo) {
+       result = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+@@ -355,6 +505,7 @@
+    }
+ 
+    pvr_bo->ref_count = 1;
++   pvr_bo->alloc_flags = flags;
+ 
+    result = device->ws->ops->buffer_create(device->ws,
+                                            size,
+@@ -475,6 +626,16 @@
+    if (!p_atomic_dec_zero(&pvr_bo->ref_count))
+       return;
+ 
++#ifdef __APPLE__
++   if (pvr_bo_cache_put(device, pvr_bo))
++      return;
++#endif
++
++   pvr_bo_free_now(device, pvr_bo);
++}
++
++static void pvr_bo_free_now(struct pvr_device *device, struct pvr_bo *pvr_bo)
++{
+ #if defined(HAVE_VALGRIND)
+    vk_free(&device->vk.alloc, pvr_bo->bo->vbits);
+ #endif /* defined(HAVE_VALGRIND) */
+--- a/src/imagination/vulkan/pvr_bo.h
++++ b/src/imagination/vulkan/pvr_bo.h
+@@ -57,8 +57,14 @@
+    struct pvr_winsys_bo *bo;
+    struct pvr_winsys_vma *vma;
+    uint32_t ref_count;
++   /* (Darwin on redwood: what it was asked for with, for keeping it for the next who asks the
++    * same -- pvr_bo.c, pvr_bo_cache)
++    */
++   uint64_t alloc_flags;
+ };
+ 
++void pvr_bo_cache_drain(struct pvr_device *device);
++
+ struct pvr_suballocator {
+    /* Pointer to the pvr_device this allocator is associated with */
+    struct pvr_device *device;
+--- a/src/imagination/vulkan/pvr_rt_dataset.c
++++ b/src/imagination/vulkan/pvr_rt_dataset.c
+@@ -60,8 +60,135 @@
+    rt_dataset->vheap_rtc_bo = NULL;
+ }
+ 
++/*
++ * Darwin on redwood: render target data kept for the next render pass of the same size.
++ *
++ * With dynamic rendering -- which is all Zink does -- every render pass makes its own (the FIXME
++ * in pvr_arch_cmd_buffer.c): a free list, four buffers and the kernel's data, made when the pass
++ * begins and given back when its command buffer is reset. For a window server that is two or
++ * three of them a frame, and most of what the kernel is asked in a frame (the r1, 13 November
++ * 2026: 211 of each made and 206 destroyed in ten seconds, with some 1600 buffers).
++ *
++ * What is given back goes here instead, and the next pass that wants one of that size takes it:
++ * no pass shares one with another, any more than before, and one is used again only when it
++ * would have been destroyed -- as a framebuffer's is used for every pass into that framebuffer.
++ * At most PVR_RT_POOL are kept, the one longest unused going first, and none longer than ten
++ * seconds unused.
++ */
++#include "util/os_time.h"
++#include "util/simple_mtx.h"
++
++#define PVR_RT_POOL 12
++#define PVR_RT_POOL_NS 10000000000ll
++
++static struct {
++   struct pvr_rt_dataset *rt_dataset;
++   int64_t since;
++} pvr_rt_pool[PVR_RT_POOL];
++static simple_mtx_t pvr_rt_pool_mtx = SIMPLE_MTX_INITIALIZER;
++
++static void pvr_rt_dataset_destroy_now(struct pvr_rt_dataset *rt_dataset);
++
++/* With the lock held: those unused too long (all of `device`'s, with `all`) are taken out; they are
++ * destroyed by the caller, without the lock (at most PVR_RT_POOL of them, in `out`).
++ */
++static unsigned pvr_rt_pool_expire(const struct pvr_device *device,
++                                   bool all,
++                                   struct pvr_rt_dataset **out)
++{
++   const int64_t now = os_time_get_nano();
++   unsigned count = 0;
++
++   for (unsigned i = 0; i < PVR_RT_POOL; i++) {
++      struct pvr_rt_dataset *const rt_dataset = pvr_rt_pool[i].rt_dataset;
++
++      if (!rt_dataset)
++         continue;
++
++      if (all ? rt_dataset->device == device
++              : now - pvr_rt_pool[i].since > PVR_RT_POOL_NS) {
++         out[count++] = rt_dataset;
++         pvr_rt_pool[i].rt_dataset = NULL;
++      }
++   }
++
++   return count;
++}
++
++struct pvr_rt_dataset *pvr_rt_dataset_pool_take(const struct pvr_device *device,
++                                                uint32_t width,
++                                                uint32_t height,
++                                                uint32_t samples,
++                                                uint32_t layers)
++{
++   struct pvr_rt_dataset *found = NULL;
++
++   simple_mtx_lock(&pvr_rt_pool_mtx);
++   for (unsigned i = 0; i < PVR_RT_POOL && !found; i++) {
++      struct pvr_rt_dataset *const rt_dataset = pvr_rt_pool[i].rt_dataset;
++
++      if (rt_dataset && rt_dataset->device == device &&
++          rt_dataset->width == width && rt_dataset->height == height &&
++          rt_dataset->samples == samples && rt_dataset->layers == layers) {
++         found = rt_dataset;
++         pvr_rt_pool[i].rt_dataset = NULL;
++      }
++   }
++   simple_mtx_unlock(&pvr_rt_pool_mtx);
++
++   return found;
++}
++
++void pvr_rt_dataset_pool_drain(const struct pvr_device *device)
++{
++   struct pvr_rt_dataset *gone[PVR_RT_POOL];
++   unsigned count;
++
++   simple_mtx_lock(&pvr_rt_pool_mtx);
++   count = pvr_rt_pool_expire(device, true, gone);
++   simple_mtx_unlock(&pvr_rt_pool_mtx);
++
++   for (unsigned i = 0; i < count; i++)
++      pvr_rt_dataset_destroy_now(gone[i]);
++}
++
+ void pvr_render_target_dataset_destroy(struct pvr_rt_dataset *rt_dataset)
+ {
++#ifdef __APPLE__
++   struct pvr_rt_dataset *gone[PVR_RT_POOL + 1];
++   unsigned count, oldest = 0;
++   int slot = -1;
++
++   simple_mtx_lock(&pvr_rt_pool_mtx);
++   count = pvr_rt_pool_expire(rt_dataset->device, false, gone);
++   for (unsigned i = 0; i < PVR_RT_POOL; i++) {
++      if (!pvr_rt_pool[i].rt_dataset) {
++         slot = i;
++         break;
++      }
++
++      if (pvr_rt_pool[i].since < pvr_rt_pool[oldest].since)
++         oldest = i;
++   }
++
++   if (slot < 0) {
++      gone[count++] = pvr_rt_pool[oldest].rt_dataset;
++      slot = oldest;
++   }
++
++   pvr_rt_pool[slot].rt_dataset = rt_dataset;
++   pvr_rt_pool[slot].since = os_time_get_nano();
++   simple_mtx_unlock(&pvr_rt_pool_mtx);
++
++   for (unsigned i = 0; i < count; i++)
++      pvr_rt_dataset_destroy_now(gone[i]);
++#else
++   pvr_rt_dataset_destroy_now(rt_dataset);
++#endif
++}
++
++static void pvr_rt_dataset_destroy_now(struct pvr_rt_dataset *rt_dataset)
++{
+    struct pvr_device *device = rt_dataset->device;
+ 
+    device->ws->ops->render_target_dataset_destroy(rt_dataset->ws_rt_dataset);
+--- a/src/imagination/vulkan/pvr_rt_dataset.h
++++ b/src/imagination/vulkan/pvr_rt_dataset.h
+@@ -69,6 +69,13 @@
+ void pvr_rt_vheap_rtc_data_fini(struct pvr_rt_dataset *rt_dataset);
+ 
+ void pvr_render_target_dataset_destroy(struct pvr_rt_dataset *rt_dataset);
++/* (Darwin on redwood: see pvr_rt_dataset.c) */
++struct pvr_rt_dataset *pvr_rt_dataset_pool_take(const struct pvr_device *device,
++                                                uint32_t width,
++                                                uint32_t height,
++                                                uint32_t samples,
++                                                uint32_t layers);
++void pvr_rt_dataset_pool_drain(const struct pvr_device *device);
+ 
+ static inline void
+ pvr_render_targets_datasets_destroy(struct pvr_render_target *render_target)
+--- a/src/imagination/vulkan/pvr_device.c
++++ b/src/imagination/vulkan/pvr_device.c
+@@ -156,11 +156,49 @@
+    return result;
+ }
+ 
++#ifdef __APPLE__
++/* Darwin on redwood: how many render passes are begun -- each makes a render state of its own, and
++ * with it the render target's data in the kernel -- and how many of those states there are at a
++ * time, said every ten seconds as a line the kernel keeps (kern.redwood.say, "!" first): states
++ * that are made and not given back are what makes every frame slower than the last.
++ */
++#include "util/os_time.h"
++extern int sysctlbyname(const char *, void *, size_t *, void *, size_t);
++static uint32_t rstates_begun, rstates_live, rstates_most;
++static int64_t rstates_said;
++
++static void pvr_rstates_say(int change)
++{
++   const int64_t now = os_time_get_nano();
++   char line[200];
++
++   rstates_live += change;
++   rstates_begun += change > 0;
++   rstates_most = MAX2(rstates_most, rstates_live);
++   if (!rstates_said)
++      rstates_said = now;
++   if (now - rstates_said < 10000000000ll)
++      return;
++
++   snprintf(line, sizeof(line),
++            "!MESA: pvr: 10 s: %u render passes begun, each with a render state of its own; "
++            "%u such states now, %u at most",
++            rstates_begun, rstates_live, rstates_most);
++   sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
++   rstates_begun = 0;
++   rstates_most = rstates_live;
++   rstates_said = now;
++}
++#endif
++
+ void pvr_rstate_entry_add(struct pvr_device *device,
+                           struct pvr_render_state *rstate)
+ {
+    simple_mtx_lock(&device->rs_mtx);
+    list_addtail(&rstate->link, &device->render_states);
++#ifdef __APPLE__
++   pvr_rstates_say(1);
++#endif
+    simple_mtx_unlock(&device->rs_mtx);
+ }
+ 
+@@ -181,6 +219,9 @@
+       list_del(&entry->link);
+ 
+       vk_free(&device->vk.alloc, entry);
++#ifdef __APPLE__
++      pvr_rstates_say(-1);
++#endif
+    }
+ 
+    simple_mtx_unlock(&device->rs_mtx);
+@@ -282,7 +323,9 @@
+        *
+        * If the import fails, we leave the file descriptor open.
+        */
++#ifndef __APPLE__ /* Darwin on redwood: the "descriptor" is an IOSurface's ID (src/redwood-drm) */
+       close(fd_info->fd);
++#endif
+    } else {
+       /* Align physical allocations to the page size of the heap that will be
+        * used when binding device memory (see pvr_bind_memory()) to ensure the
+--- a/src/imagination/vulkan/winsys/powervr/pvr_drm.c
++++ b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
+@@ -627,6 +627,17 @@
+          static_data_descriptions[i].total_size;
+       winsys_heaps[i]->page_size = 1 << array[i].page_size_log2;
+       winsys_heaps[i]->log2_page_size = array[i].page_size_log2;
++
++      /* Darwin on redwood: the GPU's pages are 4 KiB and this system's 16 KiB (Linux makes the
++       * two the same). A buffer is whole pages of the system's, and the driver takes all of a
++       * buffer to be mapped for the GPU (the control stream's 4096-byte buffers, pvr_arch_csb.c;
++       * the suballocators, pvr_bo.c): so the heaps are dealt out in the system's pages, each of
++       * them four of the GPU's.
++       */
++      if (winsys_heaps[i]->page_size < drm_ws->base.page_size) {
++         winsys_heaps[i]->page_size = drm_ws->base.page_size;
++         winsys_heaps[i]->log2_page_size = drm_ws->base.log2_page_size;
++      }
+ 
+       /* For now we don't support the heap page size being different from the
+        * host page size.
+@@ -706,6 +717,15 @@
+    drm_ws->base.syncobj_type = vk_drm_syncobj_get_type(render_fd);
+    drm_ws->base.sync_types[0] = &drm_ws->base.syncobj_type;
+    drm_ws->base.sync_types[1] = NULL;
++   /* Darwin on redwood: the kernel's syncobjs are not timelines (DRM_CAP_SYNCOBJ_TIMELINE 0), so
++    * the timelines of Vulkan's semaphores are kept here, as the pvrsrvkm winsys keeps them.
++    */
++   if (!(drm_ws->base.syncobj_type.features & VK_SYNC_FEATURE_TIMELINE)) {
++      drm_ws->base.timeline_syncobj_type =
++         vk_sync_timeline_get_type(&drm_ws->base.syncobj_type);
++      drm_ws->base.sync_types[1] = &drm_ws->base.timeline_syncobj_type.sync;
++      drm_ws->base.sync_types[2] = NULL;
++   }
+ 
+    err = u_rwlock_init(&drm_ws->dmabuf_bo_lock);
+    if (err) {
+--- a/src/imagination/vulkan/winsys/powervr/pvr_drm_job_null.c
++++ b/src/imagination/vulkan/winsys/powervr/pvr_drm_job_null.c
+@@ -92,6 +92,16 @@
+                                vk_sync_as_drm_syncobj(src_sync)->syncobj,
+                                waits[i].wait_value,
+                                0);
++#ifdef __APPLE__
++      /* Darwin on redwood: the kernel joins fences in the temporary syncobj as Linux does in a
++       * timeline's points, but only so many (E2BIG): then this one is waited for here instead.
++       */
++      if (ret && errno == E2BIG) {
++         uint32_t wait_handle = vk_sync_as_drm_syncobj(src_sync)->syncobj;
++
++         ret = drmSyncobjWait(drm_ws->base.render_fd, &wait_handle, 1, INT64_MAX, 0, NULL);
++      }
++#endif
+       if (ret) {
+          result =
+             vk_errorf(NULL,

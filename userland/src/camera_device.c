@@ -31,6 +31,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
+#include <notify.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
@@ -47,6 +48,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 #include "camera_isp.h"
@@ -124,7 +126,8 @@ say_bt(const char *what)
 	int k, used;
 	uintptr_t slide = redwood_cache_slide();
 
-	if (said++ >= 120) {
+	/* only in a CAM_TRACE build: ~40 KB a camera start, a third of what pstore keeps of a run's end (tools/r1-auto.sh) */
+	if (!CAM_TRACE || said++ >= 120) {
 		return;
 	}
 	k = backtrace(frames, 40);
@@ -617,6 +620,22 @@ static CMBaseClassID (*device_class_id)(void);
 static CMBaseClassID (*stream_class_id)(void);
 static CMBaseClassID (*session_class_id)(void);     /* FigCaptureISPProcessingSessionGetClassID */
 static CFStringRef port_back;           /* kFigCapturePortType_BackFacingCamera */
+static CFStringRef port_front;          /* kFigCapturePortType_FrontFacingCamera (r1cam_flip=1) */
+
+/* a number from the kernel's boot-args ("name=N"), or otherwise (its sandbox may not let it read them) */
+static long
+bootarg_number(const char *name, long otherwise)
+{
+	char args[1024] = " ", key[40];
+	size_t size = sizeof(args) - 2;
+	const char *at;
+
+	snprintf(key, sizeof(key), " %s=", name);
+	if (sysctlbyname("kern.bootargs", args + 1, &size, NULL, 0) != 0 || (at = strstr(args, key)) == NULL) {
+		return otherwise;
+	}
+	return strtol(at + strlen(key), NULL, 0);
+}
 
 static bool
 find_functions(void)
@@ -630,6 +649,8 @@ find_functions(void)
 	session_class_id = dlsym(RTLD_DEFAULT, "FigCaptureISPProcessingSessionGetClassID");
 	port = dlsym(RTLD_DEFAULT, "kFigCapturePortType_BackFacingCamera");
 	port_back = port != NULL ? *port : NULL;
+	port = dlsym(RTLD_DEFAULT, "kFigCapturePortType_FrontFacingCamera");
+	port_front = port != NULL ? *port : NULL;
 	if (derived_create == NULL || derived_storage == NULL || device_class_id == NULL || stream_class_id == NULL || port_back == NULL) {
 		say("CoreMedia's or CMCapture's functions are not there: no camera");
 		return false;
@@ -870,6 +891,9 @@ struct output {
 	int             pool_width, pool_height;
 	uint32_t        pool_format;
 	uint64_t        delivered;
+	unsigned        pictures;               /* (the worker's ten-second line) given since, and the time that took */
+	uint64_t        render_ns;
+	uint64_t        isp_ns, handler_ns;     /* (of render_ns: the ISP's pieces; the graph's handler) */
 };
 
 #define OUTPUTS 3
@@ -888,6 +912,7 @@ struct stream {
 	volatile bool   delivering;             /* the capture graph has called Start: pictures may go to its handlers (before that its nodes are not all there: a crash) */
 	int             torch;
 	uint64_t        frames;
+	bool            front;                  /* the front camera's stream (r1cam_flip=1): the motor turns to it before its frames */
 };
 
 static struct stream *
@@ -916,7 +941,15 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 	(void)allocator;
 	trace_key("stream get", key);
 	if (key_is(key, "PortType")) {
-		value = CFRetain(port_back);
+		value = CFRetain(s->front ? port_front : port_back);
+	} else if (s->front && key_is(key, "ModuleInfo")) {
+		/* D22/CameraSetup.plist's PortTypeFront: sensor 0x0354, FocalLengthCharacterization { LensID [1, 2, 5], scheme 1 } (no actuator or integrator) */
+		CFMutableDictionaryRef info = (CFMutableDictionaryRef)new_dict();
+
+		put(info, "sensorID", number_i(0x354));
+		put(info, "ModuleLensID", number_i(1));
+		put(info, "ModuleIDSchemeVersion", number_i(1));
+		value = info;
 	} else if (key_is(key, "ModuleInfo")) {
 		/* what FigCaptureCameraParameters reads (+sensorIDStringFromModuleInfo: formats ["sensorID"] as "0x%04x") to find the tuning data of the sensor in
 		 * D22/CameraSetup.plist: the iPhone X's back camera, 0x0343. Without it the graph has no sensor ID dictionary and BWVISNode refuses to be made. */
@@ -932,9 +965,10 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 		put(info, "ModuleIDSchemeVersion", number_i(1));
 		value = info;
 	} else if (key_is(key, "UniqueID") || key_is(key, "ModelID")) {
-		value = CFRetain(CFSTR("com.apple.avfoundation.avcapturedevice.built-in_video:0"));
+		value = CFRetain(s->front ? CFSTR("com.apple.avfoundation.avcapturedevice.built-in_video:1") :
+		    CFSTR("com.apple.avfoundation.avcapturedevice.built-in_video:0"));
 	} else if (key_is(key, "NonLocalizedName") || key_is(key, "LocalizedName")) {
-		value = CFRetain(CFSTR("Back Camera"));
+		value = CFRetain(s->front ? CFSTR("Front Camera") : CFSTR("Back Camera"));
 	} else if (key_is(key, "Manufacturer")) {
 		value = CFRetain(CFSTR("Apple Inc."));
 	} else if (key_is(key, "SupportedFormatsArray")) {
@@ -1288,7 +1322,14 @@ have_buffer:
 
 	struct render_job job = { isp, f, raw, pb, pf, (uint32_t)width, (uint32_t)height, 8 };
 
-	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
+	/*
+	 * (QOS_CLASS_DEFAULT, not USER_INTERACTIVE: the software ISP takes whatever the cores have, and above the default it left the window
+	 * server's GL threads -- Mesa's, at the default -- waiting tens of ms to run: camgl2, pvr "done to waiter woken" 64 ms in the middle)
+	 */
+	uint64_t isp_began = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+
+	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), &job, render_piece);
+	out->isp_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - isp_began;
 	if (pf != PF_BGRA && CAM_MARK) {
 		/* a bright square in the corner of every picture handed out: a dark scene is then told from frames that are not shown (CAM_MARK=1, a diagnosis) */
 		uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
@@ -1316,15 +1357,204 @@ have_buffer:
 	CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
 	CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
 	    kCVAttachmentMode_ShouldPropagate);
+	if (out == &s->out[2]) {
+		/* the StillImage output's: stream_add_attachments() tells them by this, not by size (the preview's PrimaryScaler can be 4032x3024 too) */
+		CVBufferSetAttachment(pb, CFSTR("RedwoodStillImage"), kCFBooleanTrue, kCVAttachmentMode_ShouldNotPropagate);
+	}
 
 	CMTime pts = CMClockMakeHostTimeFromSystemUnits(f->time);
 
+	uint64_t handler_began = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+
 	((pixel_buffer_handler)out->handler)(pb, pts);
+	out->handler_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - handler_began;
+	if (out == &s->out[0] && out->delivered >= 100 && out->delivered < 3000) {
+		say("cam: pic %u given %llu us", (unsigned)out->delivered, (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000));
+	}
 	CVPixelBufferRelease(pb);
 	if (out->delivered++ == 0) {
 		say("%s: the first picture given (%dx%d)", out->name, width, height);
 	}
 }
+
+/*
+ * A photo without the capture graph's still pipeline (which stops in BWGNRNode and has no HEVC encoder here: docs/camera-x6826b.md, runs 579-600): when
+ * Camera.app's shutter is tapped, our library inside the app (inject_media.c, only where etc/inject.conf names Camera) counts the tap in the notify state
+ * of REDWOOD_STILL_ASK (1, 2, 3...) and posts it. The worker owes a still for every count it has not served (one a frame, so taps that come together are
+ * not lost to the notification's coalescing); for each it copies the frame and goes on with the preview, and the copy is made a picture of the sensor's
+ * size and written as a JPEG (ImageIO's own encoder) on a queue of its own, to REDWOOD_STILL_FILE with the tap's number in it. The count it has written is
+ * then the notify state of REDWOOD_STILL_DONE, posted (written or not: the app says which), and the app gives the file to the photo library.
+ */
+#define REDWOOD_STILL_ASK       "redwood.camera.still"
+#define REDWOOD_STILL_DONE      "redwood.camera.still.done"
+#define REDWOOD_STILL_FILE      "/private/var/tmp/redwood-still-%llu.jpg"     /* the tap's number */
+#define REDWOOD_STILL_ORIGINAL  "/private/var/redwood-still-original"   /* (inject_media.c: the shutter also asks the capture graph's own still) */
+
+/* (CoreGraphics and ImageIO by name, when a photo is asked for: the library is not linked with them, and nothing else here wants them) */
+static void *
+still_symbol(const char *framework, const char *name)
+{
+	char path[160];
+
+	snprintf(path, sizeof(path), "/System/Library/Frameworks/%s.framework/%s", framework, framework);
+	(void)dlopen(path, RTLD_NOW);
+	return dlsym(RTLD_DEFAULT, name);
+}
+
+/* a still waiting for its JPEG: the tap's number, when it was asked, the ISP's settings of that moment, and the frame (header and RAW) */
+struct still_job {
+	uint64_t        tap, asked;
+	struct isp      isp;
+	uint8_t         frame[];
+};
+
+/* the count served (written or not), as REDWOOD_STILL_DONE's state: only ever from the still queue, so that it only goes up */
+static void
+still_done(uint64_t tap)
+{
+	static int done_token = -1;
+
+	if (done_token < 0) {
+		(void)notify_register_check(REDWOOD_STILL_DONE, &done_token);
+	}
+	(void)notify_set_state(done_token, tap);
+	notify_post(REDWOOD_STILL_DONE);
+}
+
+/*
+ * The stills' queue. USER_INITIATED, above the preview's ISP (DEFAULT): at UTILITY, with the preview's dispatch_apply and the compositor on all
+ * four cores, the first still of each mediaserverd took ~20 s (combo2: taps 1 and 6, 21023 and 19200 ms) against 1.1-1.5 s with nothing else
+ * running; the preview loses a second of pictures to a tap instead.
+ */
+static dispatch_queue_t
+still_dq(void)
+{
+	static dispatch_once_t once;
+	static dispatch_queue_t queue;
+
+	dispatch_once(&once, ^{
+		queue = dispatch_queue_create("redwood.camera.still", dispatch_queue_attr_make_with_qos_class(
+		    dispatch_queue_attr_make_with_autorelease_frequency(DISPATCH_QUEUE_SERIAL, DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM), QOS_CLASS_USER_INITIATED, 0));
+	});
+	return queue;
+}
+
+/* taps after `from` up to `to` that get no still: said (kept for the host) and served as such, after the stills queued before them */
+static void
+still_skip(uint64_t from, uint64_t to, const char *why)
+{
+	dispatch_async(still_dq(), ^{
+		char line[200];
+
+		if (to == from + 1) {
+			snprintf(line, sizeof(line), "still: tap %llu: NO STILL: %s", to, why);
+		} else {
+			snprintf(line, sizeof(line), "still: taps %llu to %llu: NO STILL: %s", from + 1, to, why);
+		}
+		say("%s", line);
+		(void)sysctlbyname("kern.redwood.host_keep", NULL, NULL, line, strlen(line));
+		still_done(to);
+	});
+}
+
+static void
+still_save(struct still_job *job)
+{
+	uint64_t t[5] = { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) };   /* began, symbols, ISP, CGImage, JPEG written */
+	void *(*space_create)(CFStringRef) = still_symbol("CoreGraphics", "CGColorSpaceCreateWithName");
+	void *(*context_create)(void *, size_t, size_t, size_t, size_t, void *, uint32_t) = still_symbol("CoreGraphics", "CGBitmapContextCreate");
+	void *(*context_image)(void *) = still_symbol("CoreGraphics", "CGBitmapContextCreateImage");
+	CFStringRef *srgb = still_symbol("CoreGraphics", "kCGColorSpaceSRGB");
+	void *(*file_create)(CFURLRef, CFStringRef, size_t, CFDictionaryRef) = still_symbol("ImageIO", "CGImageDestinationCreateWithURL");
+	void (*file_add)(void *, void *, CFDictionaryRef) = still_symbol("ImageIO", "CGImageDestinationAddImage");
+	bool (*file_finalize)(void *) = still_symbol("ImageIO", "CGImageDestinationFinalize");
+	const struct redwood_camera_frame *f = (const void *)job->frame;
+	size_t width = f->width, height = f->height, stride = width * 4;
+	uint8_t *bgra = NULL;
+	void *space = NULL, *context = NULL, *image = NULL, *file = NULL;
+	char path[64], part[72], line[300];
+	CFURLRef url;
+	bool ok = false, have = space_create && context_create && context_image && srgb && file_create && file_add && file_finalize;
+
+	t[1] = t[2] = t[3] = t[4] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	snprintf(path, sizeof(path), REDWOOD_STILL_FILE, job->tap);
+	snprintf(part, sizeof(part), "%s.part", path);      /* written under another name and renamed: the app never sees half a file */
+	url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)part, (CFIndex)strlen(part), false);
+	if (have) {
+		bgra = malloc(stride * height);
+		space = space_create(*srgb);
+		/* 8 bits a part, blue first, the fourth byte not used: kCGImageAlphaNoneSkipFirst (6) | kCGBitmapByteOrder32Little (2 << 12) */
+		context = bgra && space ? context_create(bgra, width, height, 8, stride, space, 6u | (2u << 12)) : NULL;
+		if (context != NULL) {
+			isp_render_bgra(&job->isp, f, job->frame + f->header_bytes, bgra, stride, (uint32_t)width, (uint32_t)height, 0, (uint32_t)height);
+			t[2] = t[3] = t[4] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+			image = context_image(context);
+			t[3] = t[4] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+		}
+		if (image != NULL && (file = file_create(url, CFSTR("public.jpeg"), 1, NULL)) != NULL) {
+			file_add(file, image, NULL);
+			ok = file_finalize(file) && rename(part, path) == 0;
+			t[4] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+		}
+	}
+	/* (the queue's wait: asked to began; the time "in" split as symbols (dlopen), ISP, CGImage, JPEG (ImageIO's create/add/finalize and the rename)) */
+	snprintf(line, sizeof(line), "still: tap %llu: frame %llu, %zux%zu: %s in %llu ms (%llu ms after the tap reached the camera; waited %llu, symbols %llu, "
+	    "ISP %llu, CGImage %llu, JPEG %llu ms)%s", job->tap, f->sequence,
+	    width, height, ok ? "WRITTEN" : !have ? "NO CoreGraphics / ImageIO" : !bgra ? "NO MEMORY" : !image ? "NO IMAGE" :
+	    !file ? "NO JPEG DESTINATION (ImageIO)" : "THE JPEG WAS NOT WRITTEN", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t[0]) / 1000000,
+	    (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - job->asked) / 1000000, (t[0] - job->asked) / 1000000, (t[1] - t[0]) / 1000000,
+	    (t[2] - t[1]) / 1000000, (t[3] - t[2]) / 1000000, (t[4] - t[3]) / 1000000, job->tap == 0 ? ": the warm-up, no tap's" : "");
+	say("%s", line);
+	(void)sysctlbyname("kern.redwood.host_keep", NULL, NULL, line, strlen(line));
+	for (int i = 0; i < 4; i++) {
+		void *o[4] = { file, image, context, space };
+
+		if (o[i]) {
+			CFRelease(o[i]);
+		}
+	}
+	CFRelease(url);
+	free(bgra);
+	if (!ok) {
+		unlink(part);
+	}
+	if (job->tap == 0) {
+		unlink(path);           /* (the warm-up's: nobody's photo, and no count to say) */
+		return;
+	}
+	/* the count served, written or not (the app looks for the file and says which) */
+	still_done(job->tap);
+}
+
+/*
+ * The worker's part of a still: the frame copied (a few MB, a millisecond or two) and the rest left to a queue of its own (still_dq). Tap 0 is the
+ * warm-up, a still of the stream's first frame in each mediaserverd, thrown away: whatever the first JPEG costs once (dlopen, ImageIO's first
+ * encode) is paid before the shutter is tapped, and its line says how much.
+ */
+static void
+still_queue(const struct isp *isp, const struct redwood_camera_frame *f, size_t bytes, uint64_t tap)
+{
+	struct still_job *job = malloc(sizeof(*job) + bytes);
+
+	say("still: tap %llu asked: frame %llu copied%s", tap, f->sequence, job ? "" : ": NO MEMORY for the copy, this tap has no still");
+	if (job == NULL) {
+		if (tap != 0) {
+			still_skip(tap - 1, tap, "no memory for the frame's copy");
+		}
+		return;
+	}
+	job->tap = tap;
+	job->asked = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	job->isp = *isp;
+	memcpy(job->frame, f, bytes);
+	dispatch_async(still_dq(), ^{
+		still_save(job);
+		free(job);
+	});
+}
+
+static uint64_t still_queued;   /* the last tap this mediaserverd queued a still for, or said it has none (across the stream's workers) */
+static bool still_warmed;
 
 static void *
 worker(void *context)
@@ -1336,16 +1566,104 @@ worker(void *context)
 	struct isp_stats st;
 	uint8_t *buffer = NULL;
 	size_t bytes = 0;
-	int device = open(REDWOOD_CAMERA_DEVICE, O_RDWR), failures = 0;
+	int device = -1, failures = 0;
 
 	pthread_setname_np("redwood-camera");
+	for (int tries = 0; tries < 5 && s->running && (device = open(REDWOOD_CAMERA_DEVICE, O_RDWR)) < 0; tries++) {
+		/* EIO is the kernel's "the camera has had a fault": its own lines (r1cam: / mtkcam: / camera:) say which. Said once, tried for 4 s more. */
+		if (tries == 0) {
+			say("%s does not open (%s)%s: trying for 4 s more", REDWOOD_CAMERA_DEVICE, strerror(errno),
+			    errno == EIO ? ": the kernel's camera driver gave the camera up, see its own lines" : "");
+		}
+		sleep(1);
+	}
+	bool flip = bootarg_number("r1cam_flip", 0) == 1;
+
 	say("worker: running, device fd %d", device);
 	if (device < 0) {
-		say("no %s (%s): no frames", REDWOOD_CAMERA_DEVICE, strerror(errno));
+		say("NO CAMERA: %s (%s): the preview stays black", REDWOOD_CAMERA_DEVICE, strerror(errno));
 		return NULL;
 	}
+	int still_token = -1;
+	uint64_t still_asked = 0, still_served = 0;       /* taps counted by the app (REDWOOD_STILL_ASK's state), and stills queued for them */
+	bool graph_still = access(REDWOOD_STILL_ORIGINAL, F_OK) == 0;
+	/*
+	 * Boot-arg cam_fps=N: preview pictures at most N a second (0: every frame the worker gets to). A picture
+	 * costs the ISP ~130 ms of processor time (fence3: mediaserverd 202% of a core for 15.5 a second) and
+	 * the panel shows ~5-6 a second: the rest starve the window server on four A53s. The frames between are
+	 * still read, measured for the exposure and taken for stills; only the ISP's picture is skipped.
+	 * Its sandbox may not let it read the boot-args: then the default, 10.
+	 */
+	unsigned cam_fps = 10;
+	uint64_t last_picture = 0;
+	{
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "cam_fps=")) != NULL) {
+			cam_fps = (unsigned)strtoul(at + 8, NULL, 10);
+		}
+		say("preview pictures: %s%u a second (boot-arg cam_fps)", cam_fps ? "at most " : "no limit, ", cam_fps);
+	}
+
+	say("the StillImage output: %s", graph_still ? "rendered (" REDWOOD_STILL_ORIGINAL " is there)" : "not rendered (the preview only)");
+	(void)notify_register_check(REDWOOD_STILL_ASK, &still_token);
+	{
+		int first = 0;
+
+		int done_token = -1;
+		uint64_t done = 0, from;
+
+		(void)notify_check(still_token, &first);        /* (the first check always says "changed") */
+		(void)notify_get_state(still_token, &still_asked);
+		/*
+		 * Taps from before this stream are not this stream's, but each is told so: those neither served (REDWOOD_STILL_DONE) nor queued by this
+		 * process. combo2: tap 5's still was owed by the mediaserverd that died (280.155) and the next one took its count for served, so the app
+		 * heard of tap 5 only from tap 6's count, 49 s later, as "No such file".
+		 */
+		(void)notify_register_check(REDWOOD_STILL_DONE, &done_token);
+		(void)notify_get_state(done_token, &done);
+		(void)notify_cancel(done_token);
+		from = done > still_queued ? done : still_queued;
+		if (still_asked > from) {
+			still_skip(from, still_asked, "asked before this stream began (mediaserverd ended, or the stream stopped, before its frame)");
+		}
+		still_queued = still_served = still_asked;
+	}
 	isp_init(&isp);
-	while (s->running && failures < 5) {
+	bool skip = false;
+	if (flip) {
+		/* r1cam_flip=1: the kernel's motor turns to this stream's face before its next session (EBUSY while it moves) */
+		struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->front ? 2 : 1 };
+		static int last_face = -1;      /* per process; r1cam_flip_ms (default 1000): a start on the other face waits this long, and is dropped if its stream stops first */
+
+		if (last_face >= 0 && last_face != (s->front ? 1 : 0)) {
+			long ms = bootarg_number("r1cam_flip_ms", 1000);
+
+			for (long w = 0; w < ms && s->running; w += 50) {
+				usleep(50000);
+			}
+		}
+		skip = !s->running;
+		if (!skip) {
+			last_face = s->front ? 1 : 0;
+		}
+		for (int tries = 0; !skip && tries < 20 && write(device, &c, sizeof(c)) != (ssize_t)sizeof(c) && errno == EBUSY; tries++) {
+			usleep(250000);
+		}
+		isp.rot180 = s->front && bootarg_number("r1cam_front_rot", 2) == 2;
+		if (skip) {
+			say("the %s camera not asked: its stream stopped within r1cam_flip_ms", s->front ? "front" : "back");
+		} else {
+			say("camera: face %d asked (%s) at %llu ms, rot180 %d", s->front ? 2 : 1, s->front ? "front" : "back",
+			    (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000), isp.rot180);
+		}
+	}
+	if (isp_tuning_load(&isp)) {
+		say("this camera's tuning file: its colour matrix%s", isp.lsc.on ? " and lens shading" : "");
+	}
+	while (s->running && !skip && failures < 5) {
 		ssize_t n;
 
 		if (buffer == NULL) {
@@ -1385,6 +1703,24 @@ worker(void *context)
 		}
 		s->frames++;
 		{
+			int changed = 0;
+
+			if (still_token >= 0 && notify_check(still_token, &changed) == NOTIFY_STATUS_OK && changed) {
+				(void)notify_get_state(still_token, &still_asked);
+				if (still_asked < still_served) {
+					still_served = still_asked;     /* (notifyd started again: its count with it) */
+				}
+			}
+			if (!still_warmed) {
+				still_warmed = true;
+				still_queue(&isp, f, bytes, 0);                 /* (the warm-up) */
+			}
+			if (still_served < still_asked) {
+				still_queue(&isp, f, bytes, ++still_served);    /* one a frame: every tap its own still */
+				still_queued = still_served;
+			}
+		}
+		{
 			/* the mark is taken by the first still request (captureStillImageNowWithSettings:, probe_still_errors): what is new after it is what a photo needs */
 			static bool did_a, did_b;
 			static uint64_t armed_at;
@@ -1403,19 +1739,85 @@ worker(void *context)
 			    OUTPUTS > 2 ? s->out[2].enabled : 0, s->out[0].config != NULL, OUTPUTS > 1 ? s->out[1].config != NULL : 0, OUTPUTS > 2 ? s->out[2].config != NULL : 0,
 			    s->delivering);
 		}
+		bool picture = true;
+
+		if (cam_fps != 0) {
+			uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+
+			/* (a frame's worth early still counts, so 30 a second divides evenly: 10 is every third frame) */
+			picture = now - last_picture + 1000000000ull / 60 >= 1000000000ull / cam_fps;
+			last_picture = picture ? now : last_picture;
+		}
 		pthread_mutex_lock(&s->lock);
-		for (int i = 0; i < OUTPUTS; i++) {
+		for (int i = 0; picture && i < OUTPUTS; i++) {
 			struct output *out = &s->out[i];
 
-			if (out->handler != NULL && out->config != NULL && (out->enabled || (i == 0 && s->delivering))) {
+			/*
+			 * The StillImage output (index 2) is the sensor's size made 4032x3024: rendered every frame, it took the worker ~0.65 s a frame, so the
+			 * preview got ~1 picture a second (camgl2: "the frames stopped (49)" after 48 s; shutter2: 27 in 23 s) and every core was busy at
+			 * USER_INTERACTIVE. Nothing takes it now that the shutter does not ask the graph's still (inject_media.c, REDWOOD_STILL_ORIGINAL; our own
+			 * photo is still_save()); rendered again only where that file asks for the graph's still.
+			 */
+			if (i == 2 && !graph_still) {
+				continue;
+			}
+			/*
+			 * Only between the graph's START and STOP (s->delivering): the handler block reaches its BWFigVideoCaptureStream's queue through an
+			 * unretained __block pointer, so after a STOP the graph that set it may be gone. combo2 280.155: SIGSEGV in dispatch_async_f
+			 * (18db2a900) from the handler's invoke (CMCapture 1a1ea6c24, block made at 1a1f185fc) on a queue already freed, a frame read with
+			 * "enabled 1/0/1, delivering 0" (the last session's handler and VideoOutputsEnabled, while the next graph's reservations thrashed).
+			 */
+			if (s->delivering && out->handler != NULL && out->config != NULL && (out->enabled || i == 0)) {
+				uint64_t began = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+
 				deliver(s, out, &isp, f, raw);
+				out->pictures++;
+				out->render_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - began;
 			}
 		}
 		pthread_mutex_unlock(&s->lock);
+		{
+			/* every ten seconds: how many pictures each output got, and what one cost (the preview's rate is this, not the kernel's frames) */
+			static uint64_t since, since_frame, since_cpu_us;
+			uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), cpu_us;
+			struct rusage ru;
+
+			/* (the process's processor time: mediaserverd's, all threads -- the ISP's pieces and the graph's own work on the pictures) */
+			getrusage(RUSAGE_SELF, &ru);
+			cpu_us = (uint64_t)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000000 + (uint64_t)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec);
+			if (since == 0) {
+				since = now;
+				since_frame = f->sequence;
+				since_cpu_us = cpu_us;
+			} else if (now - since >= 10000000000ull) {
+				unsigned n = s->out[0].pictures ? s->out[0].pictures : 1;
+
+				say("10 s: pictures given: %s %u (%llu ms each), %s %u (%llu ms each); kernel frame %llu", s->out[0].name, s->out[0].pictures,
+				    s->out[0].pictures ? s->out[0].render_ns / s->out[0].pictures / 1000000 : 0, s->out[2].name, s->out[2].pictures,
+				    s->out[2].pictures ? s->out[2].render_ns / s->out[2].pictures / 1000000 : 0, f->sequence);
+				/* where a preview picture's time goes, and whether the sensor or the worker sets the rate */
+				say("10 s: %s: ISP %llu.%llu ms, the graph's handler %llu.%llu ms a picture; the sensor %llu.%llu frames a second; "
+				    "mediaserverd's processor time %llu%% of one core", s->out[0].name, s->out[0].isp_ns / n / 1000000,
+				    s->out[0].isp_ns / n / 100000 % 10, s->out[0].handler_ns / n / 1000000, s->out[0].handler_ns / n / 100000 % 10,
+				    (f->sequence - since_frame) * 10000000000ull / (now - since) / 10, (f->sequence - since_frame) * 10000000000ull / (now - since) % 10,
+				    (cpu_us - since_cpu_us) * 100 / ((now - since) / 1000));
+				for (int i = 0; i < OUTPUTS; i++) {
+					s->out[i].pictures = 0;
+					s->out[i].render_ns = s->out[i].isp_ns = s->out[i].handler_ns = 0;
+				}
+				since = now;
+				since_frame = f->sequence;
+				since_cpu_us = cpu_us;
+			}
+		}
 		if (s->frames == 1 || s->frames % 300 == 0) {
 			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black", f->sequence,
 			    f->exposure_lines * (double)f->line_ns / 1e6, (double)f->gain / f->gain_unity, isp.digital, st.mean[1]);
 		}
+	}
+	if (still_token >= 0 && notify_get_state(still_token, &still_asked) == NOTIFY_STATUS_OK && still_asked > still_served) {
+		still_skip(still_served, still_asked, "the stream stopped before its frame");
+		still_queued = still_served = still_asked;
 	}
 	free(buffer);
 	close(device);
@@ -1503,10 +1905,13 @@ stream_add_attachments(CMBaseObjectRef o, CMSampleBufferRef sbuf, CFDictionaryRe
 	}
 	{
 		/* only the full-size pictures (the StillImage output's): the preview's frames crashed the graph with a half-made dictionary (run 598, in
-		 * -[BWFigVideoCaptureDevice captureStream:willEmitVideoSampleBuffer:drivesCameraControls:]: CFDictionaryGetValue of nothing) */
+		 * -[BWFigVideoCaptureDevice captureStream:willEmitVideoSampleBuffer:drivesCameraControls:]: CFDictionaryGetValue of nothing). Told by
+		 * deliver()'s tag, not by width: g1, a 4032x3024 PrimaryScaler preview (with SecondaryScaler) given this dictionary crashed the same way --
+		 * a frame driving camera controls with a sample buffer "MetadataDictionary" goes on (CMCapture 0x1a1ebe5ec) to 0x1a1ee0a84, which reads
+		 * PortType from the pixel buffer's own "MetadataDictionary" (none: CFDictionaryGetValue(NULL)) */
 		CVImageBufferRef image = CMSampleBufferGetImageBuffer(sbuf);
 
-		if (image == NULL || CVPixelBufferGetWidth(image) < 3000) {
+		if (image == NULL || CVBufferGetAttachment(image, CFSTR("RedwoodStillImage"), NULL) == NULL) {
 			return 0;
 		}
 	}
@@ -1583,7 +1988,7 @@ static const struct stream_class stream_derived = { 2, stream_start, stream_stop
 static const struct vtable stream_vtable = { NULL, &stream_base, &stream_derived };
 
 static CMBaseObjectRef
-stream_create(CFAllocatorRef allocator)
+stream_create(CFAllocatorRef allocator, bool front)
 {
 	CMBaseObjectRef o = NULL;
 	struct stream *s;
@@ -1595,6 +2000,7 @@ stream_create(CFAllocatorRef allocator)
 	s = stream_of(o);
 	memset(s, 0, sizeof(*s));
 	pthread_mutex_init(&s->lock, NULL);
+	s->front = front;
 	s->torch = -1;
 	s->min_fps = 2;
 	s->max_fps = 30;
@@ -1604,6 +2010,14 @@ stream_create(CFAllocatorRef allocator)
 
 	/* "Photo" and "Video-60" of D22/AVCaptureSession.plist's back camera */
 	CFDictionaryRef f[2] = { format(4032, 3024, 30, false), format(4224, 2376, 60, false) };
+
+	if (front) {
+		/* ... and "Photo" and "Video-30" of its position 2 entry */
+		CFRelease(f[0]);
+		CFRelease(f[1]);
+		f[0] = format(3088, 2320, 30, false);
+		f[1] = format(3840, 2160, 30, false);
+	}
 
 	s->formats = CFArrayCreate(NULL, (const void **)f, 2, &kCFTypeArrayCallBacks);
 	s->supported = supported(stream_props, sizeof(stream_props) / sizeof(stream_props[0]));
@@ -2092,7 +2506,7 @@ redwood_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, 
 	}
 	install_crash_handler();
 	static bool found, usable;
-	CMBaseObjectRef device = NULL, stream;
+	CMBaseObjectRef device = NULL, stream, front = NULL;
 	struct device *d;
 
 	(void)options;
@@ -2103,8 +2517,11 @@ redwood_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, 
 	if (!usable || out == NULL) {
 		return ERR_UNSUPPORTED;
 	}
-	if ((stream = stream_create(allocator)) == NULL) {
+	if ((stream = stream_create(allocator, false)) == NULL) {
 		return ERR_UNSUPPORTED;
+	}
+	if (bootarg_number("r1cam_flip", 0) == 1 && port_front != NULL) {
+		front = stream_create(allocator, true);
 	}
 	if (derived_create(allocator, &device_vtable, device_class_id(), &device) != 0 || device == NULL) {
 		CFRelease(stream);
@@ -2113,11 +2530,18 @@ redwood_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, 
 	}
 	d = derived_storage(device);
 	memset(d, 0, sizeof(*d));
-	d->streams = CFArrayCreate(NULL, (const void **)&stream, 1, &kCFTypeArrayCallBacks);
+	{
+		CFTypeRef both[2] = { stream, front };
+
+		d->streams = CFArrayCreate(NULL, (const void **)both, front != NULL ? 2 : 1, &kCFTypeArrayCallBacks);
+	}
 	d->supported = supported(device_props, sizeof(device_props) / sizeof(device_props[0]));
 	CFRelease(stream);
+	if (front != NULL) {
+		CFRelease(front);
+	}
 	*out = device;
-	say("the device made: one stream, the back camera");
+	say("the device made: %s", front != NULL ? "two streams, the back camera and the front camera (r1cam_flip=1)" : "one stream, the back camera");
 	return 0;
 }
 

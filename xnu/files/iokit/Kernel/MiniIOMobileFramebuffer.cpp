@@ -153,6 +153,15 @@ static TUNABLE(uint32_t, gFBXR, "fbxr", 0);
 #define kFBXRPointsWide         414
 #define kFBXRPointsHigh         896
 #define kFBXRSubtype            1792
+/*
+ * Boot-arg fbaspect=1: the iPhone's width in points (375, or the XR's 414 with fbxr=1) but the
+ * panel's own proportions -- on the r1's 480 x 640, 375 x 500 points, 750 x 1000 pixels at the
+ * default two a point -- so the picture fills the panel without being squashed. The width is kept
+ * because UIKit picks keyboards, widget sizes and the status bar by it; only the height is one no
+ * iPhone has. The screen class (artwork-device-subtype) stays the iPhone X's (or the XR's), so the
+ * home indicator and its gestures stay. Touches need nothing: they are fractions of the panel.
+ */
+static TUNABLE(uint32_t, gFBAspect, "fbaspect", 0);
 /* Boot-arg fbtrace=N: log the first N calls of every selector (default 3). */
 static TUNABLE(uint32_t, gFBTrace, "fbtrace", 3);
 /*
@@ -261,6 +270,84 @@ refreshHz(void)
 {
 	return gRefreshHz >= 1 && gRefreshHz <= 240 ? gRefreshHz : kFBRefreshHz;
 }
+/*
+ * fb_rdma=1: the panel's own frame rate, read off DISP_RDMA0's frame-end bit (INT_STATUS +0x04 bit 2),
+ * in place of the 60 Hz software timer. gPanelNs is 0 (today's timer) unless the bit was seen to move.
+ */
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+static TUNABLE(uint32_t, gRdma, "fb_rdma", 0);
+static TUNABLE(uint32_t, gSwapLog, "fb_swaplog", 0);   /* fb_swaplog=S: 60 swaps' ids, surfaces, layers from S s of uptime on (what are 59 swaps a second?) */
+#define RDMA0_BASE      0x1400d000ULL
+#define RDMA_INT_STATUS 0x04
+#define RDMA_FRAME_END  (1u << 2)
+static volatile uint32_t * gRdmaRegs;
+static uint64_t gPanelNs;
+
+/* the probe's one line, kept to be said again with the 5 s statistics: the boot log's start does not survive */
+static char gProbeLine[200];
+#define PROBE_LOG(...) do { snprintf(gProbeLine, sizeof(gProbeLine), __VA_ARGS__); IOLog("%s", gProbeLine); } while (0)
+
+static void
+panelProbe(void)
+{
+	static bool done;
+	uint64_t t0, t, last = 0, sum = 0, absolute;
+	uint32_t seen = 0, us;
+
+	if (done || !gRdma) {
+		return;
+	}
+	done = true;
+	volatile uint32_t * r = (volatile uint32_t *) ml_io_map(RDMA0_BASE, PAGE_SIZE);
+	if (r == NULL) {
+		PROBE_LOG("MiniIOMobileFramebuffer: RDMA0 could not be mapped: the timer beat stays\n");
+		return;
+	}
+	r[RDMA_INT_STATUS / 4] = ~RDMA_FRAME_END;
+	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &absolute);
+	t0 = mach_absolute_time();
+	while (!(r[RDMA_INT_STATUS / 4] & RDMA_FRAME_END) && mach_absolute_time() - t0 < absolute) {
+	}
+	if (!(r[RDMA_INT_STATUS / 4] & RDMA_FRAME_END)) {
+		PROBE_LOG("MiniIOMobileFramebuffer: RDMA0 INT_STATUS %#x does not move: the timer beat stays "
+		    "(INT_ENABLE %#x GLOBAL_CON %#x)\n", r[RDMA_INT_STATUS / 4], r[0], r[0x10 / 4]);
+		return;
+	}
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &absolute);
+	for (t0 = mach_absolute_time(); seen < 31 && mach_absolute_time() - t0 < absolute;) {
+		r[RDMA_INT_STATUS / 4] = ~RDMA_FRAME_END;
+		while (!(r[RDMA_INT_STATUS / 4] & RDMA_FRAME_END) && mach_absolute_time() - t0 < absolute) {
+		}
+		t = mach_absolute_time();
+		if (last != 0) {
+			sum += t - last;
+			seen++;
+		}
+		last = t;
+	}
+	if (seen < 30) {
+		PROBE_LOG("MiniIOMobileFramebuffer: RDMA0 frame end seen only %u times in a second: the timer beat stays\n", seen);
+		return;
+	}
+	absolutetime_to_nanoseconds(sum / seen, &gPanelNs);
+	us = (uint32_t) (gPanelNs / 1000);
+	PROBE_LOG("MiniIOMobileFramebuffer: panel frame every %u us (%u.%02u Hz), RDMA0\n", us,
+	    (uint32_t) (1000000 / us), (uint32_t) ((100000000ULL / us) % 100));
+	gRdmaRegs = r;
+}
+
+/* the one place the refresh period is made: the panel's, if measured, else the timer's 1/refreshHz() */
+static inline uint64_t
+framePeriodNs(void)
+{
+	return gPanelNs ? gPanelNs : NSEC_PER_SEC / refreshHz();
+}
+static inline uint32_t
+frameRate16(void)
+{
+	return gPanelNs ? (uint32_t) (((uint64_t) NSEC_PER_SEC << 16) / gPanelNs) : refreshHz() << 16;
+}
+
 static inline uint32_t
 recStep(void)
 {
@@ -429,7 +516,8 @@ IOMobileFramebuffer::publishModes(void)
 	OSDictionary * color = OSDictionary::withCapacity(8);
 	OSArray * timings = OSArray::withCapacity(1);
 	OSArray * colors = OSArray::withCapacity(1);
-	const uint32_t rate = refreshHz() << 16;                /* 16.16 fixed point */
+	panelProbe();
+	const uint32_t rate = frameRate16();                /* 16.16 fixed point */
 
 	if (timing == NULL || horizontal == NULL || vertical == NULL || color == NULL || timings == NULL || colors == NULL) {
 		return;
@@ -581,12 +669,13 @@ IOMobileFramebuffer::start(IOService * provider)
 		    fit, fPanelHeight, (fPanelHeight - fit) / 2);
 		fPanelHeight = fit;
 	}
-	if (gFBScale != 0 && gFBScale != kFBDefaultScale) {
+	if (gFBAspect || (gFBScale != 0 && gFBScale != kFBDefaultScale)) {
 		static const char * const places[][2] = { { "/chosen", "display-scale" }, { "/product", "artwork-scale-factor" } };
-		uint32_t scale = gFBScale;
+		uint32_t scale = gFBScale ? gFBScale : 2;
+		uint32_t wide = gFBXR ? kFBXRPointsWide : kFBPointsWide;
 
-		fWidth = (gFBXR ? kFBXRPointsWide : kFBPointsWide) * scale;
-		fHeight = (gFBXR ? kFBXRPointsHigh : kFBPointsHigh) * scale;
+		fWidth = wide * scale;
+		fHeight = (gFBAspect ? (wide * vinfo.v_height + vinfo.v_width / 2) / vinfo.v_width : (gFBXR ? kFBXRPointsHigh : kFBPointsHigh)) * scale;
 		if (gFBXR) {
 			IORegistryEntry * product = IORegistryEntry::fromPath("/product", gIODTPlane);
 			uint32_t subtype = kFBXRSubtype;
@@ -1244,7 +1333,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	gLiveFB = this;
 
 	/* (a frame that is late on the panel was late here already, or it was not: for telling whose it is) */
-	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz() * 5 / 4, &period);
+	nanoseconds_to_absolutetime(framePeriodNs() * 5 / 4, &period);
 	nanoseconds_to_absolutetime(FRAME_PAUSE * NSEC_PER_MSEC, &pause);
 	clock_interval_to_deadline(SWAP_HELD_MS, kMillisecondScale, &deadline);
 	if (gTouchLat) {
@@ -1332,7 +1421,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (gOnTheBeat) {
 		uint64_t period, aim, next;
 
-		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
+		nanoseconds_to_absolutetime(framePeriodNs(), &period);
 		aim = period * 3 / 8;
 		next = fReady;
 		fReady = began;
@@ -1346,7 +1435,21 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			} else {
 				next += (aim - (next - began)) / 8;
 			}
-			clock_delay_until(next);
+			if (gRdmaRegs != NULL) {
+				uint64_t margin, give;
+
+				nanoseconds_to_absolutetime(3 * NSEC_PER_MSEC, &margin);
+				if (next > margin) {
+					clock_delay_until(next - margin);
+				}
+				gRdmaRegs[RDMA_INT_STATUS / 4] = ~RDMA_FRAME_END;
+				give = mach_absolute_time() + period;
+				while (!(gRdmaRegs[RDMA_INT_STATUS / 4] & RDMA_FRAME_END) && mach_absolute_time() < give) {
+				}
+				next = mach_absolute_time();
+			} else {
+				clock_delay_until(next);
+			}
 			fBeat = next;
 			fStatOnBeat++;
 			fStatBeatWait += mach_absolute_time() - began;
@@ -1367,6 +1470,16 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fLastFrame = began;
 	report = fSwapsShown < 8;
+	if (gSwapLog) {
+		static unsigned logged;
+		uint64_t up;
+
+		absolutetime_to_nanoseconds(mach_absolute_time(), &up);
+		if (up / NSEC_PER_SEC >= gSwapLog && logged < 60) {
+			logged++;
+			report = true;
+		}
+	}
 	if (report) {
 		IOLog("MiniIOMobileFramebuffer: swap %u (#%u): surfaces %u %u %u %u, layers set 0x%x cleared 0x%x\n",
 		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
@@ -1468,6 +1581,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	absolutetime_to_nanoseconds(mach_absolute_time() - fStatSince, &nanos);
 	if (nanos >= 5 * NSEC_PER_SEC) {
 		uint64_t drawing, waiting, beat;
+		if (gProbeLine[0]) {
+			IOLog("%s", gProbeLine);
+		}
 		unsigned different;
 
 		absolutetime_to_nanoseconds(fStatDrawing, &drawing);
@@ -1686,7 +1802,7 @@ IOMobileFramebufferUserClient::armVSync(void)
 	uint64_t period, now = mach_absolute_time();
 
 	/* one refresh after the last, not after whenever we got round to this: the rate does not drift */
-	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
+	nanoseconds_to_absolutetime(framePeriodNs(), &period);
 	fVSyncTime += period;
 	if (fVSyncTime <= now || fVSyncTime > now + 2 * period) {
 		fVSyncTime = now + period;

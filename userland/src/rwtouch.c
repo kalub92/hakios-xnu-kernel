@@ -19,6 +19,8 @@
  *   read                         print the samples that arrive, forever (to watch the queue)
  *   notify NAME                  post a Darwin notification (com.redwood.unlock: see inject_sb.c)
  *   clock                        how long short sleeps really take (a check of the kernel's timers)
+ *   ifarg WORD                   stop here (quietly) unless WORD (e.g. autotest=1) is among the kernel's arguments
+ *   say TEXT                     a kept, timestamped "auto: TEXT" line in the kernel's log (a marker)
  * Positions are fractions of the screen: 0 0 is the top left corner, 1 1 the bottom right.
  * Example, "swipe up from the bottom edge two minutes after boot":
  *   rwtouch wait 120 swipe 0.5 0.99 0.5 0.4 250
@@ -28,6 +30,7 @@
 #include <notify.h>
 #include <pthread.h>
 #include <sys/qos.h>
+#include <sys/sysctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -213,6 +216,28 @@ main(int argc, char **argv)
 			uint32_t status = notify_post(argv[i + 1]);
 
 			printf("rwtouch: notification %s: %s\n", argv[i + 1], status == NOTIFY_STATUS_OK ? "posted" : "FAILED");
+			i += 1;
+		} else if (strcmp(step, "ifarg") == 0 && left >= 1) {
+			/* the rest only when the kernel's arguments have this word (e.g. autotest=1): rc.jobs' autotest */
+			char args[1024] = "", *at;
+			size_t size = sizeof(args) - 1, n = strlen(argv[i + 1]);
+
+			sysctlbyname("kern.bootargs", args, &size, NULL, 0);
+			for (at = args; (at = strstr(at, argv[i + 1])) != NULL; at += n) {
+				if ((at == args || at[-1] == ' ') && (at[n] == 0 || at[n] == ' ')) {
+					break;
+				}
+			}
+			if (at == NULL) {
+				return 0;
+			}
+			i += 1;
+		} else if (strcmp(step, "say") == 0 && left >= 1) {
+			/* a marker line, kept ("!") and timestamped by the kernel: tools/r1-auto.sh windows its metrics by these */
+			char line[200];
+
+			snprintf(line, sizeof(line), "!auto: %s", argv[i + 1]);
+			sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
 			i += 1;
 		} else if (strcmp(step, "clock") == 0) {
 			static const useconds_t lengths[] = { 1000, 16000, 100000 };

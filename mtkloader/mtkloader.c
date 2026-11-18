@@ -34,9 +34,13 @@
 #endif
 #define XNU_PHYS_BASE       0xc0000000ULL
 #if BOARD_R1
-/* r1: 0xc0000000..0xfeff5fff is the largest DRAM range clear of what keeps running under XNU (modem,
- * SCP/SSPM shares, ATF/TEE/GZ, the framebuffer, ramoops); 16 KB aligned. */
-#define XNU_MEM_SIZE        0x3e000000ULL   /* rounded down to 32 MB: arm_vm_init hung on 0x3eff4000 */
+/* r1: every firmware reservation (LK's mblock-* in the stock device tree: ATF, TEE, GZ, SSPM, SCP, modem,
+ * ccci, framebuffer, pstore, atf-log, dramc-rk0) lies below 0xc0000000; above it there is only dramc-rk1
+ * at 0x13ffff000. (iomem's "reserved" at 0xfeff6000 and 0x127000000.. are Linux's own allocations, not
+ * there when the loader runs.) So 0xc0000000..0x13e000000: 2016 MB, half of it above 4 GB. Rounded down
+ * to 32 MB: arm_vm_init hung on 0x3eff4000. xnumem=MB in the boot-args takes less (xnumem=992: the old
+ * window, 0x3e000000). */
+#define XNU_MEM_SIZE        0x7e000000ULL
 #else
 #define XNU_MEM_SIZE        0xfe000000ULL       /* up to dramc-rk1 at 0x1bffff000; room for the system image */
 #endif
@@ -74,6 +78,10 @@
 #define XNU_CORES           4
 #endif
 _Static_assert(XNU_CORES >= 1 && XNU_CORES <= 7, "one core at least, and one left for the watcher");
+/* r1: -DR1_SMALL_CORES=1 marks cores 4-7 (the 920 MHz cluster) "small-core", so XNU weighs them as slower and starts them late. Off: as before. */
+#ifndef R1_SMALL_CORES
+#define R1_SMALL_CORES      0
+#endif
 
 /*
  * The processors in the order the kernel is offered them: the one this code runs on first (LK
@@ -156,6 +164,34 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #else
 #define XNU_BOOT_ARGS       "debug=0x8 serial=3 " XNU_ROOT_ARG " " XNU_EXTRA_ARGS " loader_return_after=" XNU_RETURN_AFTER
 #endif
+
+/* The number after key (" name=") in the boot-args, or dflt if it is not there. */
+static uint64_t boot_arg(const char *key, uint64_t dflt)
+{
+	static const char args[] = XNU_BOOT_ARGS;
+
+	for (const char *p = args; *p; p++) {
+		int k = 0;
+		while (key[k] && p[k] == key[k]) {
+			k++;
+		}
+		if (key[k] == 0) {
+			uint64_t v = 0;
+			for (p += k; *p >= '0' && *p <= '9'; p++) {
+				v = v * 10 + (uint64_t)(*p - '0');
+			}
+			return v;
+		}
+	}
+	return dflt;
+}
+
+/* XNU's memory size: XNU_MEM_SIZE, or "xnumem=MB" from the boot-args (rounded down to 32 MB, never more). */
+static uint64_t xnu_mem_size(void)
+{
+	uint64_t size = (boot_arg(" xnumem=", 0) << 20) & ~0x1ffffffULL;
+	return size != 0 && size < XNU_MEM_SIZE ? size : XNU_MEM_SIZE;
+}
 
 #define CHAIN_OFFSET        0x40000u
 #define KERNEL_PA           0x40080000ULL
@@ -405,6 +441,7 @@ static void out_dec(uint64_t v)
 }
 
 #include "mtkconnsys.h"         /* Wi-Fi step 1: Android's device tree on CONNSYS, printed (uses out()) */
+#include "mtkmodem.h"           /* modem stage 0: LK's MD1 hand-over, printed (r1_md=1 only) */
 
 /* ---- run state ---- */
 
@@ -625,7 +662,13 @@ static uint64_t load_system_image(void)
 {
 	uint64_t lba, blocks, size = 0, done = 0, t0 = dbg_ticks(), f = dbg_freq();
 
+#ifdef SYSTEM_LBA   /* r1: a logical partition inside "super" (tools/r1-xnusys.sh), passed as its extent */
+	lba = SYSTEM_LBA;
+	blocks = SYSTEM_BLOCKS;
+	if (0) {
+#else
 	if (!gpt_find(SYSTEM_PART, &lba, &blocks)) {
+#endif
 		out("no " SYSTEM_PART " partition on the flash (or the GPT could not be read)\n");
 		return 0;
 	}
@@ -874,7 +917,7 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 	dt_prop_str(&w, "darwin-board", "x6826b");
 	dt_prop(&w, "random-seed", seed, sizeof(seed));
 	dt_prop_u64(&w, "dram-base", XNU_PHYS_BASE);
-	dt_prop_u64(&w, "dram-size", XNU_MEM_SIZE);
+	dt_prop_u64(&w, "dram-size", xnu_mem_size());
 	dt_prop_u32(&w, "debug-enabled", 1);
 	dt_prop_u32(&w, "display-scale", 2);
 	dt_prop_u32(&w, "display-rotation", 0);
@@ -961,7 +1004,7 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 		dt_prop_u64(&w, "bus-frequency", 100000000ULL);
 		dt_prop_u64(&w, "memory-frequency", 100000000ULL);
 		dt_prop_u64(&w, "peripheral-frequency", 24000000ULL);
-		if (!BOARD_R1 && core < 6) { /* X6826B: cores 0-5 are the Cortex-A55s, 6 and 7 the A75s */
+		if (BOARD_R1 ? (R1_SMALL_CORES && core >= 4) : core < 6) { /* X6826B: cores 0-5 are the Cortex-A55s, 6 and 7 the A75s; r1: see R1_SMALL_CORES */
 			dt_prop_u32(&w, "small-core", 1);
 		}
 		dt_end(&w);
@@ -1062,6 +1105,18 @@ void loader_fault(uint64_t vec, uint64_t esr, uint64_t elr, uint64_t far)
 	out(" FAR ");
 	out_hex(far);
 	out("\n");
+	if (BOARD_R1) {
+		/* r1: never start Android from here -- this may be the watcher's core with XNU still
+		 * running, or the return path with XNU's other cores alive (the 4-core runs froze with
+		 * text on the screen and the watchdog off). A reset that keeps DRAM goes through the
+		 * loader's entry, which rescues the log by the marker and starts Android cleanly.
+		 * With no marker (a fault before XNU started) the next boot must still be Android:
+		 * an image that boots XNU by default would otherwise fault, reset and fault for ever. */
+		if (marker_get() != MARK_RUNNING) {
+			marker_set(MARK_DONE);
+		}
+		reset_board();
+	}
 	dbg_delay_ms(5000);
 	chain_android();
 }
@@ -1084,7 +1139,7 @@ static void save_log(const struct span *sp, int nsp)
 	}
 	room = PLOG_CAP - PLOG_HDR->size;
 	room = room > 1024 ? room - 1024 : 0;
-	head = total <= room ? total : room / 4;
+	head = total <= room ? total : room / 8;   /* r1: the tail is what tools/r1-auto.sh measures */
 	tail = total <= room ? 0 : room - head;
 	skip_to = total - tail;
 
@@ -1166,8 +1221,12 @@ static void save_host_keep(const struct xnu_syms *s)
 static void show_log_tail(uint32_t lines)
 {
 	uint32_t size = PLOG_HDR->size, start = PLOG_HDR->start, n = 0;
-	uint32_t top = PANEL_H - (lines + 1) * 16;
 	uint64_t i;
+
+	if ((lines + 2) * 16 > PANEL_H) {   /* r1: 40 lines do not fit 640 rows; top went below zero and the */
+		lines = PANEL_H / 16 - 2;       /* first glyph was written 7 TB past the framebuffer (loader fault) */
+	}
+	uint32_t top = PANEL_H - (lines + 1) * 16;
 
 	if (!fbc.base || size == 0 || size != start) { /* only a log that has not wrapped */
 		return;
@@ -1485,11 +1544,17 @@ static void read_screen(void)
  * XNU is back (start.S xnu_return_stub): MMU off, our vectors, our stack. Its log was
  * linearized and written back to RAM by XNU. Save it, show its end, then reset into Android.
  */
+static uint32_t boot_reset_status, boot_marker;     /* as mtkloader_main found them: said again at the end */
+
 void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code, uint64_t elr, uint64_t far)
 {
 	struct span sp = { (const volatile char *)log_pa, len };
 
-	wdt_disable();
+	if (BOARD_R1) {
+		wr32(TOPRGU_RESTART, TOPRGU_RESTART_KEY);   /* 30 s more for saving the log; a hang here resets too */
+	} else {
+		wdt_disable();
+	}
 	xnu_back = 1;
 	marker_set(MARK_DONE);
 	uint64_t screen = fbc.base;
@@ -1497,12 +1562,18 @@ void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code,
 	dbg_puts("\n=== what the screen showed when XNU came back ===\n");
 	read_screen();
 	fbc.base = screen;
+	save_host_keep(&xsyms);         /* early: small, has the kernel's last lines (the exit save's result), and a reset may cut what follows */
 	fbc.fg = 0xffffff40u;
 	out("\n=== XNU returned to mtkloader: reason ");
 	out_dec(reason);
 	out(reason == 0 ? " (end)" : reason == 1 ? " (early exception)" : reason == 2 ? " (checkpoint)" : "");
 	out(" code ");
 	out_hex(code);
+	out(" (at boot: reset status ");
+	out_hex(boot_reset_status);
+	out(", marker ");
+	out_hex(boot_marker);
+	out(")");
 	if (reason == 1) {
 		out(" ELR ");
 		out_hex(elr);
@@ -1536,7 +1607,6 @@ void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code,
 	}
 	save_log(&sp, 1);
 	dbg_puts("=== end of XNU log ===\n");
-	save_host_keep(&xsyms);
 	show_log_tail(40);
 	dbg_delay_ms(20000);
 	reset_board();
@@ -1790,8 +1860,87 @@ static void timer_probe(void)
 
 /* ---- the watcher on the second core ---- */
 
+/*
+ * r1: the side button is key 1 of the keypad controller's matrix (the device tree's kpd-hw-map: index 1
+ * is KEY_POWER), a bit of KP_MEM1 that is 0 while the key is down. The watcher looks at it ten times
+ * a second: held for three seconds, the run ends as if its time were up (snapshot, Android). That is
+ * the way out of an image that boots XNU by default. Every change of the five words is noted too.
+ */
+#define KP_MEM1        0x10010004ULL
+#define KP_SIDE_BIT    (1u << 1)
+static uint16_t kp_last[5];
+static struct { uint32_t tenths; uint16_t word, value; } kp_log[32];
+static uint32_t kp_n, kp_ticks, kp_held, kp_seen_up;
+/*
+ * Test runs without a finger: boot-arg sidebtn_test=S has the button "held" for 3 s from S seconds
+ * into the watch; sidebtn_test_force=1 keeps it held from then on (the force gesture).
+ */
+static uint32_t kp_test_at, kp_test_force;
+
+static int side_button_held(void)
+{
+	for (uint32_t i = 0; i < 5; i++) {
+		uint16_t v = (uint16_t)rd32(KP_MEM1 + 4 * i);
+		if ((v != kp_last[i] || kp_ticks == 0) && kp_n < 32) {
+			kp_log[kp_n].tenths = kp_ticks;
+			kp_log[kp_n].word = (uint16_t)i;
+			kp_log[kp_n++].value = v;
+		}
+		kp_last[i] = v;
+	}
+	kp_ticks++;
+	int sim = kp_test_at && kp_ticks >= kp_test_at * 10 && (kp_test_force || kp_ticks < kp_test_at * 10 + 31);
+	if ((kp_last[0] & KP_SIDE_BIT) && !sim) {
+		kp_seen_up = 1;         /* never count a bit that was 0 from the start: that is no key */
+		kp_held = 0;
+	} else if (kp_seen_up || sim) {
+		kp_held++;
+	}
+	return kp_held >= 30;
+}
+
+static void kp_print(void)
+{
+	dbg_puts("\nkeypad (tenths of a second, word, value):\n");
+	for (uint32_t i = 0; i < kp_n; i++) {
+		dbg_dec(kp_log[i].tenths);
+		dbg_puts(" ");
+		dbg_dec(kp_log[i].word);
+		dbg_puts(" ");
+		dbg_hex(kp_log[i].value, 4);
+		dbg_puts("\n");
+	}
+}
+
 static uint64_t watcher_l1[512] __attribute__((aligned(4096)));
 static volatile uint64_t watcher_started __attribute__((aligned(64)));
+
+/*
+ * r1: while XNU saves after the side button (some 12 s), a line over its screen so that nobody presses
+ * again. Drawn straight into the panel's buffer, not through fbc (core 0's), and again at every look:
+ * XNU's frames draw over it.
+ */
+static void watcher_banner(void)
+{
+	static const char text[] = "Saving... then Android";
+	uint64_t base = fb_base;
+
+	if (!base) {
+		return;
+	}
+	for (uint32_t i = 0; text[i]; i++) {
+		const unsigned char *g = font8x16[(unsigned char)text[i] - 0x20];
+		for (uint32_t row = 0; row < 40; row++) {
+			for (uint32_t col = 0; col < 20; col++) {
+				int on = row >= 4 && row < 36 && col >= 2 && col < 18 &&
+				    (g[(row - 4) / 2] & (0x80 >> ((col - 2) / 2)));
+				*(volatile uint32_t *)(base + (uint64_t)(row + 8) * fb_pitch + (uint64_t)(i * 20 + col) * 4) =
+				    on ? 0xffffffffu : 0xff000000u;
+			}
+		}
+	}
+	dcache_clean_range(base + 8 * (uint64_t)fb_pitch, 40 * (uint64_t)fb_pitch);
+}
 
 static void plog_flush(void)
 {
@@ -1820,12 +1969,63 @@ void watcher_main(void)
 	dcache_clean_range((uint64_t)&watcher_started, 8);
 
 	uint64_t end = dbg_ticks() + dbg_freq() * XNU_WATCH_SECONDS;
+	/*
+	 * r1 with the data volume kept in the flash (emmc_write=1 var_store=1): the side button first asks
+	 * XNU for the orderly end, the one that saves (loader_live.stop, osfmk/arm64/loader_return.c). It
+	 * is asked only while its heartbeat (every 10 s) is recent; if it is not back within var_save_ms
+	 * + 15 s (sidebtn_wait=S), or the button is held 5 s more, the run ends here as it always did.
+	 */
+	const uint64_t live_magic2 = 0x324556494c554e58ULL;
+	int var_store = BOARD_R1 && xsyms.live && boot_arg(" emmc_write=", 0) == 1 && boot_arg(" var_store=", 0) == 1 &&
+	    *(volatile uint64_t *)kva_to_pa(xsyms.live + 80) == live_magic2;
+	uint64_t wait = dbg_freq() * boot_arg(" sidebtn_wait=", boot_arg(" var_save_ms=", 20000) / 1000 + 15);
+	uint64_t asked = 0, hb = ~0ULL, hb_at = 0;
+	kp_test_at = BOARD_R1 ? (uint32_t)boot_arg(" sidebtn_test=", 0) : 0;
+	kp_test_force = (uint32_t)boot_arg(" sidebtn_test_force=", 0);
 	while (dbg_ticks() < end) {
 		dcache_clean_range((uint64_t)&xnu_back, 8);
 		if (xnu_back) {
 			for (;;) {
 				__asm__ volatile("wfe");
 			}
+		}
+#ifndef WDT_TEST   /* -DWDT_TEST: starve it on purpose, to see the reset come */
+#define WDT_TEST 0
+#endif
+		if (BOARD_R1 && !WDT_TEST) {
+			wr32(TOPRGU_RESTART, TOPRGU_RESTART_KEY);   /* feed the dead-man switch */
+		}
+		if (var_store && *(volatile uint64_t *)kva_to_pa(xsyms.live + 8) != hb) {
+			hb = *(volatile uint64_t *)kva_to_pa(xsyms.live + 8);
+			hb_at = dbg_ticks();
+		}
+		if (BOARD_R1 && side_button_held() && !asked) {
+			if (!var_store || dbg_ticks() - hb_at > dbg_freq() * 30) {
+				break;
+			}
+			asked = dbg_ticks();
+			*(volatile uint64_t *)kva_to_pa(xsyms.live + 72) = 1;   /* loader_live.stop */
+			dcache_clean_range(kva_to_pa(xsyms.live + 72), 8);
+			kp_held = 0;    /* from here on, 5 s more of the button is the force ... */
+			kp_seen_up = 0; /* ... counted only once the first hold has been let go */
+			uint64_t fb = fbc.base;
+			fbc.base = 0;
+			dbg_puts("\n=== watcher: side button held: XNU asked to save and end the run ===\n");
+			fbc.base = fb;
+			plog_flush();   /* the first core writes the log next, with its caches off */
+		}
+		if (asked) {
+			watcher_banner();
+		}
+		/* the force only for a kernel whose heartbeat has stopped: a live one is saving, and the wait bounds it */
+		if (asked && ((kp_held >= 50 && dbg_ticks() - hb_at > dbg_freq() * 30) || dbg_ticks() - asked > wait)) {
+			uint64_t fb = fbc.base;
+			fbc.base = 0;
+			dbg_puts(kp_held >= 50 ? "\n=== watcher: side button held 5 s more: no waiting for XNU ===\n" :
+			    "\n=== watcher: XNU did not come back in time after the side button ===\n");
+			fbc.base = fb;
+			kp_held = 30;
+			break;
 		}
 		dbg_delay_ms(100);
 	}
@@ -1838,9 +2038,10 @@ void watcher_main(void)
 
 	fbc.base = 0; /* the screen is XNU's: read it, do not draw on it */
 	marker_set(MARK_DONE);
-	dbg_puts("\n=== watcher: XNU still running after " );
-	dbg_dec(XNU_WATCH_SECONDS);
-	dbg_puts(" s, snapshot ===\n");
+	dbg_puts(kp_held >= 30 ? "\n=== watcher: side button held, snapshot ===\n" : "\n=== watcher: XNU still running at the end of its time, snapshot ===\n");
+	if (BOARD_R1) {
+		kp_print();
+	}
 	if (xsyms.cpu_ttep) {
 		xnu_fp[3] = *(volatile uint64_t *)kva_to_pa(xsyms.cpu_ttep);
 		xnu_fp[2] = 0x22a51a251aULL;
@@ -2350,8 +2551,8 @@ static void __attribute__((noreturn)) run_xnu(void)
 	ba->version = 2;
 	ba->physBase = XNU_PHYS_BASE;
 	ba->virtBase = KERNEL_VIRT_BASE;
-	ba->memSize = XNU_MEM_SIZE;
-	ba->memSizeActual = XNU_MEM_SIZE;
+	ba->memSize = xnu_mem_size();
+	ba->memSizeActual = ba->memSize;
 	ba->topOfKernelData = top;
 	ba->deviceTreeP = dt_pa - XNU_SLIDE;
 	ba->deviceTreeLength = dt_len;
@@ -2362,6 +2563,9 @@ static void __attribute__((noreturn)) run_xnu(void)
 	ba->video.v_height = PANEL_H;
 	ba->video.v_depth = 32;
 	memcpy(ba->commandLine, XNU_BOOT_ARGS, sizeof(XNU_BOOT_ARGS));
+	if (boot_arg(" r1_md=", 0)) {
+		md_append_args(ba->commandLine, BOOT_LINE_LENGTH);     /* the modem handoff LK left, parsed by modem_dt_report (mtkmodem.h) */
+	}
 
 	out("md0 ");
 	out_hex(sys_size ? sys_pa : rd_pa);
@@ -2377,7 +2581,7 @@ static void __attribute__((noreturn)) run_xnu(void)
 	out(", XNU memory ");
 	out_hex(XNU_PHYS_BASE);
 	out("+");
-	out_hex(XNU_MEM_SIZE);
+	out_hex(ba->memSize);
 	out("\n");
 	display_alpha_off();
 
@@ -2390,6 +2594,16 @@ static void __attribute__((noreturn)) run_xnu(void)
 		out("watchdog: back to Android in ");
 		out_dec(t);
 		out(" s\n");
+	} else if (BOARD_R1) {
+		/* r1 dead-man switch: nothing but Android's kernel answers the side button, so a hang
+		 * that took the watcher down too left the board stuck with the screen on. The watchdog
+		 * (DDR reserve: ramoops and the RUNNING marker survive) resets into Android unless the
+		 * watcher keeps feeding it; after the reset the marker says "rescue the log, start Android". */
+		marker_set(MARK_RUNNING);
+		wr32(TOPRGU_LENGTH, ((30u * 32768u / 512u) << 5) | 0x8u);
+		wr32(TOPRGU_RESTART, TOPRGU_RESTART_KEY);
+		wr32(TOPRGU_MODE, TOPRGU_MODE_KEY | 0x80u | 0x1u);
+		out("watchdog: armed (30 s), fed by the watcher\n");
 	} else {
 		marker_set(0);
 	}
@@ -3475,6 +3689,10 @@ static const char cam_probe_flag[] = "DARWIN-REDWOOD:CAM-PROBE";
 void mtkloader_main(uint64_t dtb)
 {
 	uint32_t mark = marker_get();
+	uint32_t wdt_status = rd32(TOPRGU_BASE + 0x0c);   /* bit 31: the last reset was the watchdog's */
+
+	boot_reset_status = wdt_status;
+	boot_marker = mark;
 
 	wdt_disable();
 	lk_dtb = dtb;
@@ -3482,17 +3700,20 @@ void mtkloader_main(uint64_t dtb)
 	fbcon_init(fb_base, fb_pitch, 0, 1);
 
 	if (mark == MARK_DONE) {
-		/* XNU's log was saved when it came back; leave ramoops as it is. */
+		/* XNU's log was saved when it came back; leave ramoops as it is (this line goes at its end). */
+		out("reset status "); out_hex(wdt_status); out(" after the run\n");
 		chain_android();
 	}
 	if (mark == MARK_RUNNING) {
 		rescue_log();
+		out("reset status "); out_hex(wdt_status); out(" after the run\n");
 		dbg_delay_ms(5000);
 		chain_android();
 	}
 
 	xnu_requested();         /* before plog_reset(): the request may be in the console zone */
 	plog_reset();
+	out("reset status "); out_hex(wdt_status); out(", marker "); out_hex(mark); out("\n");
 #if TOUCH_PROBE
 	fb_rect(0, 0, PANEL_W, PANEL_H, 0xff000000u);
 	fbc.x = 0;
@@ -3549,5 +3770,8 @@ void mtkloader_main(uint64_t dtb)
 #if !BOARD_R1
 	connsys_dt_report(dtb);
 #endif         /* Wi-Fi step 1: what Android's tree says of CONNSYS (mtkconnsys.h) */
+	if (boot_arg(" r1_md=", 0)) {
+		modem_dt_report(dtb);
+	}
 	run_xnu();
 }
