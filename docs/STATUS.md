@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-18 10:30 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-18 11:00 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -27,16 +27,19 @@ Last updated: 2026-11-18 10:30 PST. Kept current as work lands; details are in t
 - Cellular in test images: LTE registration, data bearer, DNS and HTTP over `pdp_ip0` (8 of 10 approved radio-on attempts used)
 - Modem as a service with the radio off (`r1_md=10`): 30 minutes, no faults, clean shutdown
 - Bluetooth audio plug-in loads in mediaserverd and connects to bluetoothd
-- Boot image has about 1.5 MB free (Android ramdisk repacked lz4 to gzip)
+- Boot image has about 1.4 MB free (Android ramdisk repacked lz4 to gzip)
+- Cellular stage 4c/4d on a simulated bearer (radio off): `celld` publishes the service, `pdp_ip0` becomes the primary interface, DNS and traffic go out on it, the data budget cuts traffic off (about 5 KB overshoot)
 
 ## In progress
 
-- Microphone and video recording: first unattended tests (results pending)
-- Everyday cellular, stage 4c/4d: `celld` daemon with a simulated bearer, data budget (radio off)
+- Microphone and video recording: analysis of what each needs (see open problems)
 - Bluetooth speaker audio (A2DP): ready for a hands-on session; no sound has been sent to a speaker yet
 
 ## Open problems
 
+- Microphone records silence: the kernel audio driver has no capture (uplink) path at all
+- Video recording fails: no H.264 encoder on the system ("Cannot Encode"), no movie file written
+- Cellular alongside Wi-Fi (Wi-Fi should win) is untested: unattended runs have no Wi-Fi
 - All audio went silent after a speaker was paired (likely the route moved to a Bluetooth output that could not carry sound; not confirmed)
 - Safari audio spins and never plays; a Safari file download would not start (untested unattended: no Wi-Fi in those runs)
 - Home-screen swipes run at about 8 to 13 fps (parked)

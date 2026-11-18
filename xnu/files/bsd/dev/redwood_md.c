@@ -152,7 +152,7 @@ extern uint32_t cldma_tx_bytes(void);
 extern uint32_t cldma_tx_completed(void);
 /* Stage 3b (r1_md_if=1 only): redwood_cell.c, the pdp_ip0 interface */
 extern void cldma_if_enable(uint32_t pkts_cap, uint32_t bytes_cap);
-extern bool cell_if_attach(const uint8_t ip[4], const uint8_t peer[4], const uint8_t dns[4], uint32_t mtu, uint32_t pkts, uint32_t kb, char *why, size_t whylen);
+extern bool cell_if_attach(const uint8_t ip[4], const uint8_t peer[4], const uint8_t dns[4], uint32_t mtu, uint32_t pkts, uint32_t kb, bool routes, bool fake, char *why, size_t whylen);
 extern void cell_if_input(const uint8_t *ip, uint32_t len);
 extern bool cell_if_tick(uint32_t rel);
 extern bool cell_if_active(void);
@@ -3353,7 +3353,11 @@ if_start(uint32_t rel)
 		peer[3] ^= 1;
 	}
 	if_t0 = rel;
-	if_ok = cell_if_attach(d_ip, peer, d_dns[0], d_mtu > 0 ? (uint32_t)d_mtu : 1430, if_pkts, if_kb, if_why, sizeof(if_why));
+	if_ok = cell_if_attach(d_ip, peer, d_dns[0], d_mtu > 0 ? (uint32_t)d_mtu : 1430, if_pkts, if_kb, !svc, false, if_why, sizeof(if_why));
+	if (if_ok && svc) {     /* 4c: what celld publishes (the state itself comes from svc_publish) */
+		snprintf(cs_addr, sizeof(cs_addr), "%u.%u.%u.%u", d_ip[0], d_ip[1], d_ip[2], d_ip[3]);
+		cs_mtu = d_mtu > 0 ? d_mtu : 1430;
+	}
 	if (!if_ok && !if_why[0]) {
 		strlcpy(if_why, "unknown", sizeof(if_why));
 	}
@@ -3798,6 +3802,108 @@ svc_publish(uint32_t rel)
 	(void)rel;
 }
 
+/* 64-bit byte count of pdp_ip0 and the allowance (W8): stops the interface when it is used up. Real service: once a second from svc_drive; fake bearer: 10 x a second. */
+static void
+svc_budget(void)
+{
+	uint32_t txp, txb, rxp, rxb, dr;
+	bool cap;
+
+	cell_if_stats(&txp, &txb, &rxp, &rxb, &dr, &cap);
+	sv.bytes64 += (uint32_t)(txb - sv_last_tx_b) + (uint64_t)(uint32_t)(rxb - sv_last_rx_b);
+	sv_acc_b += (uint32_t)(txb - sv_last_tx_b) % 0x10000000u + (uint32_t)(rxb - sv_last_rx_b) % 0x10000000u;
+	sv_last_tx_b = txb;
+	sv_last_rx_b = rxb;
+	cs_bytes = sv.bytes64;
+	if (sv_acc_b >= 1024) {
+		uint32_t kb = sv_acc_b / 1024;
+
+		sv_acc_b %= 1024;
+		cs_budget_kb = cs_budget_kb > (int)kb ? cs_budget_kb - (int)kb : 0;
+	}
+	if (cs_budget_kb <= 0) {
+		cell_if_stop("budget exhausted (W8)");
+		svc_latch(&sv.budget_hit, "W8 budget exhausted");
+	}
+}
+
+/* ---- Stage 4c: the fake bearer (boot-arg r1_md_iffake=1, no modem): pdp_ip0 up with 192.0.2.2, peer and DNS 192.0.2.1; packets are counted and
+ * dropped. sysctl kern.redwood.cell_fake = 1 / 0 (root) brings it up / down, as many times as one likes; the status sysctls (cell_state, cell_addr,
+ * cell_mtu, cell_gen) are the real service's. The budget (r1_md_budget_mb, W8) is checked by a thread, 10 x a second. ---- */
+static bool fake_allowed, fake_thread_on;
+
+static void
+fake_state(const char *st)
+{
+	if (strcmp(cs_state, st)) {
+		strlcpy(cs_state, st, sizeof(cs_state));
+		sv_gen++;
+		SAYF("r1md: RESULT 4: %s (fake bearer)", st);
+	}
+}
+
+static void
+fake_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	for (;;) {
+		delay_for_interval(100, NSEC_PER_MSEC);
+		if (cell_if_active()) {
+			svc_budget();
+			if (sv.budget_hit) {
+				fake_state("budget");
+			}
+		}
+	}
+}
+
+static int
+fake_up(void)
+{
+	static const uint8_t ip[4] = { 192, 0, 2, 2 }, peer[4] = { 192, 0, 2, 1 };
+	char why[48] = "";
+	thread_t thread;
+
+	if (cell_if_active()) {
+		return 0;
+	}
+	if (cs_budget_kb <= 0) {
+		return EPERM;   /* the allowance is used up: raise kern.redwood.cell_budget_kb first */
+	}
+	sv.budget_hit = false;
+	if (!cell_if_attach(ip, peer, peer, 1430, 0x7ffffff0u, 4000000, false, true, why, sizeof(why))) {
+		SAYM("r1cell: fake bearer failed: %s", why);
+		return EIO;
+	}
+	strlcpy(cs_addr, "192.0.2.2", sizeof(cs_addr));
+	cs_mtu = 1430;
+	fake_state("data_up");
+	if (!fake_thread_on && kernel_thread_start(fake_thread, NULL, &thread) == KERN_SUCCESS) {
+		fake_thread_on = true;
+		thread_deallocate(thread);
+	}
+	return 0;
+}
+
+static int
+fake_sysctl(struct sysctl_oid *oid, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int v = cell_if_active(), e = sysctl_handle_int(oid, &v, 0, req);
+
+	if (e != 0 || req->newptr == USER_ADDR_NULL) {
+		return e;
+	}
+	if (!fake_allowed) {
+		return ENOTSUP;
+	}
+	if (v) {
+		return fake_up();
+	}
+	cell_if_stop("fake down");
+	fake_state("radio_off");
+	return 0;
+}
+SYSCTL_PROC(_kern_redwood, OID_AUTO, cell_fake, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, fake_sysctl, "I", "fake bearer up (1) / down (0); needs boot-arg r1_md_iffake=1");
+
 /* one pass of the service's drive. Returns true when the loop is to end (the modem is to be powered down). */
 static bool
 svc_drive(uint32_t rel, uint32_t sta0, uint32_t sta1)
@@ -3813,26 +3919,8 @@ svc_drive(uint32_t rel, uint32_t sta0, uint32_t sta1)
 	}
 	/* radio budget: 64-bit byte count and the allowance (W8) */
 	if (cell_if_active() && rel >= sv.next_cell) {
-		uint32_t txp, txb, rxp, rxb, dr;
-		bool cap;
-
 		sv.next_cell = rel + 1000;
-		cell_if_stats(&txp, &txb, &rxp, &rxb, &dr, &cap);
-		sv.bytes64 += (uint32_t)(txb - sv_last_tx_b) + (uint64_t)(uint32_t)(rxb - sv_last_rx_b);
-		sv_acc_b += (uint32_t)(txb - sv_last_tx_b) % 0x10000000u + (uint32_t)(rxb - sv_last_rx_b) % 0x10000000u;
-		sv_last_tx_b = txb;
-		sv_last_rx_b = rxb;
-		cs_bytes = sv.bytes64;
-		if (sv_acc_b >= 1024) {
-			uint32_t kb = sv_acc_b / 1024;
-
-			sv_acc_b %= 1024;
-			cs_budget_kb = cs_budget_kb > (int)kb ? cs_budget_kb - (int)kb : 0;
-		}
-		if (cs_budget_kb <= 0) {
-			cell_if_stop("budget exhausted (W8)");
-			svc_latch(&sv.budget_hit, "W8 budget exhausted");
-		}
+		svc_budget();
 	}
 	if (rel >= sv.next_w7) {        /* W7: battery and heat, every 5 s */
 		int soc = -1, chg = 0, temp = 0;
@@ -4608,7 +4696,13 @@ redwood_md_init(void)
 
 	bool sh9 = false;
 	bool svc_level = false;
+	uint32_t fk = 0, fmb = 100;
 
+	if (PE_parse_boot_argn("r1_md_iffake", &fk, sizeof(fk)) && fk == 1) {
+		fake_allowed = true;
+		(void)PE_parse_boot_argn("r1_md_budget_mb", &fmb, sizeof(fmb));
+		cs_budget_kb = (int)(fmb > 2000000 ? 2000000 : fmb) * 1024;
+	}
 	if (!PE_parse_boot_argn("r1_md", &arg, sizeof(arg)) || (arg < 1 || (arg > 7 && arg != 9 && arg != 10 && arg != 11))) {
 		return;
 	}

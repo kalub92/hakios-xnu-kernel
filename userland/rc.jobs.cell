@@ -1,0 +1,4 @@
+# Stage 4c/4d radio-off tests (RC_JOBS=rc.jobs.cell; boot-arg r1_md_iffake=1, NOWIFI, optional r1_md_budget_mb=1 for 4d). Lines run in order.
+/redwood/bin/celld &
+/redwood/bin/cell_check wait 45 ifstat dump fake 1 state data_up 10 wait 6 dump ifstat udp 1.1.1.1 9 1 100 1000 wait 1 ifstat gai example.com ifstat usage
+/redwood/bin/cell_check fake 0 state radio_off 10 wait 4 dump fake 1 state data_up 10 wait 4 dump fake 0 wait 4 dump fake 1 wait 4 dump fake 0 wait 4 dump ifstat

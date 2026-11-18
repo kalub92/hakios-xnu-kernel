@@ -219,6 +219,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			{ ${LDID:-ldid} -Ssrc/bt_test.entitlements obj/bt_test 2>/dev/null ||
 			  echo "build.sh: no ldid: bt_test is unsigned, and TCC may not let it use Bluetooth"; }
 		$DYN -fobjc-arc -framework Foundation -framework AVFoundation -o obj/camera_avtest src/camera_avtest.m
+		$DYN -fobjc-arc -framework Foundation -framework AVFoundation -framework CoreMedia -framework CoreVideo -o obj/video_test src/video_test.m
 		# (the microphone as an application records: allowed to, by an entitlement, if ldid is there)
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/record_test src/record_test.c &&
 			{ ${LDID:-ldid} -Ssrc/record_test.entitlements obj/record_test 2>/dev/null ||
@@ -263,6 +264,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
 		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
+		$DYN -framework CoreFoundation -framework SystemConfiguration -o obj/celld src/celld.c &&
+			{ ${LDID:-ldid} -Ssrc/celld.entitlements obj/celld 2>/dev/null || echo "build.sh: no ldid: celld is unsigned"; }
+		$DYN -framework CoreFoundation -framework SystemConfiguration -o obj/cell_check src/cell_check.c
 		$DYN -o obj/cell_test src/cell_test.c   # (Stage 3b: pdp_ip0 test, started by rc.jobs with ifarg r1_md_if=1)
 		$DYN -fobjc-arc -framework Foundation -framework CoreGraphics -framework ImageIO -o obj/fbgrab src/fbgrab.m
 		# (with an entitlement for "battery_test open URL", if ldid is there: src/battery_test.c)
@@ -360,6 +364,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/metal_test ] && cp obj/metal_test root/bin/
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
 	[ -f obj/cell_test ] && cp obj/cell_test root/bin/
+	[ -f obj/celld ] && cp obj/celld root/bin/
+	[ -f obj/cell_check ] && cp obj/cell_check root/bin/
 	[ -f obj/logto ] && cp obj/logto root/bin/
 	[ -f obj/fbgrab ] && cp obj/fbgrab root/bin/
 	[ -f obj/battery_test ] && cp obj/battery_test root/bin/
@@ -370,6 +376,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/torch_test ] && cp obj/torch_test root/bin/
 	[ -f obj/camera_test ] && cp obj/camera_test root/bin/
 	[ -f obj/camera_avtest ] && cp obj/camera_avtest root/bin/
+	[ -f obj/video_test ] && cp obj/video_test root/bin/
 	[ -f obj/record_test ] && cp obj/record_test root/bin/
 	for f in $EXTRA; do cp "$f" root/bin/; done
 	# /dev and /private/var exist so that this image can also be the root on its own:

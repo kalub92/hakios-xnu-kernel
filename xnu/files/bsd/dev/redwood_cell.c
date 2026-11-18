@@ -12,7 +12,8 @@
  * mbuf, and either proto_input() takes it or it is freed here. Nothing is kept.
  *
  * Teardown: the interface is never detached (ifnet_detach is asynchronous and the kernel is about to power the modem down anyway): it is
- * brought DOWN, its default routes and address removed, and left attached with cell_up false, so output and input drop everything.
+ * brought DOWN, its default routes and address removed, and left attached with cell_up false, so output and input drop everything. A later
+ * cell_if_attach (a new bearer, 4c) configures the same interface again.
  *
  * Locking: cell_lock (a mutex) covers the counters and cell_up only, held for a few instructions, never across cldma_tx(), the stack or a
  * log line. Output may run on any thread; input and tick run on the modem thread.
@@ -47,7 +48,7 @@ static LCK_MTX_DECLARE(cell_lock, &cell_grp);
 
 static ifnet_t cell_ifp;
 static volatile bool cell_up;                   /* packets pass: set when the interface is configured, cleared first thing in stop */
-static bool cell_stopped;
+static bool cell_stopped, cell_routes, cell_fake;   /* cell_fake (4c): no modem; output is counted and dropped */
 static volatile uint32_t cell_now;              /* the modem thread's clock (ms), for cldma_tx's slot timestamps */
 static uint8_t c_ip[4], c_peer[4], c_dns[4];
 static uint32_t cap_pkts, cap_bytes, next_tick, tx_logged, tick_period = 10000;
@@ -185,7 +186,7 @@ cell_output(ifnet_t ifp, mbuf_t m)
 			}
 			lck_mtx_unlock(&cell_lock);
 			if (!capped) {
-				sent = cldma_tx(pkt, (uint32_t)len, cell_now);
+				sent = cell_fake || cldma_tx(pkt, (uint32_t)len, cell_now);
 			}
 		} else {
 			v6 = (pkt[0] >> 4) == 6;
@@ -323,10 +324,11 @@ cell_route(bool add, bool scoped)
 	return rtrequest(add ? RTM_ADD : RTM_DELETE, (struct sockaddr *)&dst, (struct sockaddr *)&gw, (struct sockaddr *)&mask, flags, NULL);
 }
 
-/* Creates pdp_ip0, gives it the bearer's /32 with `peer` as its point-to-point peer, adds the default routes, publishes the DNS server (sysctl
- * kern.redwood.cell_dns) and lets packets through. false + why on any failure (what was made stays, down). */
+/* Creates pdp_ip0 (once), gives it the bearer's /32 with `peer` as its point-to-point peer, adds the default routes if `routes` (not in the service:
+ * IPMonitor owns them), marks it expensive + constrained, publishes the DNS server (sysctl kern.redwood.cell_dns) and lets packets through.
+ * Repeatable after cell_if_stop (4c). fake: no modem, packets are counted and dropped. false + why on any failure (what was made stays, down). */
 bool
-cell_if_attach(const uint8_t ip[4], const uint8_t peer[4], const uint8_t dns[4], uint32_t mtu, uint32_t pkts, uint32_t kb, char *why, size_t whylen)
+cell_if_attach(const uint8_t ip[4], const uint8_t peer[4], const uint8_t dns[4], uint32_t mtu, uint32_t pkts, uint32_t kb, bool routes, bool fake, char *why, size_t whylen)
 {
 	struct ifnet_init_eparams init = {
 		.ver = IFNET_INIT_CURRENT_VERSION,
@@ -351,8 +353,8 @@ cell_if_attach(const uint8_t ip[4], const uint8_t peer[4], const uint8_t dns[4],
 	errno_t e;
 	int r1, r2;
 
-	if (cell_ifp != NULL) {
-		snprintf(why, whylen, "already attached");
+	if (cell_up) {
+		snprintf(why, whylen, "already up");
 		return false;
 	}
 	memcpy(c_ip, ip, 4);
@@ -362,6 +364,10 @@ cell_if_attach(const uint8_t ip[4], const uint8_t peer[4], const uint8_t dns[4],
 	cap_bytes = kb * 1000;
 	if (mtu < 576 || mtu > CELL_MAX_PKT) {
 		mtu = 1430;
+	}
+	cell_fake = fake;
+	if (cell_ifp != NULL) {
+		goto configure;
 	}
 	e = proto_register_plumber(PF_INET, IFNET_FAMILY_CELLULAR, cell_attach_proto, NULL);
 	if (e != 0 && e != EEXIST) {
@@ -387,6 +393,8 @@ cell_if_attach(const uint8_t ip[4], const uint8_t peer[4], const uint8_t dns[4],
 	bpfattach(ifp, DLT_RAW, 0);
 	cell_ifp = ifp;
 	SAYM("r1cell: ifnet %s attached: family cellular, type IFT_CELLULAR, raw IP, mtu %u, caps %u pkts %u KB per direction", CELL_NAME, mtu, pkts, kb);
+configure:
+	ifnet_set_mtu(cell_ifp, mtu);
 	e = sock_socket(AF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
 	if (e != 0) {
 		snprintf(why, whylen, "socket %d", e);
@@ -404,6 +412,11 @@ cell_if_attach(const uint8_t ip[4], const uint8_t peer[4], const uint8_t dns[4],
 	if (e != 0 && e != EEXIST) {    /* (SIOCAIFADDR below plumbs the protocol itself too: not fatal here) */
 		SAYM("r1cell: SIOCPROTOATTACH returned %d", e);
 	}
+	ifr.ifr_expensive = 1;
+	r1 = sock_ioctl(so, SIOCSIFEXPENSIVE, &ifr);
+	ifr.ifr_constrained = 1;
+	r2 = sock_ioctl(so, SIOCSIFCONSTRAINED, &ifr);
+	SAYM("r1cell: expensive %d constrained %d (0 = ok)", r1, r2);
 	bzero(&ra, sizeof(ra));
 	strlcpy(ra.ifra_name, CELL_NAME, sizeof(ra.ifra_name));
 	fill_sin(&ra.ifra_addr, ip);
@@ -415,13 +428,19 @@ cell_if_attach(const uint8_t ip[4], const uint8_t peer[4], const uint8_t dns[4],
 		snprintf(why, whylen, "address %d", e);
 		return false;
 	}
-	r1 = cell_route(true, false);
-	r2 = cell_route(true, true);
-	SAYM("r1cell: address %u.%u.x.x/32 peer %u.%u.%u.%u set, default route: unscoped %d scoped %d (0 = ok)", ip[0], ip[1], peer[0], peer[1], peer[2], peer[3], r1, r2);
+	r1 = r2 = 0;
+	if (routes) {
+		r1 = cell_route(true, false);
+		r2 = cell_route(true, true);
+		cell_routes = r1 == 0 || r2 == 0;
+	}
+	SAYM("r1cell: address %u.%u.x.x/32 peer %u.%u.%u.%u set, default route: %s unscoped %d scoped %d (0 = ok)", ip[0], ip[1], peer[0], peer[1], peer[2], peer[3],
+	    routes ? "added" : "left to IPMonitor", r1, r2);
 	if (r1 != 0 && r2 != 0) {
 		snprintf(why, whylen, "no default route %d/%d", r1, r2);
 		return false;
 	}
+	cell_stopped = false;
 	snprintf(cell_dns_str, sizeof(cell_dns_str), "%u.%u.%u.%u", dns[0], dns[1], dns[2], dns[3]);
 	lck_mtx_lock(&cell_lock);
 	cell_up = true;
@@ -529,8 +548,12 @@ cell_if_stop(const char *why)
 	cell_stopped = true;
 	lck_mtx_unlock(&cell_lock);
 	cell_counters("if final");
-	r1 = cell_route(false, false);
-	r2 = cell_route(false, true);
+	r1 = r2 = 0;
+	if (cell_routes) {
+		r1 = cell_route(false, false);
+		r2 = cell_route(false, true);
+		cell_routes = false;
+	}
 	if (sock_socket(AF_INET, SOCK_DGRAM, 0, NULL, NULL, &so) == 0) {
 		bzero(&ra, sizeof(ra));
 		strlcpy(ra.ifra_name, CELL_NAME, sizeof(ra.ifra_name));
@@ -539,5 +562,5 @@ cell_if_stop(const char *why)
 		e2 = cell_flags(so, false);
 		sock_close(so);
 	}
-	SAYM("r1cell: if down (%s): routes removed %d/%d, address %d, flags %d; %s stays attached, permanently down (no detach)", why, r1, r2, e1, e2, CELL_NAME);
+	SAYM("r1cell: if down (%s): routes removed %d/%d, address %d, flags %d; %s stays attached, down until the next cell_if_attach (no detach)", why, r1, r2, e1, e2, CELL_NAME);
 }

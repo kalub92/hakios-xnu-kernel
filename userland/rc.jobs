@@ -1,6 +1,8 @@
 # Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
 # Stage 3b (r1_md_if=1 or r1_md=9): the cellular interface test, in the background from the start; ends at once without the argument. Its lines are kept ("cell_test:").
 /redwood/bin/cell_test ifarg r1_md_if=1 &
+# Stage 4c: celld publishes the cellular bearer (kern.redwood.cell_*) to configd; ends at once unless r1_md=10/11 or r1_md_iffake=1.
+/redwood/bin/celld &
 /redwood/bin/hello_dyn started by launchd
 /redwood/bin/svc_test
 /redwood/bin/surf_test
