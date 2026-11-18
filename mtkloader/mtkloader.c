@@ -2562,9 +2562,19 @@ static void __attribute__((noreturn)) run_xnu(void)
 	ba->video.v_width = PANEL_W;
 	ba->video.v_height = PANEL_H;
 	ba->video.v_depth = 32;
-	memcpy(ba->commandLine, XNU_BOOT_ARGS, sizeof(XNU_BOOT_ARGS));
+	memcpy(ba->commandLine, XNU_BOOT_ARGS, sizeof(XNU_BOOT_ARGS) < BOOT_LINE_LENGTH ? sizeof(XNU_BOOT_ARGS) : BOOT_LINE_LENGTH - 1);
+	ba->commandLine[BOOT_LINE_LENGTH - 1] = 0;
 	if (boot_arg(" r1_md=", 0)) {
-		md_append_args(ba->commandLine, BOOT_LINE_LENGTH);     /* the modem handoff LK left, parsed by modem_dt_report (mtkmodem.h) */
+		/* the seven md_append_args (mtkmodem.h) take at most 158 characters; all or none, and say so when none */
+		if (sizeof(XNU_BOOT_ARGS) + 160 > BOOT_LINE_LENGTH) {
+			out("mtkloader: BOOT-ARGS TOO LONG (");
+			out_dec(sizeof(XNU_BOOT_ARGS) + 159);
+			out(" > ");
+			out_dec(BOOT_LINE_LENGTH);
+			out("): modem hand-over args dropped\n");
+		} else {
+			md_append_args(ba->commandLine, BOOT_LINE_LENGTH);     /* the modem handoff LK left, parsed by modem_dt_report (mtkmodem.h) */
+		}
 	}
 
 	out("md0 ");

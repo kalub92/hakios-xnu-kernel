@@ -47,6 +47,9 @@ say(const char *fmt, ...)
 	printf("cell_test: %s\n", text);
 	fflush(stdout);
 	sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+	/* the "!" lines are only the 96-line ring said again each minute and the console log keeps head+tail: host_keep is what survives */
+	snprintf(line, sizeof(line), "cell_test: %s", text);
+	sysctlbyname("kern.redwood.host_keep", NULL, NULL, line, strlen(line));
 }
 
 static double
@@ -435,7 +438,7 @@ main(int argc, char **argv)
 	struct in_addr ip = { 0 }, dns = { 0 }, a = { 0 };
 	char dnsbuf[32] = "", routes[120], status[80] = "", ipm[24];
 	unsigned idx;
-	int have_if = 0, dns_ok = 0, http = -1, res_ok = 0, bytes = 0, rcode, answers;
+	int wait_s = 150, have_if = 0, dns_ok = 0, http = -1, res_ok = 0, bytes = 0, rcode, answers;
 	double rtt = 0, ttfb, total, t0;
 	pthread_t th;
 
@@ -445,8 +448,17 @@ main(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGALRM, on_alarm);
 	/* (a) wait for the interface; the whole test is over by ~40 s after it appears, the watchdog fires 75 s after that */
-	say("started: waiting up to 150 s for %s", IFNAME);
-	for (t0 = now_ms(); now_ms() - t0 < 150000; usleep(500000)) {
+	{
+		char args[1024] = "", *w;
+		size_t asz = sizeof(args) - 1;
+
+		sysctlbyname("kern.bootargs", args, &asz, NULL, 0);
+		if ((w = strstr(args, "cell_test_wait=")) != NULL && atoi(w + 15) > 0) {
+			wait_s = atoi(w + 15);
+		}
+	}
+	say("started: waiting up to %d s for %s", wait_s, IFNAME);
+	for (t0 = now_ms(); now_ms() - t0 < wait_s * 1000.0; usleep(500000)) {
 		size_t len = sizeof(dnsbuf) - 1;
 
 		if (if_addr(&ip) && ip.s_addr) {
@@ -461,7 +473,7 @@ main(int argc, char **argv)
 	g_have_if = have_if;
 	alarm(75);
 	if (!have_if) {
-		say("%s never got an IPv4 address (and a published DNS server) in 150 s", IFNAME);
+		say("%s never got an IPv4 address (and a published DNS server) in %d s", IFNAME, wait_s);
 		goto summary;
 	}
 	{

@@ -435,7 +435,7 @@ hide_wallet_row(void)
  * CoreImage guard (placeholder icons, 2026-11-17): a default CIContext finds no Metal device and falls back to
  * +[CIContext internalGLContextWithOptions:], over Apple's own EAGLContext, which has no GL dispatch table
  * (getMacroContextPrivate NULL) and then calls a zeroed glDisable slot. Refuse the fallback (nil, which
- * -initWithOptions: handles) when there is no macro context. On by default in Preferences; ci_guard=0 off, ci_guard=1 on in every injected process.
+ * -initWithOptions: handles) when there is no macro context. On by default in every process that loads this library; ci_guard=0 off.
  */
 static id (*real_gl_context)(id, SEL, id);
 
@@ -477,11 +477,11 @@ guard_coreimage(void)
 
 	bool on;
 
-	/* default on in Preferences; ci_guard=0 turns it off, ci_guard=1 forces it on in every injected process */
+	/* default on in every process that loads this library (Preferences, iconservicesagent, SpringBoard); ci_guard=0 turns it off */
 	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) {
 		args[0] = 0;
 	}
-	on = strstr(args, "ci_guard=0") == NULL && (strstr(args, "ci_guard=1") != NULL || strcmp(executable_name(), "Preferences") == 0);
+	on = strstr(args, "ci_guard=0") == NULL;
 	if (!on) {
 		return;
 	}

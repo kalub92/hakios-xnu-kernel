@@ -2077,7 +2077,8 @@ at_step(uint32_t rel)
 	}
 	cmd = at_idx < at_n ? at_seq[at_idx] : "";
 	if (at_wait) {
-		uint32_t to = !strcmp(cmd, "AT+EFUN=0") ? 30000u : (!strcmp(cmd, "AT+EFUN=1") ? 10000u : 5000u);
+		uint32_t to = !strcmp(cmd, "AT+EFUN=0") ? 30000u : (!strcmp(cmd, "AT+EFUN=1") ? 10000u : (!strcmp(cmd, at_epdn_cmd) ? 1000u : 5000u));
+		/* md3d2: the +EPDN: line of AT+EPDN=0,"ifst",20 is NOT what the modem answers with within 5 s: it came 5.1 s later, right after the next command (AT+EIF ifst up) was sent, so the completion above never fires. The modem never gives this command a final result: wait 1 s, not 5 */
 
 		if (rel - at_sent_ms >= to) {
 			SAYM("r1md: [%u ms] AT< %s: TIMEOUT (%u s without a final result)", rel, cmd, to / 1000);
