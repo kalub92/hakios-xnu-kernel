@@ -1,0 +1,9 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# The r1's microphone through iOS, with the speaker playing at the same time (RC_JOBS=rc.jobs.mic-r1; kernel
+# boot-args mtkaudio=2 mtkmic=2; docs/microphone-spec.md step 8b; rc.jobs.mic is the POCO's). record_test records
+# ten seconds through AVAudioRecorder (the virtual audio device's "Codec", whose samples come from /dev/redwood-mic);
+# four seconds in, a raw 440 Hz tone of three seconds is written to /dev/redwood-audio, so the second half of the
+# file should be louder than the first and the speaker's power-up must not stop the microphone.
+/redwood/bin/sound_test springboard
+/redwood/bin/tolog /redwood/bin/sound_test wait 4 raw 3 &
+/redwood/bin/record_test 10

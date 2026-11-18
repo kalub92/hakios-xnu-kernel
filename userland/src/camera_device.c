@@ -92,9 +92,11 @@ redwood_camera_say(const char *format, ...)
 #pragma clang attribute push(__attribute__((minsize)), apply_to = function)
 
 /* every property the capture graph asks of, or sets on, our device and stream (first sight of each, with how many times after) */
+static long bootarg_number(const char *name, long otherwise);
 static void
 trace_key(const char *who, CFStringRef key)
 {
+	static long cap;
 	static struct { char tag[96]; unsigned said; } seen[96];
 	char name[80] = "?", tag[96];
 
@@ -105,7 +107,10 @@ trace_key(const char *who, CFStringRef key)
 			strlcpy(seen[i].tag, tag, sizeof(seen[i].tag));
 		}
 		if (strcmp(seen[i].tag, tag) == 0) {
-			if (seen[i].said++ >= 8) {
+			if (cap == 0) {
+				cap = bootarg_number("vdiag", 0) == 1 ? 24 : 8;     /* vd2: the Video iteration's own traffic */
+			}
+			if (seen[i].said++ >= cap) {
 				return;         /* (the graph's retry loop asks the same things 30 times a second) */
 			}
 			break;
@@ -829,6 +834,7 @@ output_info(int width, int height)
 	put(o, "MaxScaleFactor", number_f(1));
 	put(o, "MinScaleFactor", number_f(1.0 / 32));
 	put(o, "OutputWidthAlignmentRequirement", number_i(16));
+	put(o, "GeometricDistortionCorrectionSupported", CFRetain(kCFBooleanTrue));     /* vd2 fix 2a: harmless when GDC is off */
 	return o;
 }
 

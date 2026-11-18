@@ -1364,22 +1364,118 @@ vd_wrap(const char *class_name, const char *selector, bool class_method, void (*
 	return true;
 }
 
+/*
+ * vd2 A1/A2: the argument of -[BWMultiStreamCameraSourceNode configure:] (the node configuration, a guess confirmed by the getters answering) as
+ * text on its first 4 calls, and the getters of docs/video-recording-spec-2.md A.4, one line each time the set of values changes.
+ */
+static void
+vd_getters(id cfg)
+{
+	static const char *const names[] = { "previewOutputEnabled", "videoCaptureOutputEnabled", "videoStabilizationEnabled", "visionDataConfiguration",
+		"geometricDistortionCorrectionSupported", "geometricDistortionCorrectionOnStreamingOutputsEnabled", "secondaryScalerIsNotAvailable",
+		"primaryScalerDecoupled", "optimizeBandwidthForPreviewOutput", "depthType", "clientVideoFormat" };
+	static const char *const shorts[] = { "prev", "vcap", "vis", "vision", "gdcOK", "gdcOnStr", "noSec", "primDec", "optBW", "depth", "fmt" };
+	static char last[400];
+	char line[400] = "";
+	Class cls = object_getClass(cfg);
+
+	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		SEL sel = sel_registerName(names[i]);
+		Method m = class_getInstanceMethod(cls, sel);
+		char type[16] = "?";
+		uint64_t raw;
+
+		if (m == NULL) {
+			snprintf(line + strlen(line), sizeof(line) - strlen(line), " %s=NA", shorts[i]);
+			continue;
+		}
+		method_getReturnType(m, type, sizeof(type));
+		raw = ((uint64_t (*)(id, SEL))objc_msgSend)(cfg, sel);
+		if (type[0] == 'B' || type[0] == 'c') {
+			raw &= 0xff;
+		} else if (type[0] == 'i' || type[0] == 'I') {
+			raw &= 0xffffffff;
+		}
+		if (i == 10) {          /* clientVideoFormat: the 4cc and the pointer reading, and its type */
+			char cc[5] = "????";
+
+			for (int k = 0; k < 4; k++) {
+				unsigned char c = (raw >> (24 - 8 * k)) & 0xff;
+				cc[k] = c >= 32 && c < 127 ? (char)c : '?';
+			}
+			snprintf(line + strlen(line), sizeof(line) - strlen(line), " %s=%#llx('%s',%s)", shorts[i], raw, cc, type);
+		} else {
+			snprintf(line + strlen(line), sizeof(line) - strlen(line), " %s=%llx", shorts[i], raw);
+		}
+	}
+	static unsigned calls;
+
+	/* (changed, or every 5th call: the console tail starts late, and the kept lines hold only the first ones) */
+	if (strcmp(line, last) != 0 || calls++ % 5 == 0) {
+		strlcpy(last, line, sizeof(last));
+		host_line("vd:%s", line);
+	}
+}
+
+static void
+vd_configure_extra(const char *selector, uint64_t *args, uint64_t unused, bool say_it)
+{
+	static unsigned described;
+
+	(void)selector;
+	(void)unused;
+	(void)say_it;
+	if (args[0] < 0x100000000ULL) {
+		return;
+	}
+	if (described++ % 10 < 1) {
+		host_line("vdiag: configure: arg %.300s", text_of_object((id)(uintptr_t)args[0]));
+	}
+	vd_getters((id)(uintptr_t)args[0]);
+}
+
+/* vd2 A3: the first 10 exceptions made through +exceptionWithName:reason:userInfo: (the GDC throw is made by it) */
+static void
+vd_wrap_exceptions(void)
+{
+	Class cls = objc_getClass("NSException");
+	SEL sel = sel_registerName("exceptionWithName:reason:userInfo:");
+	Method m = cls ? class_getClassMethod(cls, sel) : NULL;
+
+	if (m == NULL) {
+		host_line("vdiag: +[NSException exceptionWithName:reason:userInfo:] NOT FOUND");
+		return;
+	}
+	typedef id (*ex_imp)(id, SEL, id, id, id);
+	ex_imp orig = (ex_imp)method_getImplementation(m);
+	__block unsigned n = 0;
+
+	method_setImplementation(m, imp_implementationWithBlock((id)^id(id me, id name, id reason, id info) {
+		if (__sync_add_and_fetch(&n, 1) <= 10) {
+			host_line("vdiag: NSException #%u name %.60s reason %.250s", n, text_of_object(name), text_of_object(reason));
+		}
+		return orig(me, sel, name, reason, info);
+	}));
+	host_line("vdiag: +[NSException exceptionWithName:reason:userInfo:] wrapped");
+}
+
 /* retried every 5 s for 10 minutes: CMCapture's classes exist when the camera first starts. _writeBuffer:forInputIndex: has the buffer in a, the input in b. */
 static void
 vd_wrap_sinks(void)
 {
-	static bool done[4];
-	static const char *const w[4][2] = {
-		{ "BWQuickTimeMovieFileSinkNode", "_doStartRecordingAtTime:withSettings:sensorVideoPort:" },
-		{ "BWQuickTimeMovieFileSinkNode", "_writeBuffer:forInputIndex:" },
-		{ "BWQuickTimeMovieFileSinkNode", "_doEndRecordingAtTime:earlyTerminationErrCode:" },
-		{ "BWFileCoordinatorNode", "_doStartingToRecordWithSBuf:inputIndex:sbufPTS:" },
+	static bool done[5];
+	static const struct { const char *cls, *sel; void (*extra)(const char *, uint64_t *, uint64_t, bool); } w[5] = {
+		{ "BWQuickTimeMovieFileSinkNode", "_doStartRecordingAtTime:withSettings:sensorVideoPort:", NULL },
+		{ "BWQuickTimeMovieFileSinkNode", "_writeBuffer:forInputIndex:", NULL },
+		{ "BWQuickTimeMovieFileSinkNode", "_doEndRecordingAtTime:earlyTerminationErrCode:", NULL },
+		{ "BWFileCoordinatorNode", "_doStartingToRecordWithSBuf:inputIndex:sbufPTS:", NULL },
+		{ "BWMultiStreamCameraSourceNode", "configure:", vd_configure_extra },
 	};
 	static unsigned tries;
 	bool all = true;
 
-	for (unsigned i = 0; i < 4; i++) {
-		done[i] = done[i] || vd_wrap(w[i][0], w[i][1], false, NULL);
+	for (unsigned i = 0; i < 5; i++) {
+		done[i] = done[i] || vd_wrap(w[i].cls, w[i].sel, false, w[i].extra);
 		all &= done[i];
 	}
 	if (!all && ++tries < 120) {
@@ -1435,6 +1531,32 @@ vd_record_start(const char *selector, uint64_t *args, uint64_t unused, bool say_
 	}
 }
 
+/* vd2 fix 1c: -[AVCaptureConnection setPreferredVideoStabilizationMode:] says its argument (first 6 calls) and, with vfix=1, makes it Off (0) */
+static void
+vd_stabilization(void)
+{
+	Class cls = objc_getClass("AVCaptureConnection");
+	SEL sel = sel_registerName("setPreferredVideoStabilizationMode:");
+	Method m = cls ? class_getInstanceMethod(cls, sel) : NULL;
+	bool force = boot_arg_has("vfix=1");
+
+	if (m == NULL) {
+		host_line("vdiag: AVCaptureConnection setPreferredVideoStabilizationMode: NOT FOUND");
+		return;
+	}
+	typedef void (*stab_imp)(id, SEL, long);
+	stab_imp orig = (stab_imp)method_getImplementation(m);
+	__block unsigned n = 0;
+
+	method_setImplementation(m, imp_implementationWithBlock((id)^void(id me, long mode) {
+		if (__sync_add_and_fetch(&n, 1) <= 6) {
+			host_line("vdiag: setPreferredVideoStabilizationMode: %ld%s", mode, force ? " -> 0 (vfix=1)" : "");
+		}
+		orig(me, sel, force ? 0 : mode);
+	}));
+	host_line("vdiag: setPreferredVideoStabilizationMode: wrapped%s", force ? ", forcing Off" : "");
+}
+
 /* 7, 8, 9: the Camera app's storage check and recording call, and the video configuration getters */
 static void
 vdiag_camera_app(void)
@@ -1460,6 +1582,7 @@ vdiag_camera_app(void)
 		}
 	}
 	free(methods);
+	vd_stabilization();
 	Class cap = objc_getClass("CAMCaptureCapabilities");
 	host_line("vdiag: CAMCaptureCapabilities %s", cap ? "present" : "absent");
 }
@@ -1471,6 +1594,8 @@ vdiag_media_start(void)
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
 		vdiag_encoder_list("mediaserverd");
 	});
+	host_line("vd2: outputs say GDC supported");
+	vd_wrap_exceptions();
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
 		vd_wrap_sinks();
 	});

@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-18 13:27 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-18 14:38 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -32,16 +32,16 @@ Last updated: 2026-11-18 13:27 PST. Kept current as work lands; details are in t
 
 ## In progress
 
-- Home-screen swipes: driver shader caches took the swipe test from 9 to 21 swaps per second (frame time 10.8 to 4.4 ms; `swipe-profile.md`). Home screen looks correct; Camera and Settings pictures with the new driver still to be checked, then a hands-on look
+- Home-screen swipes: driver shader caches took the swipe test from 9 to 21 swaps per second (`swipe-profile.md`); home, Settings and Camera screenshots look correct with them; needs a hands-on look
+- Microphone: capture path written into the audio driver (default off), device tests next
 - Using Open Mapple (github.com/open-mapple, same code lineage, MediaTek phone): plan in `open-mapple-plan.md`; phase 1 small items done (volume guard, UI-activity CPU boost with no measured gain yet, boot-args length check); pass benchmark and profiler next
-- Microphone: spec written (`microphone-spec.md`), implementation waiting for the owner's OK to change the audio driver
 - Microphone and video recording: analysis of what each needs (see open problems)
 - Bluetooth speaker audio (A2DP): ready for a hands-on session; no sound has been sent to a speaker yet
 
 ## Open problems
 
 - Microphone records silence: the kernel audio driver has no capture (uplink) path at all
-- Video recording fails in two places: Camera's capture graph loops as soon as Video mode is selected (before any encoder is asked for), and neither of Apple's dormant software encoders (H.264, HEVC) will create a session when registered (-12908)
+- Video recording: Camera's Video mode now streams (video stabilization forced off, `vfix=1`) and recording starts and stops without error, but there is still no working H.264 encoder: VideoToolbox never calls a registered encoder (-12908), so no confirmed movie file
 - Cellular alongside Wi-Fi (Wi-Fi should win) is untested: unattended runs have no Wi-Fi
 - All audio went silent after a speaker was paired (likely the route moved to a Bluetooth output that could not carry sound; not confirmed)
 - Safari audio spins and never plays; a Safari file download would not start (untested unattended: no Wi-Fi in those runs)
