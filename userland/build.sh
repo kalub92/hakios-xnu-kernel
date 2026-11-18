@@ -136,6 +136,8 @@ IOS_JOBS=${JOBS-"
 # MORE_JOBS="label ...": other iOS jobs added to the list for a run (the wallpaper's: com.apple.mediaserverd,
 # which decodes HEIC -- the posters' pictures -- for every process)
 [ -n "$MORE_JOBS" ] && IOS_JOBS="$IOS_JOBS $MORE_JOBS"
+# MEDIAPARSERD=1: CoreMedia's file/stream parser daemon (starts on demand only; docs/audio-gaps.md C2/D2)
+[ -n "$MEDIAPARSERD" ] && IOS_JOBS="$IOS_JOBS com.apple.mediaparserd"
 # DROP_JOBS="label ...": jobs left out for a run (com.apple.chronod: no widget extensions, run 326)
 for j in $DROP_JOBS; do IOS_JOBS=$(echo " $IOS_JOBS " | tr '\n\t' '  ' | sed "s/ $j / /g"); done
 # (and TRIM="label:service,...;..." keeps only those Mach services of a job: see mkjobs.py)
@@ -591,6 +593,15 @@ if [ -n "$BT" ] && [ -d ../../ios-extra/BTAudioHALPlugin.driver ]; then
 	rm -f root/bin/camera_avtest root/bin/apfs_mmap_test root/bin/metal_test root/bin/pvr_vk_test root/bin/pvr_gl_test
 	find root/lib/BTAudioHALPlugin.driver -name "*.lproj" -empty -exec rmdir {} +   # 50 empty language directories: the boot partition is full
 	ln -s /redwood/lib/BTAudioHALPlugin.driver root/hal/BTAudioHALPlugin.driver
+fi
+# ringtones (docs/audio-gaps.md): /Library/Ringtones is not in the system image; init binds root/ringtones there.
+# NOT for BT=1 builds: that payload has only ~32 KB headroom. A missing source file is skipped silently.
+if [ -z "$BT" ]; then
+	RT=/System/Library/PrivateFrameworks/ToneLibrary.framework/Versions/A/Resources/Ringtones
+	for t in ${RINGTONES-}; do  # opt-in: the 32 MB boot partition has no room by default (Opening alone needs test tools cut)
+		[ -f "$RT/$t.m4r" ] || continue
+		mkdir -p root/ringtones && cp "$RT/$t.m4r" root/ringtones/ && chmod 644 "root/ringtones/$t.m4r"
+	done
 fi
 # the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/
 # as it is, which the kernel's drivers use where it lies in memory (bsd/dev/redwood_image.c)

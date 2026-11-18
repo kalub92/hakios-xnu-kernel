@@ -1421,6 +1421,11 @@ main(int argc, char **argv, char **envp)
 	if (!flash_root_mode && stat(in_image("/hal/BTAudioHALPlugin.driver"), &bt_st) == 0) {
 		check(bind_dir(in_image("/hal"), "/System/Library/Audio/Plug-Ins/HAL"), "our audio devices + Bluetooth's");
 	}
+	/* ringtones (docs/audio-gaps.md): ToneLibrary reads /Library/Ringtones, which the system image does not have */
+	if (!flash_root_mode && stat(in_image("/ringtones/Opening.m4r"), &bt_st) == 0 && stat("/Library/Ringtones", &bt_st) != 0) {
+		check(synthetic_dir("/Library/Ringtones") && bind_dir(in_image("/ringtones"), "/Library/Ringtones"),
+		    "ringtones on /Library/Ringtones");
+	}
 	run_rc(in_image("/etc/rc"));
 	printf("\n=== init: done ===\n");
 	reboot(RB_HALT);

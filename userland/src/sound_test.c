@@ -18,6 +18,9 @@
  *   file PATH                          a sound file, played as a system sound
  *   route                              where iOS says its sound goes: the audio session's outputs and volume,
  *                                      and the devices of the system's output context
+ *   avplayer URL SECONDS              AVPlayer on a path or an http(s) URL, as an application or WebKit's GPU
+ *                                      process plays media: item status and player state every second
+ *                                      (docs/audio-gaps.md); passes if ready and playing at the end
  *   haptic [SECONDS]                   haptics the way an application (and UIKit's feedback generators) plays
  *                                      them, through CoreHaptics: a tap, then a vibration of SECONDS (default
  *                                      0.3, at most 3: the kernel cuts a vibration at 1 s) at half strength, then
@@ -374,6 +377,48 @@ restart(void)
 	printf("sound_test: restart: no mediaserverd is running\n");
 }
 
+/* AVPlayer, as an application or WebKit's GPU process would play a file or a URL: what the item and the player say, every second */
+static int
+avplayer(const char *where, double seconds)
+{
+	CFStringRef s = CFStringCreateWithCString(NULL, where, kCFStringEncodingUTF8);
+	Class NSURL = objc_getClass("NSURL");
+	id url = strstr(where, "://") ? ((id (*)(id, SEL, id))objc_msgSend)((id)NSURL, sel_registerName("URLWithString:"), (id)s)
+	    : ((id (*)(id, SEL, id))objc_msgSend)((id)NSURL, sel_registerName("fileURLWithPath:"), (id)s);
+	id session = send((id)objc_getClass("AVAudioSession"), "sharedInstance");
+	id error = NULL;
+	BOOL ok;
+
+	printf("sound_test: avplayer %s: category Playback\n", where);
+	((BOOL (*)(id, SEL, id, id *))objc_msgSend)(session, sel_registerName("setCategory:error:"), (id)CFSTR("AVAudioSessionCategoryPlayback"), &error);
+	printf("sound_test: avplayer: setActive...\n");          /* a hang here = the audio session (mediaserverd) */
+	ok = ((BOOL (*)(id, SEL, BOOL, id *))objc_msgSend)(session, sel_registerName("setActive:error:"), YES, &error);
+	printf("sound_test: avplayer: setActive %d %.200s\n", ok, error ? text(send(error, "description")) : "");
+	id player = ((id (*)(id, SEL, id))objc_msgSend)((id)objc_getClass("AVPlayer"), sel_registerName("playerWithURL:"), url);
+	printf("sound_test: avplayer: player %p, play\n", (void *)player);
+	((void (*)(id, SEL))objc_msgSend)(player, sel_registerName("play"));
+	long last = -1;
+	for (double t = 0; t < seconds; t += 1) {
+		CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1, false);
+		id item = send(player, "currentItem");
+		long status = item ? ((long (*)(id, SEL))objc_msgSend)(item, sel_registerName("status")) : -1;
+		long control = ((long (*)(id, SEL))objc_msgSend)(player, sel_registerName("timeControlStatus"));
+		struct { int64_t value; int32_t timescale; uint32_t flags; int64_t epoch; } now =
+		    ((typeof(now) (*)(id, SEL))objc_msgSend)(player, sel_registerName("currentTime"));
+		id failure = item ? send(item, "error") : NULL;
+		/* status 0 unknown, 1 ready, 2 failed; control 0 paused, 1 waiting, 2 playing */
+		if (status * 10 + control != last || (int)t % 5 == 0) {
+			printf("sound_test: avplayer t=%.0f status %ld control %ld at %.2f s waiting \"%s\" %.200s\n", t, status, control,
+			    now.timescale ? (double)now.value / now.timescale : -1.0, text(send(player, "reasonForWaitingToPlay")),
+			    failure ? text(send(failure, "description")) : "");
+			last = status * 10 + control;
+		}
+	}
+	((void (*)(id, SEL))objc_msgSend)(player, sel_registerName("pause"));
+	CFRelease(s);
+	return last != 12;      /* passed = ready and playing at the end */
+}
+
 int
 main(int argc, char **argv)
 {
@@ -400,6 +445,9 @@ main(int argc, char **argv)
 				sleep((unsigned)atoi(argv[i + 2]));
 				route();
 			}
+			i += 2;
+		} else if (strcmp(argv[i], "avplayer") == 0 && i + 2 < argc) {
+			failed |= avplayer(argv[i + 1], atof(argv[i + 2]));
 			i += 2;
 		} else if (strcmp(argv[i], "route") == 0) {
 			route();

@@ -1,0 +1,8 @@
+# Commands run by the launchd job com.redwood.demo. docs/audio-gaps.md D1/D2 (RC_JOBS=rc.jobs.media): AVPlayer on local files
+# (a text tone, a ringtone), plain http and https, then Safari on an mp3. One line at a time: the first blocks ~60 s after SpringBoard.
+/redwood/bin/sound_test springboard route avplayer /System/Library/PrivateFrameworks/ToneLibrary.framework/AlertTones/Modern/Note.m4r 6 avplayer /Library/Ringtones/Opening.m4r 6 avplayer http://commondatastorage.googleapis.com/codeskulptor-demos/DDR_assets/Kangaroo_MusiQue_-_The_Neverwritten_Role_Playing_Game.mp3 15 avplayer https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3 15 route
+/bin/ps -A
+/redwood/bin/rwtouch say safari notify com.redwood.unlock wait 5
+/redwood/bin/battery_test open https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3
+/redwood/bin/rwtouch wait 12 say tap tap 0.5 0.5 wait 20 say end
+/bin/ps -A
