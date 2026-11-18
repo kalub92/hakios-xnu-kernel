@@ -45,6 +45,7 @@
 #include <stdarg.h>
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void redwood_host_keep_add(const char *format, ...) __printflike(1, 2);
@@ -78,6 +79,15 @@ static volatile bool md_quiet;
 /* Log budget (docs/cellular-attach-2.md 5c): SAY = bulk, dropped (and counted in md_cut) once ~20 KB of r1md output went out (26 KB after radio-on);
  * SAYM = must-lines (results, gate summary, radio on/off, registration URCs, CCIF bits >= 16, errors, exceptions): never dropped. Lines are <= 191 chars. */
 static uint32_t md_bytes, md_cut, md_sup, md_budget = 20000;   /* md_sup: lines deduplicated on purpose */
+/* Stage 4a (r1_md=10/11, the service): the 64 KB kept buffer (redwood_host_keep) fills from the head and is shared with every other driver, so the service keeps
+ * SVC_RESERVE bytes of it for itself: ordinary lines (SAY and SAYM) stop at that mark, SAYF lines (status, watchdog trips, the exit) go on to the very end; after the
+ * gates ordinary lines also pass a token bucket (30 at once, one more every 3 s); what it drops is counted (sv_rl_cut). */
+extern uint32_t redwood_host_keep_len, redwood_host_keep_dropped, redwood_host_keep_reserve;
+#define SVC_RESERVE     14000u
+static bool svc, svc_radio, sv_steady, say_force;       /* svc: r1_md=10 or 11; svc_radio: 11; sv_steady: the gates have been evaluated */
+static uint32_t sv_rl_cut, sv_tok = 30, sv_tok_ms;
+static uint64_t md_t0;
+static uint32_t md_ms(void);
 
 void redwood_md_say(bool must, const char *format, ...) __printflike(2, 3);
 void
@@ -94,6 +104,27 @@ redwood_md_say(bool must, const char *format, ...)
 	vsnprintf(b, sizeof(b), format, ap);
 	va_end(ap);
 	l = strlen(b) + 1;
+	if (svc && !say_force) {
+		if (redwood_host_keep_len + l > 0xff00u - SVC_RESERVE) {
+			md_cut++;
+			return;
+		}
+		if (sv_steady) {
+			uint32_t now = md_ms();
+
+			if (now - sv_tok_ms >= 3000) {
+				uint32_t add = (now - sv_tok_ms) / 3000;
+
+				sv_tok = sv_tok + add > 30 ? 30 : sv_tok + add;
+				sv_tok_ms += add * 3000;
+			}
+			if (!sv_tok) {
+				sv_rl_cut++;
+				return;
+			}
+			sv_tok--;
+		}
+	}
 	if (!must && md_bytes > md_budget) {
 		md_cut++;
 		return;
@@ -103,6 +134,7 @@ redwood_md_say(bool must, const char *format, ...)
 }
 #define SAY(...)  redwood_md_say(false, __VA_ARGS__)
 #define SAYM(...) redwood_md_say(true, __VA_ARGS__)
+#define SAYF(...) do { say_force = true; redwood_md_say(true, __VA_ARGS__); say_force = false; } while (0)
 /* redwood_cldma.c */
 extern void cldma_maps(vm_offset_t infra);
 extern void cldma_snap(const char *why, uint32_t ms, bool md_on);
@@ -128,6 +160,8 @@ extern bool cell_if_done(void);
 extern bool cell_if_exists(void);
 extern void cell_if_stats(uint32_t *txp, uint32_t *txb, uint32_t *rxp, uint32_t *rxb, uint32_t *drops, bool *caphit);
 extern void cell_if_stop(const char *why);
+extern void cell_if_period(uint32_t ms);
+extern void cldma_svc_enable(void);
 
 /* SPM */
 #define SPM_PWR_STATUS          0x180
@@ -227,13 +261,48 @@ static bool found_vm_valid;
 /* 0 not started, 1 powering on / running, 2 powered down again */
 static volatile int md_state;
 static uint32_t md_level;       /* the r1_md value: 3 = stage 1 + 2a */
-static uint64_t md_t0;
 static uint32_t rd_t_on;        /* ms (run-relative) at which AT+EFUN=1 was sent; 0 = never */
 static bool data_on, eif_on;    /* Stage 3a, see the comment at cldma_on */
 /* Stage 3b: if_on = r1_md_if=1 (or the r1_md=9 shorthand) together with data_on. if_pkts / if_kb: per-direction traffic caps (boot-args r1_md_if_pkts, r1_md_if_kb) */
 static bool if_on, if_ok;       /* if_ok: pdp_ip0 was attached and configured */
 static uint32_t if_pkts = 300, if_kb = 150, if_hold_ms = 20000, if_t0;
 static char if_why[48] = "";
+
+/* ---- Stage 4a/4b (docs/cellular-stage4.md): the modem as a service, r1_md=10 (radio off) / 11 (radio on; also needs r1_md_radio=1 and the ten gates) ---- */
+static struct {
+	bool fatal, stop_called, denied, w7, budget_hit, cpms_done;
+	const char *why;                        /* the watchdog that wants the modem stopped */
+	uint32_t t_start, next_status, next_status2, next_ka, next_gate, next_w4, next_w7, next_boot, next_cell, next_b20, act_ms, to_run;
+	uint32_t ka_n, ka_ok, polls_fast, polls_slow, win_busy_us;
+	uint32_t oth_win, oth_win_t, new_ch, sys_unknown, b20_win, b20_bad, w7_cycles, csq, bars;
+	uint64_t busy_ns, bytes64, last_pkts;
+	uint32_t last_gates, last_cell_tx, last_cell_rx, cpms_n;
+	uint8_t ka_cmd;
+	char cpms[64], cpms_fin[24];
+	int rsrp;
+} sv = { .rsrp = -9999, .csq = 99 };
+static uint32_t sv_gen;
+static char cs_state[24] = "off", cs_sig[24] = "", cs_op[16] = "", cs_addr[20] = "", cs_cpms[64] = "";
+static int cs_rat, cs_mtu, cs_radio, cs_budget_kb = 102400, cs_gates, cs_fsops, cs_ovl;
+static uint64_t cs_bytes;
+SYSCTL_DECL(_kern_redwood);
+SYSCTL_STRING(_kern_redwood, OID_AUTO, cell_state, CTLFLAG_RD | CTLFLAG_LOCKED, cs_state, sizeof(cs_state), "modem service: off|booting|gates_failed|radio_off|searching|registered|data_up|denied|budget|stopped (r1_md=10/11)");
+SYSCTL_STRING(_kern_redwood, OID_AUTO, cell_sig, CTLFLAG_RD | CTLFLAG_LOCKED, cs_sig, sizeof(cs_sig), "csq,rsrp(raw ECSQ),bars 0-4");
+SYSCTL_STRING(_kern_redwood, OID_AUTO, cell_op, CTLFLAG_RD | CTLFLAG_LOCKED, cs_op, sizeof(cs_op), "operator name (+COPS?)");
+SYSCTL_INT(_kern_redwood, OID_AUTO, cell_rat, CTLFLAG_RD | CTLFLAG_LOCKED, &cs_rat, 0, "access technology (7 = LTE)");
+SYSCTL_STRING(_kern_redwood, OID_AUTO, cell_addr, CTLFLAG_RD | CTLFLAG_LOCKED, cs_addr, sizeof(cs_addr), "bearer IPv4 address");
+SYSCTL_INT(_kern_redwood, OID_AUTO, cell_mtu, CTLFLAG_RD | CTLFLAG_LOCKED, &cs_mtu, 0, "bearer MTU");
+SYSCTL_UINT(_kern_redwood, OID_AUTO, cell_gen, CTLFLAG_RD | CTLFLAG_LOCKED, &sv_gen, 0, "bumped at every bearer up/down");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, cell_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &cs_bytes, "rx+tx bytes of pdp_ip0 this boot (64 bit)");
+SYSCTL_INT(_kern_redwood, OID_AUTO, cell_radio, CTLFLAG_RW | CTLFLAG_LOCKED, &cs_radio, 0, "radio wanted (0/1); needs r1_md=11, r1_md_radio=1 and the gates to take effect");
+SYSCTL_INT(_kern_redwood, OID_AUTO, cell_budget_kb, CTLFLAG_RW | CTLFLAG_LOCKED, &cs_budget_kb, 0, "data allowance left this boot (KB); 0 = exhausted");
+SYSCTL_INT(_kern_redwood, OID_AUTO, cell_gates, CTLFLAG_RD | CTLFLAG_LOCKED, &cs_gates, 0, "gates passed of 10 (last evaluation)");
+SYSCTL_INT(_kern_redwood, OID_AUTO, cell_fsops, CTLFLAG_RD | CTLFLAG_LOCKED, &cs_fsops, 0, "modem FS requests served");
+SYSCTL_INT(_kern_redwood, OID_AUTO, cell_overlay, CTLFLAG_RD | CTLFLAG_LOCKED, &cs_ovl, 0, "NV overlay bytes in RAM");
+SYSCTL_STRING(_kern_redwood, OID_AUTO, cell_cpms, CTLFLAG_RD | CTLFLAG_LOCKED, cs_cpms, sizeof(cs_cpms), "AT+CPMS? answer (where SMS are stored)");
+/* Stage 4b: the exit request (redwood_md_stop_request) and the modem being down (md_pd_done) */
+static volatile bool svc_exit_req, md_pd_started, md_pd_done;
+static volatile uint64_t svc_exit_t0;
 
 static inline uint32_t
 rd(vm_offset_t base, uint32_t at)
@@ -1285,12 +1354,18 @@ static const char *const at_white[] = {
 	"AT+CEREG?", "AT+COPS?", "AT+CSQ", "AT+CGATT?", "AT+CEMODE?", "AT+ERAT?", "AT+EBOOT=0", "AT+EPOC",
 	/* attempt 2 (docs/cellular-attach.md 4.1): stock volatile pre-radio settings, URC enables, read-only diagnostics */
 	"AT+EDALLOW=1", "AT+EGRAT=14", "AT+CEREG=3", "AT+CSCON=3", "AT+EIAREG=1", "AT+PSBEARER=1", "AT+ECCAUSE=1", "AT+CEER", "AT+EREG?", "AT+EGREG?", "AT+CSCON?", "AT+EPSB?",
+	"AT+CPMS?" /* Stage 4a: read only, where SMS are stored */,
 };
 /* the scripts: 2d (r1_md=6), 2e-1 (r1_md=7: SIM up, radio off), and the 2e-2 ones (radio_go only) */
 static const char *const at_seq6[] = { "AT", "ATE0", "AT+CFUN?", "AT+EFUN?", "AT+CPIN?", "AT+ESIMS?", "AT+CGSN", "AT+CGMR" };
 static const char *const at_seq7[] = {
 	"AT", "ATE0", "AT+CMEE=1", "AT+ESIMS=1", "AT+ESIMS", "AT+EDALLOW=1", "AT+EBOOT=0", "AT+EPOC", "AT+EFUN=0", "AT+CPIN?", "AT+EFUN?", "AT+CFUN?",
 	"AT+CGSN", "AT+CGMR", "AT+ERAT?", "AT+CEMODE?", "AT+EPSB?",
+};
+/* r1_md=10/11: the same as at_seq7, then the read-only AT+CPMS? (where the modem stores SMS) */
+static const char *const at_seq7s[] = {
+	"AT", "ATE0", "AT+CMEE=1", "AT+ESIMS=1", "AT+ESIMS", "AT+EDALLOW=1", "AT+EBOOT=0", "AT+EPOC", "AT+EFUN=0", "AT+CPIN?", "AT+EFUN?", "AT+CFUN?",
+	"AT+CGSN", "AT+CGMR", "AT+ERAT?", "AT+CEMODE?", "AT+EPSB?", "AT+CPMS?",
 };
 static const char *const at_seqA[] = {
 	"AT+CREG=2", "AT+CGREG=2", "AT+CEREG=3", "AT+EREG=3", "AT+EGREG=3", "AT+CSCON=3", "AT+EIAREG=1", "AT+PSBEARER=1", "AT+ECCAUSE=1", "AT+ECSQ=1",
@@ -1301,6 +1376,7 @@ static const char *const at_seqC[] = { "AT+CSCON?" };
 static const char *const at_seqD[] = { "AT+CEER", "AT+CEREG?", "AT+EREG?", "AT+EGREG?", "AT+CSCON?" };
 static const char *const at_seqQ[] = { "AT+CEREG?" };
 static const char *const at_seqS[] = { "AT+CSQ" };
+static const char *const at_seqM[] = { "AT+CPMS?" };
 #define AT_NCMD 8
 static const char *const at_names[AT_NCMD] = { "AT", "ATE0", "CFUN", "EFUN", "CPIN", "ESIMS", "CGSN", "CGMR" };
 static const char *const *at_seq = at_seq6;
@@ -1388,7 +1464,7 @@ at_safe(const char *l, char *out, uint32_t outsz)
 		if (!strcmp(pre, "+CEREG") || !strcmp(pre, "+CREG") || !strcmp(pre, "+CGREG") || !strcmp(pre, "+EREG") || !strcmp(pre, "+EGREG") ||
 			!strcmp(pre, "+ECSQ") || !strcmp(pre, "+COPS") || !strcmp(pre, "+CSQ") || !strcmp(pre, "+CGATT") || !strcmp(pre, "+CSCON") ||
 			!strcmp(pre, "+EIAREG") || !strcmp(pre, "+CGEV") || !strcmp(pre, "+PSBEARER") || !strcmp(pre, "+ECCAUSE") || !strcmp(pre, "+CEER") ||
-			!strcmp(pre, "+EPSB")) {      /* cell/signal/operator: not personal */
+			!strcmp(pre, "+EPSB") || !strcmp(pre, "+CPMS")) {      /* cell/signal/operator/message memory: not personal */
 			uint32_t o = 0;
 
 			for (; l[o] && o + 1 < outsz; o++) {
@@ -1483,6 +1559,7 @@ ecsq_log(const char *l)
 	}
 	rsrp = (int)strtol(f[6], NULL, 10);
 	lnow = strtol(f[0], NULL, 10) == 255;
+	sv.rsrp = lnow ? -9999 : rsrp;
 	chg = lnow != lost || (!lnow && (rsrp > last ? rsrp - last : last - rsrp) >= 12);
 	if (n++ < 3 || chg) {
 		last = rsrp;
@@ -1554,7 +1631,7 @@ at_send(const char *cmd, uint32_t rel)
 	if (!ring_tx(5, 12, 0, CCCI_HEADER_LEN + n + 1, 0, body, n + 1, rel)) {
 		return false;
 	}
-	if (!(rd_t_on && at_periodic(cmd))) {
+	if (!((rd_t_on || sv_steady) && at_periodic(cmd))) {
 		SAY("r1md: [%u ms] AT> %s", rel, cmd);
 	}
 	strlcpy(at_lastcmd, cmd, sizeof(at_lastcmd));
@@ -1709,7 +1786,9 @@ at_note(const char *l, uint32_t rel)
 			data_scan("EAPNINFO", l + 10, false);
 		}
 	}
-	if (!strncmp(l, "+ESIMS:", 7)) {
+	if (!strncmp(l, "+CPMS:", 6)) {
+		at_safe(l, sv.cpms, sizeof(sv.cpms));       /* message storages and counts, not personal; the line is kept for the service's own report */
+	} else if (!strncmp(l, "+ESIMS:", 7)) {
 		sim_esims = (int)strtol(l + 7, NULL, 10);
 	} else if (!strncmp(l, "+ICCID:", 7)) {
 		const char *v = l + 7;
@@ -1830,8 +1909,13 @@ at_finish(const char *final, uint32_t rel)
 	show[0] = 0;
 	idbuf[0] = 0;
 	at_last_ok = !strcmp(final, "OK");
+	sv.to_run = 0;          /* (service watchdog W2: any final result, error or not, is an answer) */
+	if (!strcmp(cmd, "AT+CPMS?")) {
+		strlcpy(sv.cpms_fin, final, sizeof(sv.cpms_fin));
+		sv.cpms_done = true;
+	}
 	at_resp[at_rlen] = 0;
-	if (md_level >= 7 && rd_t_on && at_periodic(cmd) && at_same_as_last(cmd, final)) {
+	if (md_level >= 7 && (rd_t_on || sv_steady) && at_periodic(cmd) && at_same_as_last(cmd, final)) {
 		suppress = true;
 		md_sup++;
 	}
@@ -1874,6 +1958,9 @@ at_finish(const char *final, uint32_t rel)
 				}
 			} else if (radio_go && !strncmp(line, "+CSQ:", 5)) {
 				rp_csqv = (int)strtol(line + 5, NULL, 10);
+			}
+			if (svc && !strncmp(line, "+CSQ:", 5)) {
+				sv.csq = (uint32_t)strtol(line + 5, NULL, 10);
 			}
 			if (data_on && !strncmp(line, "+CGCONTRDP:", 11)) {
 				contrdp_parse(line);
@@ -2077,7 +2164,11 @@ at_step(uint32_t rel)
 	}
 	cmd = at_idx < at_n ? at_seq[at_idx] : "";
 	if (at_wait) {
-		uint32_t to = !strcmp(cmd, "AT+EFUN=0") ? 30000u : (!strcmp(cmd, "AT+EFUN=1") ? 10000u : (!strcmp(cmd, at_epdn_cmd) ? 1000u : 5000u));
+		uint32_t to = !strcmp(cmd, "AT+EFUN=0") ? (svc ? 5000u : 30000u) : (!strcmp(cmd, "AT+EFUN=1") ? 10000u : (!strcmp(cmd, at_epdn_cmd) ? 1000u : 5000u));
+
+		if (svc_exit_req && !strcmp(cmd, "AT+EFUN?")) {
+			to = 2000;      /* Stage 4b: EFUN=0 5 s (above), EFUN? 2 s, the whole exit 8 s */
+		}
 		/* md3d2: the +EPDN: line of AT+EPDN=0,"ifst",20 is NOT what the modem answers with within 5 s: it came 5.1 s later, right after the next command (AT+EIF ifst up) was sent, so the completion above never fires. The modem never gives this command a final result: wait 1 s, not 5 */
 
 		if (rel - at_sent_ms >= to) {
@@ -2085,6 +2176,7 @@ at_step(uint32_t rel)
 			at_dump(cmd, rel);
 			at_last_ok = false;
 			at_to = true;
+			sv.to_run++;
 			efun1_to |= !strcmp(cmd, "AT+EFUN=1");
 			if (md_level == 6) {
 				snprintf(at_res[at_idx], sizeof(at_res[at_idx]), "timeout");
@@ -2304,6 +2396,9 @@ drain_one(int q, uint32_t rel)
 	} else if (ch == 2) {
 		st2a.sys++;
 		st2a.sys_late += st2a.hs2;
+		if (svc && st2a.hs2 && data1 != 0x105 && data1 != 0x114 && data1 != 0x116) {
+			sv.sys_unknown++;       /* service: a system message after HS2 is counted; only one we do not know ends the radio (W6) */
+		}
 		SAY("r1md: sys msg %#x resv %#x", data1, resv);
 		if (md_level >= 4) {
 			sys_serve(data1, resv, rel);
@@ -2318,6 +2413,10 @@ drain_one(int q, uint32_t rel)
 		}
 		if (ch != 4 && ch != 34 && ch != 57 && ch != 59 && ch != 169 && ch != 171) {
 			st2a.oth_bad++;     /* gate 7 and the pre-radio-on stop rule only; after EFUN=1 the rules in post_radio_rx apply */
+		}
+		if (svc && ch != 4 && ch != 34 && ch != 38 && ch != 57 && ch != 59 && ch != 169 && ch != 171) {
+			sv.oth_win++;       /* W6: counted per minute, and a channel never seen before is the other trigger */
+			sv.new_ch += ch >= 256 || oth_ch[ch] == 1;
 		}
 		if (rd_t_on) {
 			post_radio_rx(ch, q, L, seq, pkt, rel);
@@ -2558,6 +2657,7 @@ read_hs1(uint32_t elapsed)
 /* ---- sub-stage 2e: the ten gates (docs/cellular-stage3.md A.10), evaluated where the radio-on command would be sent ---- */
 
 static uint32_t gates_pass, g_sta0, g_sta1;
+static bool gates_quiet;       /* the service re-evaluates the gates now and then without a line per failure */
 static char gates_bad[100];
 static bool gates_done, g_exc, had_wifi, imei_h_set;
 static uint32_t g_connsys, imei_h;
@@ -2571,7 +2671,7 @@ gate_out(int n, const char *name, int res, const char *fmt, ...)
 	va_start(ap, fmt);
 	vsnprintf(d, sizeof(d), fmt, ap);
 	va_end(ap);
-	if (res != 0) {         /* passing gates are in the summary line "gates N/10" */
+	if (res != 0 && !gates_quiet) {         /* passing gates are in the summary line "gates N/10" */
 		SAYM("r1md: gate %d %s: %s %s", n, name, res == 1 ? "FAIL" : "pending reference", d);
 	}
 	if (res == 0) {
@@ -2620,8 +2720,8 @@ gates_eval(uint32_t sta0, uint32_t sta1, bool exc)
 	}
 	ops[on] = 0;
 	gate_out(5, "rpc", (!st2a.unanswered && !rpc_bad) ? 0 : 1, "unanswered %u, ops seen: %s(stock: 4005 400e)", st2a.unanswered, on ? ops : "none ");
-	gate_out(6, "no_sysmsg_after_hs2", st2a.sys_late ? 1 : 0, "system messages after HS2 %u (in all %u)", st2a.sys_late, st2a.sys);
-	gate_out(7, "channels", (!st2a.oth_bad && !garbage) ? 0 : 1, "other-channel packets outside {4,34,57,59,169,171}: %u, ring garbage %s", st2a.oth_bad,
+	gate_out(6, "no_sysmsg_after_hs2", (svc && sv_steady ? sv.sys_unknown : st2a.sys_late) ? 1 : 0, "system messages after HS2 %u (in all %u)", st2a.sys_late, st2a.sys);
+	gate_out(7, "channels", (!(svc && sv_steady ? sv.new_ch : st2a.oth_bad) && !garbage) ? 0 : 1, "other-channel packets outside {4,34,57,59,169,171}: %u, ring garbage %s", st2a.oth_bad,
 		garbage ? "YES" : "no");
 	gate_out(8, "sim_ready", (!strcmp(sim_cpin, "READY") && sim_esims >= 1) ? 0 : 1, "CPIN \"%s\", ESIMS %d", sim_cpin[0] ? sim_cpin : "none", sim_esims);
 	if (imei_digits != 15 || !imei_luhn) {
@@ -2631,10 +2731,13 @@ gates_eval(uint32_t sta0, uint32_t sta1, bool exc)
 	} else {
 		gate_out(9, "imei_hash", imei_hash == imei_h ? 0 : 1, "hash %08x %s the Android reference", imei_hash, imei_hash == imei_h ? "equals" : "DIFFERS from");
 	}
-	gate_out(10, "physical", (bat && (soc >= 30 || chg) && tmp && temp < 50 && !had_wifi && g_connsys < 12) ? 0 : 1,
+	gate_out(10, "physical", (bat && (soc >= (svc ? 15 : 30) || chg) && tmp && temp < 50 && !had_wifi && g_connsys < 12) ? 0 : 1,
 		"battery %d%% charger %s%s, SoC %d C%s, Wi-Fi %s (wifi arg %u, connsys_step %u)", soc, chg ? "in" : "out", bat ? "" : " (not read)", temp,
 		tmp ? "" : " (not read)", (had_wifi || g_connsys >= 12) ? "ON" : "off", had_wifi, g_connsys);
-	SAYM("r1md: gates %u/10%s%s", gates_pass, gates_bad[0] ? "; not passed: " : "", gates_bad);
+	cs_gates = (int)gates_pass;
+	if (!gates_quiet) {
+		SAYF("r1md: gates %u/10%s%s", gates_pass, gates_bad[0] ? "; not passed: " : "", gates_bad);
+	}
 }
 
 /* the one RESULT 2e-1 line: said as soon as the gates are in (the kept log fills up; the verbose summaries come after) */
@@ -2649,13 +2752,14 @@ result_2e1(bool exc)
 		return;
 	}
 	result_said = true;
-	SAYM("r1md: RESULT 2e-1: SIM %s (ESIMS %d), EFUN %d CFUN %d%s, gates passed %u of 10%s%s", sim, sim_esims, at_radio_val[1], at_radio_val[0],
+	SAYF("r1md: RESULT 2e-1: SIM %s (ESIMS %d), EFUN %d CFUN %d%s, gates passed %u of 10%s%s", sim, sim_esims, at_radio_val[1], at_radio_val[0],
 	    at_radio_on ? " RADIO ON BY DEFAULT" : "", gates_pass, gates_bad[0] ? ", not passed: " : "", gates_bad);
 }
 
 /* ---- sub-stage 2e-2: registration only. Reached only with radio_go, which needs r1_md=7, r1_md_radio=1 and all ten gates. ---- */
 
-enum { RP_PRE, RP_WAIT, RP_POST, RP_DATA, RP_HOLD, RP_OFF, RP_END };
+/* RP_SVC: registered and serving (r1_md=11), never ends by itself; RP_IDLE: the radio is off and the modem stays up (service, after W6-W9 / the radio-off request) */
+enum { RP_PRE, RP_WAIT, RP_POST, RP_DATA, RP_HOLD, RP_SVC, RP_OFF, RP_END, RP_IDLE };
 static int rp = RP_PRE;
 static bool rp_new = true, rp_failed;
 static uint32_t rp_t, rp_ereg, rp_csq, rp_reg_ms;
@@ -2760,6 +2864,9 @@ off_drive(uint32_t rel)
 		off_tm = rel;
 		off_res = at_last_ok ? "OK" : (at_to ? "timeout" : "error");
 		off_wait = at_last_ok ? 2000 : (at_to ? 3000 : 1000);      /* quiet time for the late final / the URCs (+CGEV: ME DETACH) */
+		if (svc) {
+			off_wait = detach_seen ? 0 : 1000;      /* service / exit: the 8 s budget (EFUN=0 5 s, this, EFUN? 2 s); the detach URC ends the wait at once */
+		}
 		off_ph = 2;
 		break;
 	case 2:
@@ -2777,7 +2884,7 @@ off_drive(uint32_t rel)
 			return;
 		}
 		efun_final = at_radio_val[1];
-		if (efun_final != 0 && off_try < 2) {
+		if (efun_final != 0 && off_try < 2 && !(svc && (sv.fatal || svc_exit_req))) {
 			off_ph = 0;     /* not confirmed off: one more EFUN=0 + EFUN? */
 			break;
 		}
@@ -3201,6 +3308,12 @@ static void
 data_finish(uint32_t rel, const char *why)
 {
 	d_fin = true;
+	if (svc) {
+		SAYM("r1cell: [%u ms] data phase done (%s)", rel, why);
+		result_3a(rel);
+		rp = RP_SVC;
+		return;
+	}
 	SAYM("r1cell: [%u ms] data phase done (%s): hold %u s", rel, why, if_hold_ms / 1000);
 	result_3a(rel);
 	held_started = true;
@@ -3215,6 +3328,12 @@ data_fail(uint32_t rel, const char *why)
 	d_fin = true;
 	if (!d_tries && !d_res[0]) {
 		snprintf(d_res, sizeof(d_res), "not sent: %.40s", why);
+	}
+	if (svc) {      /* service: registered without a bearer (the rebind rules are stage 4c); the radio stays on */
+		SAYF("r1cell: [%u ms] data not up (%s): registered, no bearer", rel, why);
+		result_3a(rel);
+		rp = RP_SVC;
+		return;
 	}
 	SAYM("r1cell: [%u ms] data stopped (%s): off sequence", rel, why);
 	result_3a(rel);
@@ -3246,7 +3365,7 @@ if_start(uint32_t rel)
 static void
 data_drive(uint32_t rel)
 {
-	if (rel - dp_t0 >= (if_on ? 75000u : 30000u) || (if_on && rd_t_on && rel - rd_t_on >= 150000)) {
+	if (!svc && (rel - dp_t0 >= (if_on ? 75000u : 30000u) || (if_on && rd_t_on && rel - rd_t_on >= 150000))) {
 		data_finish(rel, if_on ? "75 s deadline" : "30 s deadline");
 		return;
 	}
@@ -3320,6 +3439,10 @@ data_drive(uint32_t rel)
 			} else {
 				dp = DP_IF;
 				dp_t = rel;
+				if (svc) {
+					sv_gen++;
+					rp = RP_SVC;
+				}
 			}
 		} else if (!dns_send(0, rel)) {
 			data_fail(rel, "tx refused");
@@ -3331,7 +3454,7 @@ data_drive(uint32_t rel)
 		break;
 	case DP_IF:
 		/* pdp_ip0 is up: only the test tool talks (cell_test); the tick in radio_drive watches the caps and the 10 s counters */
-		if (cell_if_done()) {
+		if (!svc && cell_if_done()) {
 			data_finish(rel, "cell_test finished");
 		}
 		break;
@@ -3367,7 +3490,7 @@ radio_drive(uint32_t rel)
 	if (if_on) {
 		if (rp >= RP_OFF) {
 			cell_if_stop("off sequence");   /* before the off sequence: down, routes and address removed (idempotent) */
-		} else if (cell_if_tick(rel) && rp < RP_OFF) {
+		} else if (cell_if_tick(rel) && rp < RP_OFF && !svc) {
 			cell_if_stop("traffic cap hit");
 			radio_stop("traffic cap hit");
 		}
@@ -3397,7 +3520,16 @@ radio_drive(uint32_t rel)
 			}
 		}
 	}
-	if (rp < RP_OFF) {
+	if (rp < RP_OFF && svc) {
+		/* service: no time caps; the stop rules count per window (W5 here, W6 in svc_drive) */
+		if (efun1_to) {
+			radio_stop("EFUN=1 timeout");
+		} else if (st2a.unanswered || rpc_bad) {
+			sv.fatal = true;
+			sv.why = "W5 rpc";
+			radio_stop("W5 rpc");
+		}
+	} else if (rp < RP_OFF) {
 		if (rd_t_on && t >= 240000) {
 			radio_stop("hard cap of 4 minutes");
 		} else if (efun1_to) {
@@ -3453,8 +3585,11 @@ radio_drive(uint32_t rel)
 			char why[40];
 
 			snprintf(why, sizeof(why), "reject cause #%d", rej_cause);
+			if (svc) {
+				sv.denied = true;       /* W9: radio off for the rest of the boot, the modem stays up */
+			}
 			radio_stop(why);
-		} else if (t >= 90000) {
+		} else if (t >= 90000 && !svc) {
 			if (!final_diag) {
 				final_diag = true;
 				radio_load(at_seqD, sizeof(at_seqD) / sizeof(at_seqD[0]));
@@ -3485,9 +3620,19 @@ radio_drive(uint32_t rel)
 			}
 			break;
 		}
+		if (svc) {
+			rp = RP_SVC;
+			break;
+		}
 		rp = RP_HOLD;
 		held_started = true;
 		rp_t = rel;
+		break;
+	case RP_SVC:
+		if (rel - rp_csq >= 30000) {    /* the keep-alive and the signal, while serving */
+			rp_csq = rel;
+			radio_load(at_seqS, 1);
+		}
 		break;
 	case RP_DATA:
 		data_drive(rel);
@@ -3574,6 +3719,309 @@ result_2fa(const char *tag, uint32_t rel)
 	    (cs >= 0 && s3 >= 0) ? s3 - cs : -1, bits, fsw_ops, fsw_err, fsw_wr, rpc_win, cldma_rx_count(), cldma_rx_err(), md_cut, md_sup + rpc_dups);
 }
 
+
+/* ---- Stage 4a: the service's own drive (docs/cellular-stage4.md 1): the watchdogs W1-W9, the status line, the keep-alive, the poll rate ---- */
+
+static uint32_t sv_soc = 0, sv_temp = 0;
+static int sv_chg;
+static bool sv_bat_ok, sv_tmp_ok, sv_ka_pending;
+static uint32_t sv_fatal_t0, sv_last_tx_b, sv_last_rx_b, sv_acc_b, sv_tripped, sv_pub_t, sv_win_t0;
+
+static void
+svc_fatal(const char *why, uint32_t rel)
+{
+	if (!sv.fatal) {
+		sv.fatal = true;
+		sv.why = why;
+		sv_fatal_t0 = rel;
+		SAYF("r1md: svc: %s: the modem will be stopped (EFUN=0 if the radio is on, then MD1 down)", why);
+	}
+}
+
+/* W6, W7, W8, W9: the radio goes off (or stays off), the modem stays up */
+static void
+svc_latch(bool *flag, const char *why)
+{
+	if (!*flag) {
+		*flag = true;
+		sv_tripped++;
+		SAYF("r1md: svc: %s: radio off, modem stays up", why);
+	}
+}
+
+static const char *
+svc_state_name(void)
+{
+	if (md_pd_done) {
+		return "stopped";
+	}
+	if (!sv_steady) {
+		return "booting";
+	}
+	if (sv.budget_hit) {
+		return "budget";
+	}
+	if (sv.denied) {
+		return "denied";
+	}
+	if (radio_go && rd_active && rp < RP_OFF) {
+		return cell_if_active() ? "data_up" : (eps_reg ? "registered" : "searching");
+	}
+	return (gates_done && gates_pass != 10) ? "gates_failed" : "radio_off";
+}
+
+static void
+svc_publish(uint32_t rel)
+{
+	const char *st = svc_state_name();
+	uint32_t ops, miss, ovl;
+
+	if (rel - sv_pub_t < 1000 && !strcmp(cs_state, st)) {
+		return;
+	}
+	sv_pub_t = rel;
+	mdfs_counts(&ops, &miss, &ovl);
+	cs_fsops = (int)ops;
+	cs_ovl = (int)ovl;
+	cs_rat = rp_rat;
+	if (strcmp(cs_state, st)) {
+		strlcpy(cs_state, st, sizeof(cs_state));
+		sv_gen++;
+		SAYF("r1md: RESULT 4: %s (gates %u/10%s%s, radio %s, sig %u)", st, gates_pass, gates_bad[0] ? ", not passed: " : "", gates_bad, rd_t_on ? "on/was on" : "off", sv.csq);
+	}
+	sv.bars = sv.csq == 99 ? 0 : (sv.csq >= 20 ? 4 : (sv.csq >= 14 ? 3 : (sv.csq >= 8 ? 2 : (sv.csq >= 2 ? 1 : 0))));
+	snprintf(cs_sig, sizeof(cs_sig), "%u,%d,%u", sv.csq, sv.rsrp, sv.bars);
+	strlcpy(cs_op, rp_op, sizeof(cs_op));
+	if (sv.cpms[0]) {
+		strlcpy(cs_cpms, sv.cpms, sizeof(cs_cpms));
+	}
+	(void)rel;
+}
+
+/* one pass of the service's drive. Returns true when the loop is to end (the modem is to be powered down). */
+static bool
+svc_drive(uint32_t rel, uint32_t sta0, uint32_t sta1)
+{
+	bool want_stop;
+
+	if (!sv_steady) {
+		return false;
+	}
+	/* W2: the AT engine is dead */
+	if (sv.to_run >= 3) {
+		svc_fatal("W2 AT engine dead (3 timeouts in a row)", rel);
+	}
+	/* radio budget: 64-bit byte count and the allowance (W8) */
+	if (cell_if_active() && rel >= sv.next_cell) {
+		uint32_t txp, txb, rxp, rxb, dr;
+		bool cap;
+
+		sv.next_cell = rel + 1000;
+		cell_if_stats(&txp, &txb, &rxp, &rxb, &dr, &cap);
+		sv.bytes64 += (uint32_t)(txb - sv_last_tx_b) + (uint64_t)(uint32_t)(rxb - sv_last_rx_b);
+		sv_acc_b += (uint32_t)(txb - sv_last_tx_b) % 0x10000000u + (uint32_t)(rxb - sv_last_rx_b) % 0x10000000u;
+		sv_last_tx_b = txb;
+		sv_last_rx_b = rxb;
+		cs_bytes = sv.bytes64;
+		if (sv_acc_b >= 1024) {
+			uint32_t kb = sv_acc_b / 1024;
+
+			sv_acc_b %= 1024;
+			cs_budget_kb = cs_budget_kb > (int)kb ? cs_budget_kb - (int)kb : 0;
+		}
+		if (cs_budget_kb <= 0) {
+			cell_if_stop("budget exhausted (W8)");
+			svc_latch(&sv.budget_hit, "W8 budget exhausted");
+		}
+	}
+	if (rel >= sv.next_w7) {        /* W7: battery and heat, every 5 s */
+		int soc = -1, chg = 0, temp = 0;
+
+		sv.next_w7 = rel + 5000;
+		sv_bat_ok = redwood_battery_get(&soc, &chg);
+		sv_tmp_ok = redwood_r1_temp(&temp);
+		sv_soc = (uint32_t)soc;
+		sv_chg = chg;
+		sv_temp = (uint32_t)temp;
+		if (!sv.w7 && ((sv_bat_ok && !chg && soc < 10) || (sv_tmp_ok && temp >= 55))) {
+			sv.w7_cycles++;
+			svc_latch(&sv.w7, sv_tmp_ok && temp >= 55 ? "W7 SoC >= 55 C" : "W7 battery < 10% on battery");
+			if (sv.w7_cycles > 5) {
+				svc_latch(&sv.denied, "W7 more than 5 cycles");
+			}
+		} else if (sv.w7 && (!sv_bat_ok || chg || soc >= 20) && (!sv_tmp_ok || temp <= 45)) {
+			sv.w7 = false;
+			SAYF("r1md: svc: W7 over (battery %d%% charger %s, SoC %d C): radio may come back", soc, chg ? "in" : "out", temp);
+		}
+	}
+	if (rel >= sv.next_w4) {        /* W4: the FS rules, every 10 s (the overlay's checksum sweep is the cost) */
+		struct mdfs_gate_info g;
+		uint64_t refused = redwood_emmc_nv_refused();
+
+		sv.next_w4 = rel + 10000;
+		mdfs_gate(&g);
+		if (g.prot_mut) {
+			svc_fatal("W4 a change on a protected path (CALIBRAT/IMEI)", rel);
+		} else if (g.crc_bad || g.sweep_bad) {
+			svc_fatal("W4 overlay checksum mismatch", rel);
+		} else if (refused) {
+			svc_fatal("W4 eMMC NV write refused", rel);
+		} else if (g.cap_hits) {
+			svc_fatal("W4 overlay full", rel);
+		}
+	}
+	/* W5 (rpc) is checked here too for the radio-off case (radio_drive does it with the radio on) */
+	if (st2a.unanswered || rpc_bad) {
+		svc_fatal("W5 rpc outside the stock set / unanswered", rel);
+	}
+	/* W6: other channels, per minute window; an unknown system message */
+	if (rel - sv.oth_win_t >= 60000) {
+		if (sv.oth_win > 60) {
+			svc_latch(&sv.denied, "W6 more than 60 other-channel packets in a minute");
+		}
+		sv.oth_win = 0;
+		sv.oth_win_t = rel;
+	}
+	if (sv.new_ch || sv.sys_unknown) {
+		svc_latch(&sv.denied, sv.new_ch ? "W6 a channel never seen before" : "W6 an unknown system message");
+	}
+	/* gates, every 60 s, quiet; a change is one line */
+	if (rel >= sv.next_gate) {
+		sv.next_gate = rel + 60000;
+		gates_quiet = true;
+		gates_eval(sta0, sta1, g_exc);
+		gates_quiet = false;
+		if (gates_pass != sv.last_gates) {
+			SAYF("r1md: svc: gates now %u/10%s%s", gates_pass, gates_bad[0] ? "; not passed: " : "", gates_bad);
+			sv.last_gates = gates_pass;
+		}
+	}
+	/* the radio engine's stop reasons (service) */
+	want_stop = sv.fatal || svc_exit_req;
+	if (radio_go && rd_active && rp < RP_OFF && !sv.stop_called) {
+		const char *why = sv.fatal ? sv.why : (svc_exit_req ? "exit request" : (sv.budget_hit ? "W8 budget" : (sv.denied ? "W6/W9" : (sv.w7 ? "W7" : (!cs_radio ? "cell_radio=0" : NULL)))));
+
+		if (why) {
+			sv.stop_called = true;
+			if (cell_if_active()) {
+				cell_if_stop(why);      /* pdp_ip0 down first */
+			}
+			radio_stop(why);
+		}
+	}
+	if (radio_go && rp == RP_END && !want_stop) {   /* the off sequence of a non-fatal stop is done: the modem stays up, radio off */
+		rp = RP_IDLE;
+		rd_active = false;
+		sv.stop_called = false;
+		sv_gen++;
+	}
+	if (radio_go && rp == RP_IDLE && radio_req && cs_radio && gates_pass == 10 && !sv.denied && !sv.budget_hit && !sv.w7 && !want_stop && at_done && !at_wait &&
+	    cs_budget_kb > 0) {
+		/* W7 over / cell_radio=1 again: the radio engine starts from the top (the bearer is not rebuilt: stage 4c) */
+		SAYF("r1md: svc: radio back on (EFUN=1 script)");
+		off_ph = 0;
+		off_try = 0;
+		result2_said = false;
+		rp = RP_PRE;
+		rp_new = true;
+		rd_active = true;
+		sv.stop_called = false;
+		eps_reg = false;
+		eps_reg_at = 0;
+		creg_stat = -1;
+		eps_seq[0] = 0;
+		stat3_pend = false;
+		n_stat3 = 0;
+		rej_perm = false;
+		diag_rounds = 0;
+		final_diag = false;
+		cscon_n = 0;
+		d_fin = false;
+		dp = DP_START;
+		efun1_ok_ms = 0;
+		efun1_to = false;
+		cscon1_ms_v = stat3_ms_v = 0;
+		efun_final = -2;
+		off_res = "none";
+	}
+	/* the read-only keep-alive, radio-off only: AT+CSQ every 60 s (W2 counts its timeouts) */
+	if (sv_ka_pending && at_done && !at_wait) {
+		sv_ka_pending = false;
+		if (sv.ka_cmd == 2) {
+			SAYF("r1md: svc: AT+CPMS? (try %u): %s %s", sv.cpms_n, sv.cpms[0] ? sv.cpms : "(no +CPMS line)", sv.cpms_fin);
+		} else {
+			sv.ka_ok += at_last_ok;
+		}
+	}
+	if (!rd_active && !want_stop && at_done && !at_wait && rel >= sv.next_ka) {
+		sv.next_ka = rel + 60000;
+		sv_ka_pending = true;
+		if (!sv.cpms[0] && sv.cpms_n < 6 && sv.ka_cmd != 2 && sv.ka_n >= 1 && (sv.ka_n <= 4 || sv.ka_n % 10 == 0)) {
+			/* the first AT+CPMS? (in the boot script, 8 s after the reply) said ERROR: the message service may not have been up yet; asked again, read only */
+			sv.ka_cmd = 2;
+			sv.cpms_n++;
+			radio_load(at_seqM, 1);
+		} else {
+			sv.ka_cmd = 1;
+			sv.ka_n++;
+			radio_load(at_seqS, 1);
+		}
+	}
+	/* bit 20 health (docs 6): more than 50 edges in 10 s while pdp_ip0 is up, sustained 60 s = W3 */
+	if (rel >= sv.next_b20) {
+		sv.next_b20 = rel + 10000;
+		if (cell_if_active() && sv.b20_win > 50) {
+			SAYF("r1md: svc: CCIF bit 20 %u edges in 10 s while pdp_ip0 is up", sv.b20_win);
+			if (++sv.b20_bad >= 6) {
+				svc_fatal("W3 CCIF bit 20 storm for 60 s", rel);
+			}
+		} else {
+			sv.b20_bad = 0;
+		}
+		sv.b20_win = 0;
+	}
+	/* the status line, every 60 s (health), a second one every 5 min (resources) */
+	if (rel >= sv.next_status) {
+		uint32_t ops, miss, ovl, wall = rel - sv_win_t0, pc;
+
+		sv.next_status = rel + 60000;
+		sv_win_t0 = rel;
+		pc = (uint32_t)(sv.busy_ns / 1000 * 10 / (wall ? wall : 1));      /* hundredths of a percent of one core */
+		mdfs_counts(&ops, &miss, &ovl);
+		SAYF("r1md: svc [%us] %s gates %u/10 ka %u/%u poll %u+%u cpu %u.%02u%% fs %u/%u ovl %u B rpc %u trips %u batt %u%% %uC keep %u/%u cut %u+%u",
+		    rel / 1000, cs_state, gates_pass, sv.ka_ok, sv.ka_n, sv.polls_fast, sv.polls_slow, pc / 100, pc % 100, ops, miss, ovl, st2a.rpc, sv_tripped,
+		    sv_soc, sv_temp, redwood_host_keep_len, redwood_host_keep_dropped, md_cut, sv_rl_cut);
+		sv.polls_fast = sv.polls_slow = 0;
+		sv.busy_ns = 0;
+	}
+	if (rel >= sv.next_status2) {
+		sv.next_status2 = rel + 300000;
+		SAYF("r1md: svc: pkts %u (fs %u rpc %u ctl %u sys %u oth %u) cldma rx %u tx %llu B64 %llu sig %s cpms %s", st2a.pkts, st2a.fs, st2a.rpc, st2a.ctl, st2a.sys, st2a.other,
+		    cldma_rx_count(), (unsigned long long)cldma_tx_pkts(), (unsigned long long)sv.bytes64, cs_sig, sv.cpms[0] ? sv.cpms : "-");
+	}
+	svc_publish(rel);
+	if (!want_stop) {
+		return false;
+	}
+	/* the loop ends when the radio is off (or was never on), or after 8 s from the request / the trip whatever the radio says */
+	if (!(radio_go && rd_active && rp != RP_END && rp != RP_IDLE)) {
+		return true;
+	}
+	if (svc_exit_req) {
+		uint64_t ns = 0;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - svc_exit_t0, &ns);
+		if (ns >= 8000ULL * NSEC_PER_MSEC) {
+			SAYF("r1md: exit: the radio-off sequence did not finish in 8 s: MD1 powered down anyway");
+			return true;
+		}
+	} else if (rel - sv_fatal_t0 >= 8000) {
+		SAYF("r1md: svc: the radio-off sequence did not finish in 8 s: MD1 powered down anyway");
+		return true;
+	}
+	return false;
+}
+
 /* up to 10 s of the boot status and the CCIF; read only except for the interrupt ack md_ccif_isr does */
 static bool
 wait_hs1(void)
@@ -3588,20 +4036,32 @@ wait_hs1(void)
 
 	SAY("r1md: [%u ms] waiting up to 10000 ms for HS1, polling every 10 ms", md_ms());
 	for (;;) {
+		bool lite = svc && st2a.hs2;    /* the service after HS2: no per-pass SRAM trace, the boot status once per 10 s */
+		uint64_t pass_t0 = mach_absolute_time();
+		uint32_t dly_ms;
+
 		ns = 0;
-		absolutetime_to_nanoseconds(mach_absolute_time() - t_start, &ns);
+		absolutetime_to_nanoseconds(pass_t0 - t_start, &ns);
 		elapsed = (uint32_t)(ns / NSEC_PER_MSEC);
-		s0 = boot_sta(0);
-		s1 = boot_sta(1);
-		if (s0 != sta0 || s1 != sta1) {
-			SAY("r1md: [%u ms] MD boot status %#x %#x (%s)", elapsed, s0, s1, boot_sta_desc(s0));
-			sta0 = s0;
-			sta1 = s1;
+		if (!lite || elapsed >= sv.next_boot) {
+			s0 = boot_sta(0);
+			s1 = boot_sta(1);
+			if (lite) {
+				sv.next_boot = elapsed + 10000;
+			}
+			if (s0 != sta0 || s1 != sta1) {
+				SAY("r1md: [%u ms] MD boot status %#x %#x (%s)", elapsed, s0, s1, boot_sta_desc(s0));
+				if (lite) {
+					SAYF("r1md: svc: the MD boot status changed to %#x %#x", s0, s1);
+				}
+				sta0 = s0;
+				sta1 = s1;
+			}
 		}
-		for (int i = 0; i < 15; i++) {
+		for (int i = 0; !lite && i < 15; i++) {
 			trace[i] = rd(ccif, APCCIF_CHDATA + 4 * i);
 		}
-		if (memcmp(trace, last_trace, sizeof(trace)) != 0) {
+		if (!lite && memcmp(trace, last_trace, sizeof(trace)) != 0) {
 			if (ntrace++ < 6) {
 				SAY("r1md: [%u ms] CCIF boot trace %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", elapsed,
 				    trace[0], trace[1], trace[2], trace[3], trace[4], trace[5], trace[6], trace[7], trace[8], trace[9], trace[10], trace[11],
@@ -3609,7 +4069,7 @@ wait_hs1(void)
 			}
 			memcpy(last_trace, trace, sizeof(trace));
 		}
-		if (elapsed >= next_sec && (md_level < 7 || next_sec < 3000)) {
+		if (!lite && elapsed >= next_sec && (md_level < 7 || next_sec < 3000)) {
 			SAY("r1md: [%u ms] tick: boot status %#x %#x, AP CCIF RCHNUM %#x BUSY %#x, channels seen %#x", elapsed, s0, s1, rd(ccif, APCCIF_RCHNUM),
 			    rd(ccif, APCCIF_BUSY), seen);
 			next_sec += 1000;
@@ -3623,6 +4083,8 @@ wait_hs1(void)
 				SAY("r1md: [%u ms] CCIF RCHNUM %#x (new %#x)", elapsed, rch, rch & ~seen & 0xffff);
 			}
 			seen |= rch;
+			sv.act_ms = elapsed - t_send;
+			sv.b20_win += (rch >> 20) & 1;
 			/* stock acks every bit: md_ccif_isr (irq0) the low 16, md_cd_ccif_isr (irq1) bits 15..30. The ring bits lose nothing: the rings are
 			 * drained every pass whatever RCHNUM says, and a bit raised again after this ack is just the next RCHNUM. Nothing is sent back on bit 20. */
 			wr(ccif, APCCIF_ACK, rch);
@@ -3650,6 +4112,9 @@ wait_hs1(void)
 				 * on a dead AT engine, but the radio-off attempt and the EFUN? confirm are tried); power-down only after it, or at the 255/400 s caps. */
 				if (!exc_radio) {
 					exc_radio = true;
+					if (svc) {
+						svc_fatal("W1 MD exception with the radio on", elapsed - t_send);
+					}
 					SAYM("r1md: [%u ms] D2H_EXCEPTION_INIT with the radio on (%u ms after EFUN=1): off sequence follows", elapsed - t_send, elapsed - t_send - rd_t_on);
 					ee_dump(false);
 					delay_for_interval(300, NSEC_PER_MSEC);
@@ -3658,7 +4123,11 @@ wait_hs1(void)
 				}
 			} else if (rch & (1u << CCIF_RX_EXCEPTION_INIT)) {
 				if (md_level >= 3 && sent) {
-					SAYM("r1md: [%u ms] D2H_EXCEPTION_INIT after the runtime data", elapsed - t_send);
+					if (svc) {
+						sv.fatal = true;
+						sv.why = "W1 MD exception";
+					}
+					SAYF("r1md: [%u ms] D2H_EXCEPTION_INIT after the runtime data", elapsed - t_send);
 					ee_dump(false);
 					delay_for_interval(300, NSEC_PER_MSEC);
 					ee_dump(true);
@@ -3681,7 +4150,9 @@ wait_hs1(void)
 			if (sent) {
 				drain_rings(elapsed - t_send);
 				if (cldma_on && cldma_rx_poll(elapsed - t_send)) {
-					if (rd_active) {
+					if (svc) {
+						svc_fatal("W3 CLDMA stop rule", elapsed - t_send);
+					} else if (rd_active) {
 						radio_stop("cldma stop rule");
 					} else {
 						cl_fatal = true;
@@ -3693,8 +4164,26 @@ wait_hs1(void)
 						if (at_done && !gates_done && (redwood_battery_get(&bsoc, &bchg) || elapsed - t_send - at_last_ms >= 60000)) {
 							gates_eval(sta0, sta1, exc);
 							result_2e1(exc);
+							if (svc) {
+								uint32_t now = elapsed - t_send;
+
+								sv_steady = true;
+								sv.t_start = now;
+								sv.next_status = now + 20000;
+								sv.next_status2 = now + 120000;
+								sv.next_ka = now + 20000;
+								sv.next_gate = now + 60000;
+								sv.next_w4 = now + 10000;
+								sv.next_w7 = now;
+								sv.oth_win_t = now;
+								sv_win_t0 = now;
+								sv.last_gates = gates_pass;
+								cell_if_period(600000);
+								SAYF("r1md: svc: steady state at %u ms (r1_md=%u): modem up, FS/RPC served for the whole uptime, no time caps, radio %s", now, svc_radio ? 11u : 10u,
+								    radio_req ? "wanted if the gates pass" : "OFF");
+							}
 							if (!radio_req) {
-								SAYM("r1md: radio-on NOT requested: stopping at 2e-1");
+								SAYM("r1md: radio-on NOT requested: %s", svc ? "service, radio stays off" : "stopping at 2e-1");
 							} else if (gates_pass != 10) {
 								SAYM("r1md: radio-on REFUSED: gates passed %u of 10 (not passed: %s)", gates_pass, gates_bad);
 							} else if (!at_radio_on) {
@@ -3708,9 +4197,10 @@ wait_hs1(void)
 						}
 						/* 2e-1: the last response + 3 s, 120 s after HS2. 2e-2: until EFUN=0 is confirmed; the cap below is the kernel's own
 						 * timer: 15 s past the 4 minutes, MD1 goes down whatever the state machine is doing */
-						if (at_radio_on || cl_fatal || (rd_active && rd_t_on && elapsed - t_send - rd_t_on >= 255000) || (rd_active && md_ms() >= 400000) || (radio_go && rp == RP_END) ||
-							(!rd_active && ((st2a.hs2 && (elapsed - t_send - st2a.t_hs2 >= 120000 || (at_done && gates_done && elapsed - t_send - at_last_ms >= 3000))) ||
-							(!st2a.hs2 && elapsed - t_send >= 30000) || md_ms() >= 150000))) {
+						if (svc ? (svc_drive(elapsed - t_send, sta0, sta1) || at_radio_on) :
+						    (at_radio_on || cl_fatal || (rd_active && rd_t_on && elapsed - t_send - rd_t_on >= 255000) || (rd_active && md_ms() >= 400000) || (radio_go && rp == RP_END) ||
+						    (!rd_active && ((st2a.hs2 && (elapsed - t_send - st2a.t_hs2 >= 120000 || (at_done && gates_done && elapsed - t_send - at_last_ms >= 3000))) ||
+						    (!st2a.hs2 && elapsed - t_send >= 30000) || md_ms() >= 150000)))) {
 							break;
 						}
 					} else if (at_radio_on || (st2a.hs2 && (elapsed - t_send - st2a.t_hs2 >= 90000 || (at_done && elapsed - t_send - at_last_ms >= 3000))) ||
@@ -3745,7 +4235,27 @@ wait_hs1(void)
 				break;
 			}
 		}
-		delay_for_interval(cell_if_active() ? 3 : 10, NSEC_PER_MSEC);   /* pdp_ip0 up: 3 ms, short enough for interactive latency */
+		dly_ms = cell_if_active() ? 3 : 10;     /* pdp_ip0 up: 3 ms, short enough for interactive latency */
+		if (svc && st2a.hs2) {
+			/* the service's adaptive poll: 2 ms while anything moved in the last second (packets, CCIF bits, a command in flight, a script to send, an exit), 20 ms otherwise */
+			uint32_t rel = elapsed - t_send;
+			uint64_t acts = (uint64_t)st2a.pkts + cldma_rx_count() + cldma_tx_pkts(), ns2 = 0;
+
+			if (acts != sv.last_pkts) {
+				sv.last_pkts = acts;
+				sv.act_ms = rel;
+			}
+			if (rel - sv.act_ms < 1000 || at_wait || !at_done || svc_exit_req || sv.fatal) {
+				dly_ms = 2;
+				sv.polls_fast++;
+			} else {
+				dly_ms = 20;
+				sv.polls_slow++;
+			}
+			absolutetime_to_nanoseconds(mach_absolute_time() - pass_t0, &ns2);
+			sv.busy_ns += ns2;
+		}
+		delay_for_interval(dly_ms, NSEC_PER_MSEC);
 	}
 	if (md_level >= 5) {
 		uint32_t rel = sent ? elapsed - t_send : elapsed, fops, fmiss, fovl;
@@ -3845,10 +4355,11 @@ md_power_off(const char *why)
 {
 	uint32_t v = 0;
 
-	if (md_state != 1) {
+	if (md_state != 1 && !(md_pd_started && !md_pd_done)) {       /* (a power-down the thread began and the stopped CPUs cut short is finished by the quiesce) */
 		return;
 	}
 	md_state = 2;
+	md_pd_started = true;
 	SAYM("r1md: powering MD1 down (%s)", why);
 	if (if_on && !md_quiet) {
 		cell_if_stop("MD1 power-down");         /* no-op when the off sequence already did it; never from the loader hand-back path */
@@ -3891,20 +4402,38 @@ md_power_off(const char *why)
 	wr(infra, INFRA_MD_SRCCLKENA, (rd(infra, INFRA_MD_SRCCLKENA) & ~0xffu) | 0);
 	wr(top, 0, rd(top, 0) | 0x300);
 	if (found_vm_valid) {
-		if ((found_vm_elr0 & 0x7f) != VMODEM_SEL_800MV) {
-			(void)pw_write(VMODEM_ELR0, found_vm_elr0);
+		uint32_t cur_elr0 = 0, cur_con0 = 0;
+
+		/* what is there now, not what we set: the selector reads 0x24 after the run on this board (the modem's own voltage scaling), found 0x30 */
+		if (pw_read(VMODEM_ELR0, &cur_elr0) ? (cur_elr0 & 0x7f) != (found_vm_elr0 & 0x7f) : (found_vm_elr0 & 0x7f) != VMODEM_SEL_800MV) {
+			(void)pw_write(VMODEM_ELR0, (cur_elr0 & ~0x7fu) | (found_vm_elr0 & 0x7f));
 		}
-		if (!(found_vm_con0 & 1)) {
-			(void)pw_write(VMODEM_CON0, found_vm_con0);
+		if (pw_read(VMODEM_CON0, &cur_con0) ? (cur_con0 & 1) != (found_vm_con0 & 1) : !(found_vm_con0 & 1)) {
+			(void)pw_write(VMODEM_CON0, (cur_con0 & ~1u) | (found_vm_con0 & 1));
 		}
 		(void)pw_read(VMODEM_CON0, &v);
 		SAY("r1md: VMODEM put back: CON0 %#x (found %#x) ELR0 found %#x", v, found_vm_con0, found_vm_elr0);
 	}
 	dump_status("powered down");
 	SAY("r1md: found before: CLK_MODE %#x SRCCLKENA %#x AP2MD %#x", found_clk_mode, found_srcclkena, found_ap2md);
+	md_pd_done = true;
 	return;
 stuck:
 	dump_status("power-off STOPPED");
+	md_pd_done = true;
+}
+
+/* Stage 4b: what the power-down left, against what was found at the start (the same registers md_power_off puts back); one line, `exit:` */
+static void
+md_readback_line(const char *what)
+{
+	uint32_t clk = rd(top, 0), src = rd(infra, INFRA_MD_SRCCLKENA), ap = rd(infra, INFRA_AP2MD_DUMMY), c0 = 0, e0 = 0;
+	bool pw = md1_is_on(), vm = found_vm_valid && pw_read(VMODEM_CON0, &c0) && pw_read(VMODEM_ELR0, &e0);
+	bool same = !pw && clk == found_clk_mode && (src & 0xff) == 0 && (ap & 1) == (found_ap2md & 1) && (!found_vm_valid || (vm && (c0 & 1) == (found_vm_con0 & 1) && (e0 & 0x7f) == (found_vm_elr0 & 0x7f)));
+
+	SAYF("r1md: exit: %s read-backs %s (now/found): MD1 %s CLK %#x/%#x SRC %#x/%#x AP2MD %u/%u VMODEM CON0 %#x/%#x ELR0 %#x/%#x", what,
+	    same ? "EQUAL as found" : "DIFFER", pw ? "ON" : "off", clk, found_clk_mode, src & 0xff, found_srcclkena & 0xff, ap & 1, found_ap2md & 1,
+	    c0 & 1, found_vm_con0 & 1, e0 & 0x7f, found_vm_elr0 & 0x7f);
 }
 
 static void
@@ -3971,6 +4500,9 @@ md_thread(__unused void *parameter, __unused wait_result_t result)
 		cldma_data_enable();
 		if (if_on) {
 			cldma_if_enable(if_pkts, if_kb * 1000);
+			if (svc) {
+				cldma_svc_enable();     /* (after, and instead of, the 3b caps) */
+			}
 		}
 		SAYM("r1md: Stage 3a armed (r1_md_data=1%s): TX ring, 0x400d answer, bearer binding after registration", eif_on ? ", r1_md_eif=1" : "");
 		if (if_on) {
@@ -3987,7 +4519,24 @@ md_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	(void)wait_hs1();
 	dump_status("after wait");
-	md_power_off("end of the HS1 watch");
+	if (svc) {
+		cs_gates = (int)gates_pass;
+		uint64_t ns0 = 0;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - (svc_exit_req ? svc_exit_t0 : md_t0), &ns0);
+		SAYF("r1md: exit: the service ends (%s%s): radio %s, EFUN=0 x%d %s, EFUN? %d, detach %s, %u ms since the %s", svc_exit_req ? "exit request" : (sv.fatal ? sv.why : "watch ended"),
+		    svc_exit_req && sv.fatal ? ", also a trip" : "", rd_t_on ? "was on" : "never on", off_try, off_res, efun_final, detach_seen ? "seen" : "no",
+		    (uint32_t)(ns0 / NSEC_PER_MSEC), svc_exit_req ? "request" : "start");
+	}
+	md_power_off(svc ? "the service ends" : "end of the HS1 watch");
+	if (svc) {
+		uint64_t ns = 0;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - (svc_exit_req ? svc_exit_t0 : md_t0), &ns);
+		strlcpy(cs_state, "stopped", sizeof(cs_state));
+		md_readback_line(svc_exit_req ? "the exit's" : "the stop's");
+		SAYF("r1md: exit: MD1 down %u ms after the %s (the loader's budget for it: 8 s)", (uint32_t)(ns / NSEC_PER_MSEC), svc_exit_req ? "request" : "start");
+	}
 	if (radio_go) {         /* the last thing the driver says: the results again, after the modem is down */
 		result2_said = false;
 		res_tag = "off";
@@ -4003,9 +4552,49 @@ out:
 void
 redwood_md_quiesce(void)
 {
-	if (md_state == 1 && spm) {
+	if ((md_state == 1 || (md_pd_started && !md_pd_done)) && spm) {
 		md_quiet = true;
 		md_power_off("on the way back to the loader");
+	}
+}
+
+/*
+ * Stage 4b: the orderly end of the service, asked by the loader paths (osfmk/arm64/loader_return.c: the side-button stop poll and the timed return) from a
+ * thread, BEFORE the data volume's save. stop_request only sets a flag the modem thread sees within 20 ms (it does the pdp_ip0 down, AT+EFUN=0 with a 5 s
+ * cap, EFUN? with 2 s, the CLDMA stop and the MD1 power-down). stop_wait, after the save, waits for that for what is left of 8 s from the request; if it is
+ * not done the stopped CPUs and redwood_md_quiesce finish the MMIO power-down. Neither is ever called with the other CPUs stopped, and neither takes a lock.
+ * Without r1_md=10/11 both do nothing.
+ */
+void
+redwood_md_stop_request(void)
+{
+	if (!svc || md_pd_done || svc_exit_req || md_state != 1) {
+		return;
+	}
+	svc_exit_t0 = mach_absolute_time();
+	svc_exit_req = true;
+	SAYF("r1md: exit: requested (radio %s)", rd_t_on && rp < RP_OFF && radio_go && rd_active ? "on: EFUN=0 first" : "off: orderly stop");
+}
+
+void
+redwood_md_stop_wait(void)
+{
+	uint64_t ns = 0;
+
+	if (!svc || !svc_exit_req) {
+		return;
+	}
+	for (;;) {
+		absolutetime_to_nanoseconds(mach_absolute_time() - svc_exit_t0, &ns);
+		if (md_pd_done || ns >= 8000ULL * NSEC_PER_MSEC) {
+			break;
+		}
+		delay_for_interval(5, NSEC_PER_MSEC);
+	}
+	if (md_pd_done) {
+		SAYF("r1md: exit: modem down, waited until %u ms after the request", (uint32_t)(ns / NSEC_PER_MSEC));
+	} else {
+		SAYF("r1md: exit: modem NOT down after 8 s (the quiesce powers MD1 down by MMIO)");
 	}
 }
 
@@ -4018,11 +4607,17 @@ redwood_md_init(void)
 	thread_t thread;
 
 	bool sh9 = false;
+	bool svc_level = false;
 
-	if (!PE_parse_boot_argn("r1_md", &arg, sizeof(arg)) || (arg < 1 || (arg > 7 && arg != 9))) {
+	if (!PE_parse_boot_argn("r1_md", &arg, sizeof(arg)) || (arg < 1 || (arg > 7 && arg != 9 && arg != 10 && arg != 11))) {
 		return;
 	}
-	if (arg == 9) {         /* shorthand (the kernel command line is length-limited): 7 + r1_md_cldma=1 + r1_md_data=1 + r1_md_if=1 + r1_md_eif=1 */
+	if (arg == 10 || arg == 11) {   /* Stage 4a: the modem as a service: 9's CLDMA + data + interface + eif, radio off (10) or wanted with r1_md_radio=1 and the gates (11) */
+		svc = svc_level = true;
+		svc_radio = arg == 11;
+		sh9 = true;
+		arg = 7;
+	} else if (arg == 9) {         /* shorthand (the kernel command line is length-limited): 7 + r1_md_cldma=1 + r1_md_data=1 + r1_md_if=1 + r1_md_eif=1 */
 		sh9 = true;
 		arg = 7;
 	}
@@ -4033,10 +4628,13 @@ redwood_md_init(void)
 		at_seq = at_seq7;
 		at_n = sizeof(at_seq7) / sizeof(at_seq7[0]);
 		radio_req = PE_parse_boot_argn("r1_md_radio", &v, sizeof(v)) && v == 1;
+		if (svc_level && !svc_radio) {
+			radio_req = false;      /* r1_md=10: the radio is never asked for, whatever else is on the line */
+		}
 		/* the CLDMA receive ring is started ONLY with r1_md_cldma=1; without it not one CLDMA register is written (snapshots are reads) */
 		cldma_on = sh9 || (PE_parse_boot_argn("r1_md_cldma", &v, sizeof(v)) && v == 1);
 		/* Stage 3a: r1_md_data=1 only counts together with r1_md_radio=1 and r1_md_cldma=1 (the ten gates and registration are checked at run time) */
-		data_on = radio_req && cldma_on && (sh9 || (PE_parse_boot_argn("r1_md_data", &v, sizeof(v)) && v == 1));
+		data_on = svc_level || (radio_req && cldma_on && (sh9 || (PE_parse_boot_argn("r1_md_data", &v, sizeof(v)) && v == 1)));
 		eif_on = data_on && (sh9 || (PE_parse_boot_argn("r1_md_eif", &v, sizeof(v)) && v == 1));
 		if_on = data_on && (sh9 || (PE_parse_boot_argn("r1_md_if", &v, sizeof(v)) && v == 1));
 		if (if_on) {
@@ -4047,6 +4645,20 @@ redwood_md_init(void)
 				if_kb = v;
 			}
 			if_hold_ms = 5000;
+		}
+		if (svc_level) {
+			uint32_t mb = 100;
+
+			redwood_host_keep_reserve = SVC_RESERVE;        /* the other drivers leave the end of the kept buffer to the r1md lines (status, exit) */
+
+			at_seq = at_seq7s;
+			at_n = sizeof(at_seq7s) / sizeof(at_seq7s[0]);
+			if_pkts = 0x7ffffff0u;          /* no per-direction caps in the service: the byte budget is (cell_budget_kb, W8) */
+			if_kb = 4000000;
+			(void)PE_parse_boot_argn("r1_md_budget_mb", &mb, sizeof(mb));
+			cs_budget_kb = (int)(mb > 2000000 ? 2000000 : mb) * 1024;
+			cs_radio = radio_req ? 1 : 0;
+			strlcpy(cs_state, "booting", sizeof(cs_state));
 		}
 		imei_h_set = PE_parse_boot_argn("r1_md_imei_h", &imei_h, sizeof(imei_h));
 		had_wifi = PE_parse_boot_argn("wifi", &v, sizeof(v)) && v != 0;

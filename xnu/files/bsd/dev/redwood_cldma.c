@@ -28,7 +28,7 @@ extern void redwood_md_say(bool must, const char *format, ...) __printflike(2, 3
 #define AO_BASE         0x10014000UL
 #define PD_BASE         0x1021b000UL
 #define CG2_STA         0xac            /* INFRA: bit 3 = CLDMA_BCLK gated */
-#define RING_N          32
+#define RING_N_DEF      32
 #define BUF_BYTES       4096u
 #define DL_MTU          3584u
 #define CANARY          0xc1d3a5a5u
@@ -139,6 +139,7 @@ struct tgpd {
 	uint16_t len, psn;
 };
 
+static uint32_t rx_n = RING_N_DEF;      /* RX ring entries: 32, 128 in the service (a burst during a 20 ms idle sleep must fit) */
 static bool tx_on;                      /* cldma_data_enable() was called: TX ring, hook, 200-packet cap */
 static uint32_t rx_cap = MAX_RX;
 /* TX ring accounting: tx_prod packets queued in all, tx_done reclaimed (the hardware cleared HWO); slot = index % TX_N; in flight = tx_prod - tx_done */
@@ -165,6 +166,16 @@ cldma_data_enable(void)
 {
 	tx_on = true;
 	rx_cap = RX_MAX_DATA - 1;       /* the 200th packet trips the rule */
+}
+
+/* Stage 4a (r1_md=10/11, the service): no per-run packet caps (the byte budget is the kernel's, redwood_md.c), a bigger RX ring. Called before cldma_rx_start. */
+void
+cldma_svc_enable(void)
+{
+	tx_cap_pkts = 0x7fffffff;
+	tx_cap_bytes = 0x7fffffff;
+	rx_cap = 0x7fffffff;
+	rx_n = 128;
 }
 
 /* Stage 3b (r1_md_if=1): the ifnet sends interactively. Backstops a little above the caps redwood_cell.c enforces (those are what end the run cleanly). */
@@ -216,7 +227,7 @@ bool
 cldma_rx_start(uint32_t ms)
 {
 	vm_offset_t va = 0;
-	uint64_t rxsize = (uint64_t)PAGE_SIZE * 3 + (uint64_t)RING_N * BUF_BYTES;
+	uint64_t rxsize = (uint64_t)PAGE_SIZE * 3 + (uint64_t)rx_n * BUF_BYTES;
 	uint64_t tbytes = ((uint64_t)TX_N * TX_BUF + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
 	uint64_t size = rxsize + (tx_on ? (uint64_t)PAGE_SIZE * 2 + tbytes : 0);     /* + TX ring page, the TX buffers (whole pages), TX canary page */
 	uint32_t maxpn = (uint32_t)((0x100000000ULL >> PAGE_SHIFT) - 1);
@@ -250,11 +261,11 @@ cldma_rx_start(uint32_t ms)
 	cl.lo = (uint32_t *)cl.va;
 	cl.g = (struct rgpd *)(cl.va + PAGE_SIZE);
 	cl.bufs = (uint8_t *)(cl.va + 2 * PAGE_SIZE);
-	cl.hi = (uint32_t *)(cl.va + 2 * PAGE_SIZE + (uint64_t)RING_N * BUF_BYTES);
+	cl.hi = (uint32_t *)(cl.va + 2 * PAGE_SIZE + (uint64_t)rx_n * BUF_BYTES);
 	cl.lo_pa = cl.pa;
 	cl.g_pa = cl.pa + PAGE_SIZE;
 	cl.bufs_pa = cl.pa + 2 * PAGE_SIZE;
-	cl.hi_pa = cl.bufs_pa + (uint64_t)RING_N * BUF_BYTES;
+	cl.hi_pa = cl.bufs_pa + (uint64_t)rx_n * BUF_BYTES;
 	for (uint32_t i = 0; i < PAGE_SIZE / 4; i++) {
 		cl.lo[i] = cl.hi[i] = CANARY;
 	}
@@ -281,11 +292,11 @@ cldma_rx_start(uint32_t ms)
 			t->psn = 0;
 		}
 	}
-	for (int i = 0; i < RING_N; i++) {
+	for (uint32_t i = 0; i < rx_n; i++) {
 		struct rgpd *g = &cl.g[i];
 
 		g->allow = DL_MTU;
-		g->next = (uint32_t)(cl.g_pa + (uint64_t)((i + 1) % RING_N) * sizeof(struct rgpd));
+		g->next = (uint32_t)(cl.g_pa + (uint64_t)((i + 1) % rx_n) * sizeof(struct rgpd));
 		g->buf = (uint32_t)(cl.bufs_pa + (uint64_t)i * BUF_BYTES);
 		g->len = 0;
 		g->msb = 0;
@@ -293,8 +304,8 @@ cldma_rx_start(uint32_t ms)
 		g->flags = 0x81;        /* HWO | IOC */
 	}
 	__asm__ volatile ("dsb sy");
-	redwood_md_say(true, "r1md: cldma: ring memory pa %#llx..%#llx: canary lo %#llx, rgpd %#llx x%d, buffers %#llx (%d x %u), canary hi %#llx", cl.pa, cl.pa + size - 1,
-	    cl.lo_pa, cl.g_pa, RING_N, cl.bufs_pa, RING_N, BUF_BYTES, cl.hi_pa);
+	redwood_md_say(true, "r1md: cldma: ring memory pa %#llx..%#llx: canary lo %#llx, rgpd %#llx x%u, buffers %#llx (%u x %u), canary hi %#llx", cl.pa, cl.pa + size - 1,
+	    cl.lo_pa, cl.g_pa, rx_n, cl.bufs_pa, rx_n, BUF_BYTES, cl.hi_pa);
 	cldma_hw_reset();
 	delay(100);
 	wr(ao, 0x418, DL_MTU);
@@ -316,7 +327,7 @@ cldma_rx_start(uint32_t ms)
 	(void)rd(pd, 0x404);
 	cl_started = true;
 	delay(100);
-	redwood_md_say(true, "r1md: [%u ms] cldma: rx q0 started: rgpd %#llx x%d buf %#llx, INFRA C00 %#x (interrupts left masked)", ms, cl.g_pa, RING_N, cl.bufs_pa, rd(infra_b, 0xc00));
+	redwood_md_say(true, "r1md: [%u ms] cldma: rx q0 started: rgpd %#llx x%u buf %#llx, INFRA C00 %#x (interrupts left masked)", ms, cl.g_pa, rx_n, cl.bufs_pa, rd(infra_b, 0xc00));
 	redwood_md_say(true, "r1md: cldma after start: AO CFG %#x START %#x CUR %#x STATUS %#x MTU %#x; PD SO_ERR %#x DLD %#x %#x %#x %#x L2RISAR %#x", rd(ao, 0x400), rd(ao, 0x404),
 	    rd(ao, 0x408), rd(ao, 0x414), rd(ao, 0x418), rd(pd, 0x400), rd(pd, 0x410), rd(pd, 0x414), rd(pd, 0x418), rd(pd, 0x41c), rd(pd, 0x830));
 	return true;
@@ -390,7 +401,7 @@ cldma_rx_poll(uint32_t ms)
 		__asm__ volatile ("dsb sy" ::: "memory");
 		g->flags = 0x81;
 		__asm__ volatile ("dsb sy" ::: "memory");
-		cl_cur = (cl_cur + 1) % RING_N;
+		cl_cur = (cl_cur + 1) % rx_n;
 	}
 	if (!(rd(ao, 0x414) & 1)) {
 		wr(pd, 0x408, 1);       /* SO_RESUME_CMD */

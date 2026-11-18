@@ -50,7 +50,7 @@ static volatile bool cell_up;                   /* packets pass: set when the in
 static bool cell_stopped;
 static volatile uint32_t cell_now;              /* the modem thread's clock (ms), for cldma_tx's slot timestamps */
 static uint8_t c_ip[4], c_peer[4], c_dns[4];
-static uint32_t cap_pkts, cap_bytes, next_tick, tx_logged;
+static uint32_t cap_pkts, cap_bytes, next_tick, tx_logged, tick_period = 10000;
 static struct {
 	uint32_t tx_p, tx_b, rx_p, rx_b, drops, tx_v6, rx_v6, tx_busy, cap_hit;
 	uint32_t txp[4], rxp[4];                /* tcp, udp, icmp, other */
@@ -459,7 +459,7 @@ cell_if_tick(uint32_t rel)
 		return false;
 	}
 	if (rel >= next_tick) {
-		next_tick = rel + 10000;
+		next_tick = rel + tick_period;
 		cell_counters("if up");
 	}
 	lck_mtx_lock(&cell_lock);
@@ -467,6 +467,13 @@ cell_if_tick(uint32_t rel)
 	said_cap |= hit;
 	lck_mtx_unlock(&cell_lock);
 	return hit;
+}
+
+/* Stage 4a (service): the counters line every `ms` instead of every 10 s */
+void
+cell_if_period(uint32_t ms)
+{
+	tick_period = ms;
 }
 
 bool

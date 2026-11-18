@@ -58,6 +58,8 @@ extern void redwood_r1_dram_restore(void);       /* bsd/dev/redwood_cpufreq.c: r
 extern void redwood_r1_gpu_restore(void);        /* bsd/dev/redwood_pvr.c: r1_gpu='s VCORE vote taken back (an MMIO write) */
 extern void redwood_haptic_quiesce(void);
 extern void redwood_md_quiesce(void);          /* bsd/dev/redwood_md.c: MD1 off again, if r1_md=2 left it on */
+extern void redwood_md_stop_request(void);      /* bsd/dev/redwood_md.c (r1_md=10/11): the modem service's orderly end begins, does not wait */
+extern void redwood_md_stop_wait(void);         /* ... and is waited for (what is left of 8 s from the request) */
 extern void redwood_torch_quiesce(void);
 extern void redwood_camera_quiesce(void);
 extern void redwood_mic_quiesce(void);
@@ -456,7 +458,9 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 	}
 	PE_parse_boot_argn("return_panic", &as_panic, sizeof(as_panic));
 	if (!as_panic) {
+		redwood_md_stop_request();      /* the modem service (r1_md=10/11): radio off first, MD1 down: in step with the save below, 8 s at most */
 		redwood_var_save_on_return();   /* the data volume kept, while the system is still whole */
+		redwood_md_stop_wait();
 		redwood_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
 		redwood_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
 		redwood_adsp_stop();            /* and the audio DSP */
@@ -493,17 +497,37 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_return_timer_init);
  */
 static thread_call_t loader_stop_call;
 
+/*
+ * boot-arg loader_stop_test=S (test images only): the stop poll acts as if the watcher had set loader_live.stop S seconds after boot, as it does for the side-button
+ * hold on an image with var_store. The watcher itself asks XNU only when var_store is on (mtkloader.c: without it the hold goes straight to the snapshot and the
+ * reset); a test image must not write the saved store, so this is how the kernel's half of that path (the same function, the same order) is run without it.
+ */
+static uint32_t loader_stop_test_s;
+static bool
+loader_stop_test_due(void)
+{
+	uint64_t ns = 0;
+
+	if (loader_stop_test_s == 0) {
+		return false;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns >= (uint64_t)loader_stop_test_s * NSEC_PER_SEC;
+}
+
 static void
 loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	uint64_t deadline;
 
-	if (loader_live.stop) {
+	if (loader_live.stop || loader_stop_test_due()) {
 		static const char banner[] = "\n--- the host asked for the end of the run: back to the loader ---\n";
 		for (const char *c = banner; *c; c++) {
 			loader_log_putc(*c);
 		}
+		redwood_md_stop_request();      /* the modem service's orderly end starts before the save (see loader_return_timer) */
 		redwood_var_save_on_return();
+		redwood_md_stop_wait();
 		redwood_adreno_stop();
 		redwood_wifi_stop();
 		redwood_adsp_stop();
@@ -518,6 +542,7 @@ static void
 loader_stop_poll_init(void)
 {
 	loader_stop_call = thread_call_allocate(loader_stop_poll, NULL);
+	(void)PE_parse_boot_argn("loader_stop_test", &loader_stop_test_s, sizeof(loader_stop_test_s));
 	loader_stop_poll(NULL, NULL);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_stop_poll_init);

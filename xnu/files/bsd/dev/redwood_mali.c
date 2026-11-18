@@ -133,6 +133,7 @@ SYSCTL_PROC(_kern_redwood, OID_AUTO, say, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_
 #define HOST_KEEP_SIZE 0xff00          /* the pmsg zone is 64 KB, less its header and mtkloader's first line */
 char redwood_host_keep[HOST_KEEP_SIZE];
 uint32_t redwood_host_keep_len, redwood_host_keep_dropped;
+uint32_t redwood_host_keep_reserve;    /* r1_md=10/11: bytes at the end that only "r1md: " lines may use (redwood_md.c) */
 
 static int
 host_keep_line(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
@@ -183,7 +184,7 @@ redwood_host_keep_add(const char *format, ...)
 	length = strlen(line);
 	line[length++] = '\n';
 	lck_mtx_lock(&kept_lock);
-	if (redwood_host_keep_len + length <= sizeof(redwood_host_keep)) {
+	if (redwood_host_keep_len + length <= sizeof(redwood_host_keep) - (strncmp(line, "r1md: ", 6) ? redwood_host_keep_reserve : 0)) {
 		memcpy(redwood_host_keep + redwood_host_keep_len, line, length);
 		redwood_host_keep_len += (uint32_t)length;
 	} else {
