@@ -1189,21 +1189,29 @@ static const char *const at_white[] = {
 	"AT", "ATE0", "AT+CMEE=1", "AT+ESIMS=1", "AT+ESIMS", "AT+ESIMS?", "AT+EFUN=0", "AT+EFUN=1" /* only with radio_go */, "AT+EFUN?", "AT+CFUN?",
 	"AT+CPIN?", "AT+CGSN", "AT+CGMR", "AT+CREG=2", "AT+CGREG=2", "AT+CEREG=2", "AT+EREG=3", "AT+EGREG=3", "AT+ECSQ=1", "AT+CREG?", "AT+CGREG?",
 	"AT+CEREG?", "AT+COPS?", "AT+CSQ", "AT+CGATT?", "AT+CEMODE?", "AT+ERAT?", "AT+EBOOT=0", "AT+EPOC",
+	/* attempt 2 (docs/cellular-attach.md 4.1): stock volatile pre-radio settings, URC enables, read-only diagnostics */
+	"AT+EDALLOW=1", "AT+EGRAT=14", "AT+CEREG=3", "AT+CSCON=3", "AT+EIAREG=1", "AT+PSBEARER=1", "AT+ECCAUSE=1", "AT+CEER", "AT+EREG?", "AT+EGREG?", "AT+CSCON?", "AT+EPSB?",
 };
 /* the scripts: 2d (r1_md=6), 2e-1 (r1_md=7: SIM up, radio off), and the 2e-2 ones (radio_go only) */
 static const char *const at_seq6[] = { "AT", "ATE0", "AT+CFUN?", "AT+EFUN?", "AT+CPIN?", "AT+ESIMS?", "AT+CGSN", "AT+CGMR" };
 static const char *const at_seq7[] = {
-	"AT", "ATE0", "AT+CMEE=1", "AT+ESIMS=1", "AT+ESIMS", "AT+EFUN=0", "AT+CPIN?", "AT+EFUN?", "AT+CFUN?", "AT+CGSN", "AT+CGMR", "AT+ERAT?", "AT+CEMODE?",
+	"AT", "ATE0", "AT+CMEE=1", "AT+ESIMS=1", "AT+ESIMS", "AT+EDALLOW=1", "AT+EBOOT=0", "AT+EPOC", "AT+EFUN=0", "AT+CPIN?", "AT+EFUN?", "AT+CFUN?",
+	"AT+CGSN", "AT+CGMR", "AT+ERAT?", "AT+CEMODE?", "AT+EPSB?",
 };
-static const char *const at_seqA[] = { "AT+CREG=2", "AT+CGREG=2", "AT+CEREG=2", "AT+ECSQ=1", "AT+EFUN=1" };
-static const char *const at_seqP[] = { "AT+COPS?", "AT+CSQ", "AT+CGATT?", "AT+CEREG?" };
+static const char *const at_seqA[] = {
+	"AT+CREG=2", "AT+CGREG=2", "AT+CEREG=3", "AT+EREG=3", "AT+EGREG=3", "AT+CSCON=3", "AT+EIAREG=1", "AT+PSBEARER=1", "AT+ECCAUSE=1", "AT+ECSQ=1",
+	"AT+EGRAT=14", "AT+EFUN=1",
+};
+static const char *const at_seqP[] = { "AT+COPS?", "AT+CSQ", "AT+CGATT?", "AT+CEREG?", "AT+EREG?", "AT+CSCON?" };
+static const char *const at_seqC[] = { "AT+CSCON?" };
+static const char *const at_seqD[] = { "AT+CEER", "AT+CEREG?", "AT+EREG?", "AT+EGREG?", "AT+CSCON?" };
 static const char *const at_seqQ[] = { "AT+CEREG?" };
 static const char *const at_seqS[] = { "AT+CSQ" };
 #define AT_NCMD 8
 static const char *const at_names[AT_NCMD] = { "AT", "ATE0", "CFUN", "EFUN", "CPIN", "ESIMS", "CGSN", "CGMR" };
 static const char *const *at_seq = at_seq6;
 static uint32_t at_n = AT_NCMD;
-static char at_buf[1024], at_resp[700], at_res[AT_NCMD][24];
+static char at_buf[1024], at_resp[1500], at_res[AT_NCMD][24];
 static uint32_t at_len, at_rlen, at_idx, at_sent_ms, at_ready_ms, at_last_ms, at_unsol, at_not_before, cpin_t0;
 static bool at_ready, at_wait, at_done, at_radio_on, at_refused, at_stop, at_last_ok;
 static int at_radio_val[2] = { -1, -1 };
@@ -1215,6 +1223,11 @@ static bool imei_luhn;
 /* 2e-2: never set in a run that does not have r1_md=7 AND r1_md_radio=1 AND all ten gates passed */
 static bool radio_req, radio_go, rd_active;
 static int creg_stat = -1;
+/* attempt 2: EPS registration evidence, reject cause, RRC state, kept for RESULT 2e-2 */
+static bool eps_reg, stat3_pend, rej_perm, held_started, final_diag;
+static int cs_stat = -1, ereg_stat = -1, rej_type = -1, rej_cause = -1, cscon_n;
+static uint32_t n_stat3, diag_rounds, cscon1_ms_v, eps_reg_at;
+static char eps_seq[28], eps_src[12] = "-", eiareg_s[40], ceer_s[64];
 static uint32_t rd_t_on;
 /* 2e-2 bookkeeping (RESULT 2e-2): EFUN=1 timing, operator/RAT/signal, detach, the post-radio-on channel counts */
 static bool efun1_to, at_to, detach_seen, held_ok = true;
@@ -1262,7 +1275,9 @@ at_safe(const char *l, char *out, uint32_t outsz)
 		memcpy(pre, l, (size_t)(colon - l));
 		pre[colon - l] = 0;
 		if (!strcmp(pre, "+CEREG") || !strcmp(pre, "+CREG") || !strcmp(pre, "+CGREG") || !strcmp(pre, "+EREG") || !strcmp(pre, "+EGREG") ||
-			!strcmp(pre, "+ECSQ") || !strcmp(pre, "+COPS") || !strcmp(pre, "+CSQ") || !strcmp(pre, "+CGATT")) {      /* cell/signal/operator: not personal */
+			!strcmp(pre, "+ECSQ") || !strcmp(pre, "+COPS") || !strcmp(pre, "+CSQ") || !strcmp(pre, "+CGATT") || !strcmp(pre, "+CSCON") ||
+			!strcmp(pre, "+EIAREG") || !strcmp(pre, "+CGEV") || !strcmp(pre, "+PSBEARER") || !strcmp(pre, "+ECCAUSE") || !strcmp(pre, "+CEER") ||
+			!strcmp(pre, "+EPSB")) {      /* cell/signal/operator: not personal */
 			uint32_t o = 0;
 
 			for (; l[o] && o + 1 < outsz; o++) {
@@ -1328,8 +1343,8 @@ at_send(const char *cmd, uint32_t rel)
 static bool
 at_is_final(const char *l)
 {
-	return !strcmp(l, "OK") || !strcmp(l, "ERROR") || !strncmp(l, "+CME ERROR", 10) || !strncmp(l, "+CMS ERROR", 10) || !strcmp(l, "NO CARRIER") ||
-		   !strcmp(l, "BUSY") || !strcmp(l, "NO ANSWER");
+	/* only these end a command: every other line (+CREG: 2 ...) is a URC or an information line */
+	return !strcmp(l, "OK") || !strcmp(l, "ERROR") || !strncmp(l, "+CME ERROR", 10) || !strncmp(l, "+CMS ERROR", 10);
 }
 
 static bool
@@ -1351,26 +1366,107 @@ luhn_ok(const char *d, uint32_t n)
 	return sum % 10 == 0;
 }
 
-/* +CEREG: <n>,<stat>[,...] (a query) or +CEREG: <stat>[,"tac",...] (a URC): the stat */
-static int
-cereg_stat_of(const char *v)
+/* split `a,"b",,c` into up to n fields (quotes dropped, empty fields stay empty) */
+static uint32_t
+csv_split(const char *v, char f[][20], uint32_t n)
 {
-	const char *c;
+	uint32_t k = 0, o = 0;
+	bool q = false;
 
 	while (*v == ' ') {
 		v++;
 	}
-	c = strchr(v, ',');
-	if (c && c[1] >= '0' && c[1] <= '9') {
-		return (int)strtol(c + 1, NULL, 10);
+	f[0][0] = 0;
+	for (; *v && k < n; v++) {
+		if (*v == '"') {
+			q = !q;
+		} else if (*v == ',' && !q) {
+			f[k][o] = 0;
+			o = 0;
+			if (++k < n) {
+				f[k][0] = 0;
+			}
+		} else if (o < 19) {
+			f[k][o++] = *v;
+		}
 	}
-	return (int)strtol(v, NULL, 10);
+	if (k < n) {
+		f[k][o] = 0;
+		k++;
+	}
+	return k;
+}
+
+static int
+fnum(char f[][20], uint32_t nf, uint32_t i)
+{
+	return (i < nf && f[i][0] >= '0' && f[i][0] <= '9') ? (int)strtol(f[i], NULL, 10) : -1;
+}
+
+static void
+eps_mark(const char *src, uint32_t rel)
+{
+	if (!eps_reg_at) {
+		eps_reg_at = rd_t_on ? rel - rd_t_on + 1 : 1;     /* +1: 0 means never */
+		strlcpy(eps_src, src, sizeof(eps_src));
+	}
+	eps_reg = true;
+	rej_perm = false;
+}
+
+/* +CEREG / +EREG. A query response is `+CEREG: <n>,<stat>,...`, a URC is `+CEREG: <stat>[,"tac",...]`: the caller says which (the line is a
+ * query response only while that very query is outstanding and its 2nd field is an unquoted digit). EREG: stat,lac,ci,eAct,nwk,roam,cause_type,cause;
+ * CEREG: stat,tac,ci,AcT,cause_type,cause. */
+static void
+reg_note(bool is_cereg, const char *v, bool query_ctx, uint32_t rel)
+{
+	char f[10][20];
+	uint32_t nf = csv_split(v, f, 10);
+	const char *c = strchr(v, ',');
+	uint32_t o = (query_ctx && c && c[1] >= '0' && c[1] <= '9') ? 1 : 0;
+	int stat = fnum(f, nf, o), act = fnum(f, nf, o + 3), ct = fnum(f, nf, o + (is_cereg ? 4 : 6)), ca = fnum(f, nf, o + (is_cereg ? 5 : 7));
+	size_t sl = strlen(eps_seq);
+
+	if (stat < 0) {
+		return;
+	}
+	if (is_cereg) {
+		if (stat != creg_stat && sl + 3 < sizeof(eps_seq)) {
+			if (sl) {
+				eps_seq[sl++] = ',';
+			}
+			eps_seq[sl++] = (char)('0' + stat % 10);
+			eps_seq[sl] = 0;
+		}
+		if (stat == 3 && creg_stat != 3) {
+			n_stat3++;
+			stat3_pend = true;
+		}
+		creg_stat = stat;
+		if (stat == 1 || stat == 5) {
+			eps_mark("CEREG", rel);
+		} else {
+			eps_reg = false;
+		}
+	} else {
+		ereg_stat = stat;
+		if ((stat == 1 || stat == 5) && act == 7) {
+			eps_mark("EREG", rel);
+		}
+	}
+	if (ca > 0 && (ct <= 0)) {
+		rej_type = ct;
+		rej_cause = ca;
+		rej_perm = (ca == 3 || ca == 6 || ca == 7 || ca == 8) && !eps_reg;
+	}
 }
 
 /* 2e: every line from the modem, in or out of a response: what it says about the SIM and the registration */
 static void
-at_note(const char *l)
+at_note(const char *l, uint32_t rel)
 {
+	bool wq = at_wait && at_idx < at_n;
+
 	if (!strncmp(l, "+ESIMS:", 7)) {
 		sim_esims = (int)strtol(l + 7, NULL, 10);
 	} else if (!strncmp(l, "+ICCID:", 7)) {
@@ -1388,10 +1484,79 @@ at_note(const char *l)
 		}
 		strlcpy(sim_cpin, v, sizeof(sim_cpin));
 	} else if (!strncmp(l, "+CEREG:", 7)) {
-		creg_stat = cereg_stat_of(l + 7);
+		reg_note(true, l + 7, wq && !strcmp(at_seq[at_idx], "AT+CEREG?"), rel);
+	} else if (!strncmp(l, "+EREG:", 6)) {
+		reg_note(false, l + 6, wq && !strcmp(at_seq[at_idx], "AT+EREG?"), rel);
+	} else if (!strncmp(l, "+CREG:", 6)) {
+		char f[2][20];
+
+		cs_stat = fnum(f, csv_split(l + 6, f, 2), 0);      /* CS domain: recorded, never acted on */
+	} else if (!strncmp(l, "+CSCON:", 7)) {
+		char f[3][20];
+		uint32_t nf = csv_split(l + 7, f, 3);
+		const char *c = strchr(l, ',');
+		bool q = wq && !strcmp(at_seq[at_idx], "AT+CSCON?") && c && nf > 1;      /* query: +CSCON: <n>,<mode>[,...] */
+
+		if (fnum(f, nf, q ? 1 : 0) == 1 && rd_t_on && !cscon1_ms_v) {
+			cscon1_ms_v = rel - rd_t_on + 1;
+		}
+	} else if (!strncmp(l, "+EIAREG:", 8) && strnstr(l, "ME ATTACH", strlen(l))) {
+		const char *v = l + 8;
+
+		while (*v == ' ') {
+			v++;
+		}
+		at_safe(v, eiareg_s, sizeof(eiareg_s));
+		eps_mark("EIAREG", rel);
+	} else if (!strncmp(l, "+CEER:", 6)) {
+		const char *v = l + 6;
+
+		while (*v == ' ') {
+			v++;
+		}
+		at_safe(v, ceer_s, sizeof(ceer_s));
 	} else if (strnstr(l, "ME DETACH", strlen(l))) {
 		detach_seen = true;
+		eps_reg = false;
 	}
+}
+
+/* a "+XXX: ..." line that is not the information response of this command (its name is the command's) is an unsolicited result code */
+static bool
+at_is_urc(const char *cmd, const char *l)
+{
+	size_t n = 0;
+
+	if (l[0] != '+') {
+		return false;
+	}
+	if (cmd[2] != '+') {
+		return true;
+	}
+	cmd += 3;
+	while (cmd[n] && cmd[n] != '?' && cmd[n] != '=') {
+		n++;
+	}
+	return strncmp(l + 1, cmd, n) || l[1 + n] != ':';
+}
+
+/* a command timed out: the lines buffered during its wait (URCs included) are logged here, not dropped */
+static void
+at_dump(const char *cmd, uint32_t rel)
+{
+	char one[112], *line, *next;
+	uint32_t n = 0;
+
+	at_resp[at_rlen] = 0;
+	for (line = at_resp; line && *line && n < 40; line = next, n++) {
+		next = strchr(line, '\n');
+		if (next) {
+			*next++ = 0;
+		}
+		at_safe(line, one, sizeof(one));
+		SAY("r1md: [%u ms] AT< %s (no final result) buffered: %s", rel, cmd, one);
+	}
+	at_rlen = 0;
 }
 
 /* the response to the current command is complete: log it (identifiers only as a digit count and a hash), keep what is needed */
@@ -1452,7 +1617,7 @@ at_finish(const char *final, uint32_t rel)
 			}
 			at_safe(line, one, sizeof(one));
 			if (md_level >= 7) {
-				SAY("r1md: [%u ms] AT< %s: %s", rel, cmd, one);
+				SAY("r1md: [%u ms] AT< %s: %s%s", rel, cmd, at_is_urc(cmd, line) ? "[urc] " : "", one);
 			} else {
 				sn += (uint32_t)snprintf(show + sn, sizeof(show) - sn, "%s%s", sn ? "|" : "", one);
 			}
@@ -1545,7 +1710,7 @@ at_line(const char *l, uint32_t rel)
 		at_ready_ms = rel;
 	}
 	if (md_level >= 7) {
-		at_note(l);
+		at_note(l, rel);
 	}
 	if (at_wait) {
 		if (!strcmp(l, at_seq[at_idx])) {
@@ -1633,10 +1798,11 @@ at_step(uint32_t rel)
 	}
 	cmd = at_idx < at_n ? at_seq[at_idx] : "";
 	if (at_wait) {
-		uint32_t to = !strcmp(cmd, "AT+EFUN=0") ? 15000u : (!strcmp(cmd, "AT+EFUN=1") ? 10000u : 5000u);
+		uint32_t to = !strcmp(cmd, "AT+EFUN=0") ? 30000u : (!strcmp(cmd, "AT+EFUN=1") ? 10000u : 5000u);
 
 		if (rel - at_sent_ms >= to) {
 			SAY("r1md: [%u ms] AT< %s: TIMEOUT (%u s without a final result)", rel, cmd, to / 1000);
+			at_dump(cmd, rel);
 			at_last_ok = false;
 			at_to = true;
 			efun1_to |= !strcmp(cmd, "AT+EFUN=1");
@@ -2223,19 +2389,35 @@ static const char *const at_seqEQ[] = { "AT+EFUN?" };
 static void
 result_2e2(uint32_t rel)
 {
+	char cs[16], rg[24];
+
 	if (result2_said) {
 		return;
 	}
 	result2_said = true;
-	SAY("r1md: RESULT 2e-2: %s; EFUN=1 OK %d ms; reg stat %d at %d ms, held %s; radio on %u ms; hold %s", rp_failed ? rp_why : "completed",
-	    efun1_ok_ms ? (int)efun1_ok_ms - 1 : -1, creg_stat, rp_reg_ms ? (int)rp_reg_ms : -1, held_ok ? "yes" : "NO", rd_t_on ? rel - rd_t_on : 0,
-	    rp >= RP_HOLD ? "reached" : "not reached");
-	SAY("r1md: RESULT 2e-2b: op %s RAT %d csq %d; EFUN=0 tries %d res %s detach %s final EFUN %d; ch34 %u ch38 %u new ch %u/%u pkts, quiet %u", rp_op, rp_rat,
-	    rp_csqv, off_try, off_res, detach_seen ? "seen" : "no", efun_final, n34, n38, oth_new_ch, oth_new, n_quiet);
+	if (cscon1_ms_v) {
+		snprintf(cs, sizeof(cs), "%d ms", (int)cscon1_ms_v - 1);
+	} else {
+		strlcpy(cs, "never", sizeof(cs));
+	}
+	if (eps_reg_at) {
+		snprintf(rg, sizeof(rg), "%d ms (%s)", (int)eps_reg_at - 1, eps_src);
+	} else {
+		strlcpy(rg, "never", sizeof(rg));
+	}
+	SAY("r1md: RESULT 2e-2: %s; EFUN=1 OK %d ms; CSCON1 %s; eps %s; reg %s; held %s", rp_failed ? rp_why : "completed", efun1_ok_ms ? (int)efun1_ok_ms - 1 : -1, cs,
+	    eps_seq[0] ? eps_seq : "-", rg, held_started ? (held_ok ? "yes" : "NO") : "n/a");
+	SAY("r1md: RESULT 2e-2b: reject type %d cause %d n3 %u cs %d; op %s RAT %d csq %d; EFUN=0 x%d %s, EFUN? %d, detach %s; on %u ms", rej_type, rej_cause, n_stat3,
+	    cs_stat, rp_op, rp_rat, rp_csqv, off_try, off_res, efun_final, detach_seen ? "seen" : "no", rd_t_on ? rel - rd_t_on : 0);
+	SAY("r1md: RESULT 2e-2c: ch34 %u ch38 %u new ch %u/%u pkts quiet %u; eiareg \"%s\"; diag rounds %u; ereg stat %d; hold %s", n34, n38, oth_new_ch, oth_new, n_quiet,
+	    eiareg_s, diag_rounds, ereg_stat, held_started ? "reached" : "not reached");
+	SAY("r1md: RESULT 2e-2d: ceer \"%s\"", ceer_s);
 }
 
-/* the off sequence: one command at a time (at_step is the only sender and sends nothing while at_wait), EFUN=0 up to 3 x 15 s 1 s apart,
- * then AT+EFUN? to confirm; the caller powers MD1 down in every case */
+/* the off sequence: one command at a time (at_step is the only sender and sends nothing while at_wait). Plain AT+EFUN=0 (30 s), a quiet wait,
+ * AT+EFUN?; if that is not 0 one more EFUN=0 + EFUN?; the caller powers MD1 down in every case */
+static uint32_t off_wait;
+
 static void
 off_drive(uint32_t rel)
 {
@@ -2261,36 +2443,29 @@ off_drive(uint32_t rel)
 			return;
 		}
 		off_tm = rel;
-		if (at_last_ok) {
-			off_res = "OK";
-			off_ph = 2;
-		} else if (at_to) {
-			off_res = "timeout";
-			off_ph = 4;
-		} else {
-			off_res = "error";
-			off_ph = off_try < 3 ? 3 : 4;
+		off_res = at_last_ok ? "OK" : (at_to ? "timeout" : "error");
+		off_wait = at_last_ok ? 2000 : (at_to ? 3000 : 1000);      /* quiet time for the late final / the URCs (+CGEV: ME DETACH) */
+		off_ph = 2;
+		break;
+	case 2:
+		if (rel - off_tm >= off_wait) {
+			off_ph = 3;
 		}
 		break;
-	case 2:         /* OK: 2 s of URCs (+CGEV: ME DETACH, +CEREG: 0) */
-		if (rel - off_tm >= 2000) {
-			off_ph = 4;
-		}
-		break;
-	case 3:         /* error: 1 s, then the next try */
-		if (rel - off_tm >= 1000) {
-			off_ph = 0;
-		}
+	case 3:
+		at_radio_val[1] = -1;           /* a timed-out EFUN? must not look like the earlier +EFUN: 0 */
+		radio_load(at_seqEQ, 1);
+		off_ph = 4;
 		break;
 	case 4:
-		radio_load(at_seqEQ, 1);
-		off_ph = 5;
-		break;
-	case 5:
 		if (!at_done) {
 			return;
 		}
 		efun_final = at_radio_val[1];
+		if (efun_final != 0 && off_try < 2) {
+			off_ph = 0;     /* not confirmed off: one more EFUN=0 + EFUN? */
+			break;
+		}
 		SAY("r1md: radio: off sequence done: EFUN=0 %d tries (%s), AT+EFUN? -> %d%s", off_try, off_res, efun_final, efun_final == 0 ? " (confirmed off)" : " (NOT confirmed)");
 		rp = RP_END;
 		rd_active = false;
@@ -2303,17 +2478,17 @@ off_drive(uint32_t rel)
 static void
 radio_drive(uint32_t rel)
 {
+	uint32_t t = rd_t_on ? rel - rd_t_on : 0;
+
 	if (!radio_go) {
 		rd_active = false;
 		return;
 	}
 	if (rp < RP_OFF) {
-		if (rd_t_on && rel - rd_t_on >= 240000) {
+		if (rd_t_on && t >= 240000) {
 			radio_stop("hard cap of 4 minutes");
 		} else if (efun1_to) {
 			radio_stop("EFUN=1 timeout");
-		} else if (creg_stat == 3) {
-			radio_stop("registration denied");
 		} else if (st2a.unanswered || rpc_bad || st2a.sys_late || st2a.ctl_odd || (rd_t_on ? (oth_new_ch > 3 || oth_new > 50) : st2a.oth_bad != 0)) {
 			radio_stop("unexpected traffic");
 		}
@@ -2323,18 +2498,21 @@ radio_drive(uint32_t rel)
 		return;
 	}
 	if (rp_new) {
+		if (at_wait) {
+			return;         /* never replace the script under a command in flight */
+		}
 		rp_new = false;
 		if (rp == RP_PRE) {
-			radio_load(at_seqA, 5);
+			radio_load(at_seqA, sizeof(at_seqA) / sizeof(at_seqA[0]));
 		} else if (rp == RP_POST) {
-			radio_load(at_seqP, 4);
+			radio_load(at_seqP, sizeof(at_seqP) / sizeof(at_seqP[0]));
 		}
 		return;
 	}
 	if (!at_done || at_wait) {
 		return;
 	}
-	if (rp >= RP_POST && rp < RP_OFF && creg_stat != 1 && creg_stat != 5) {
+	if (rp >= RP_POST && rp < RP_OFF && !eps_reg) {
 		held_ok = false;
 	}
 	switch (rp) {
@@ -2347,16 +2525,35 @@ radio_drive(uint32_t rel)
 		}
 		break;
 	case RP_WAIT:
-		if (creg_stat == 1 || creg_stat == 5) {
-			rp_reg_ms = rel - rd_t_on;
-			SAY("r1md: radio: registered (CEREG stat %d) %u ms after the radio-on command", creg_stat, rp_reg_ms);
+		if (eps_reg) {
+			rp_reg_ms = eps_reg_at - 1;
+			SAY("r1md: radio: registered (%s) %u ms after the radio-on command", eps_src, rp_reg_ms);
 			rp = RP_POST;
 			rp_new = true;
-		} else if (rel - rd_t_on >= 90000) {
-			radio_stop("no registration in 90 s");
+		} else if (stat3_pend && diag_rounds < 3) {
+			/* a single stat 3 is not final (T3411 retries): read the cause and keep listening, unless the cause is a permanent one */
+			stat3_pend = false;
+			diag_rounds++;
+			SAY("r1md: radio: EPS stat 3 (#%u): diagnostics round %u (CEER, CEREG?, EREG?, EGREG?, CSCON?)", n_stat3, diag_rounds);
+			radio_load(at_seqD, sizeof(at_seqD) / sizeof(at_seqD[0]));
+		} else if (rej_perm && diag_rounds) {
+			char why[40];
+
+			snprintf(why, sizeof(why), "reject cause #%d", rej_cause);
+			radio_stop(why);
+		} else if (t >= 90000) {
+			if (!final_diag) {
+				final_diag = true;
+				radio_load(at_seqD, sizeof(at_seqD) / sizeof(at_seqD[0]));
+			} else {
+				radio_stop("no registration in 90 s");
+			}
 		} else if (rel - rp_ereg >= 5000) {
 			rp_ereg = rel;
 			radio_load(at_seqQ, 1);
+		} else if ((cscon_n == 0 && t >= 5000) || (cscon_n == 1 && t >= 15000)) {
+			cscon_n++;
+			radio_load(at_seqC, 1);
 		} else if (rel - rp_csq >= 10000) {
 			rp_csq = rel;
 			radio_load(at_seqS, 1);
@@ -2364,6 +2561,7 @@ radio_drive(uint32_t rel)
 		break;
 	case RP_POST:
 		rp = RP_HOLD;
+		held_started = true;
 		rp_t = rel;
 		break;
 	case RP_HOLD:

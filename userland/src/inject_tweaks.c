@@ -435,7 +435,7 @@ hide_wallet_row(void)
  * CoreImage guard (placeholder icons, 2026-11-17): a default CIContext finds no Metal device and falls back to
  * +[CIContext internalGLContextWithOptions:], over Apple's own EAGLContext, which has no GL dispatch table
  * (getMacroContextPrivate NULL) and then calls a zeroed glDisable slot. Refuse the fallback (nil, which
- * -initWithOptions: handles) when there is no macro context. Inert unless boot-arg ci_guard=1. Every process.
+ * -initWithOptions: handles) when there is no macro context. On by default in Preferences; ci_guard=0 off, ci_guard=1 on in every injected process.
  */
 static id (*real_gl_context)(id, SEL, id);
 
@@ -475,14 +475,22 @@ guard_coreimage(void)
 	Method m;
 	const char *enc;
 
-	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || strstr(args, "ci_guard=1") == NULL) {
+	bool on;
+
+	/* default on in Preferences; ci_guard=0 turns it off, ci_guard=1 forces it on in every injected process */
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) {
+		args[0] = 0;
+	}
+	on = strstr(args, "ci_guard=0") == NULL && (strstr(args, "ci_guard=1") != NULL || strcmp(executable_name(), "Preferences") == 0);
+	if (!on) {
 		return;
 	}
 	dlopen("/System/Library/Frameworks/CoreImage.framework/CoreImage", RTLD_NOW);
 	c = objc_getClass("CIContext");
 	m = c != NULL ? class_getClassMethod(c, sel_registerName("internalGLContextWithOptions:")) : NULL;
 	enc = m != NULL ? method_getTypeEncoding(m) : NULL;
-	if (m == NULL || enc == NULL || strncmp(enc, "@24@0:8@16", 10) != 0) {
+	/* (the method returns the context as an object or as a raw pointer: "@24@0:8@16" or "^v24@0:8@16"; either is a pointer return, nil = NULL) */
+	if (m == NULL || enc == NULL || (strncmp(enc, "@24@0:8@16", 10) != 0 && strncmp(enc, "^v24@0:8@16", 11) != 0)) {
 		say("redwood: tweaks: %s: CIContext guard off (%s %s)\n", executable_name(), c == NULL ? "no CIContext" : m == NULL ? "no method" : "type", enc != NULL ? enc : "");
 		return;
 	}

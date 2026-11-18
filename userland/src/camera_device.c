@@ -1404,6 +1404,7 @@ still_symbol(const char *framework, const char *name)
 /* a still waiting for its JPEG: the tap's number, when it was asked, the ISP's settings of that moment, and the frame (header and RAW) */
 struct still_job {
 	uint64_t        tap, asked;
+	bool            front;
 	struct isp      isp;
 	uint8_t         frame[];
 };
@@ -1468,6 +1469,13 @@ still_save(struct still_job *job)
 	void *(*file_create)(CFURLRef, CFStringRef, size_t, CFDictionaryRef) = still_symbol("ImageIO", "CGImageDestinationCreateWithURL");
 	void (*file_add)(void *, void *, CFDictionaryRef) = still_symbol("ImageIO", "CGImageDestinationAddImage");
 	bool (*file_finalize)(void *) = still_symbol("ImageIO", "CGImageDestinationFinalize");
+	CFStringRef *orient_key = still_symbol("ImageIO", "kCGImagePropertyOrientation");
+	CFStringRef *width_key = still_symbol("ImageIO", "kCGImagePropertyPixelWidth");
+	CFStringRef *height_key = still_symbol("ImageIO", "kCGImagePropertyPixelHeight");
+	void *(*source_create)(CFURLRef, CFDictionaryRef) = still_symbol("ImageIO", "CGImageSourceCreateWithURL");
+	CFDictionaryRef (*source_props)(void *, size_t, CFDictionaryRef) = still_symbol("ImageIO", "CGImageSourceCopyPropertiesAtIndex");
+	/* EXIF orientation of the JPEG (6 = rotate 90 clockwise to show): the sensor's landscape frame is saved as is, no pixels turned */
+	int orient = (int)(job->front ? bootarg_number("r1cam_front_still_orient", 6) : bootarg_number("r1cam_still_orient", 6));
 	const struct redwood_camera_frame *f = (const void *)job->frame;
 	size_t width = f->width, height = f->height, stride = width * 4;
 	uint8_t *bgra = NULL;
@@ -1492,18 +1500,28 @@ still_save(struct still_job *job)
 			t[3] = t[4] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 		}
 		if (image != NULL && (file = file_create(url, CFSTR("public.jpeg"), 1, NULL)) != NULL) {
-			file_add(file, image, NULL);
+			CFDictionaryRef props = NULL;
+			CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType, &orient);
+
+			if (orient_key != NULL) {
+				props = CFDictionaryCreate(NULL, (const void **)orient_key, (const void **)&number, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+			}
+			file_add(file, image, props);
+			if (props != NULL) {
+				CFRelease(props);
+			}
+			CFRelease(number);
 			ok = file_finalize(file) && rename(part, path) == 0;
 			t[4] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 		}
 	}
 	/* (the queue's wait: asked to began; the time "in" split as symbols (dlopen), ISP, CGImage, JPEG (ImageIO's create/add/finalize and the rename)) */
 	snprintf(line, sizeof(line), "still: tap %llu: frame %llu, %zux%zu: %s in %llu ms (%llu ms after the tap reached the camera; waited %llu, symbols %llu, "
-	    "ISP %llu, CGImage %llu, JPEG %llu ms)%s", job->tap, f->sequence,
+	    "ISP %llu, CGImage %llu, JPEG %llu ms), orientation %d%s", job->tap, f->sequence,
 	    width, height, ok ? "WRITTEN" : !have ? "NO CoreGraphics / ImageIO" : !bgra ? "NO MEMORY" : !image ? "NO IMAGE" :
 	    !file ? "NO JPEG DESTINATION (ImageIO)" : "THE JPEG WAS NOT WRITTEN", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t[0]) / 1000000,
 	    (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - job->asked) / 1000000, (t[0] - job->asked) / 1000000, (t[1] - t[0]) / 1000000,
-	    (t[2] - t[1]) / 1000000, (t[3] - t[2]) / 1000000, (t[4] - t[3]) / 1000000, job->tap == 0 ? ": the warm-up, no tap's" : "");
+	    (t[2] - t[1]) / 1000000, (t[3] - t[2]) / 1000000, (t[4] - t[3]) / 1000000, orient, job->tap == 0 ? ": the warm-up, no tap's" : "");
 	say("%s", line);
 	(void)sysctlbyname("kern.redwood.host_keep", NULL, NULL, line, strlen(line));
 	for (int i = 0; i < 4; i++) {
@@ -1512,6 +1530,28 @@ still_save(struct still_job *job)
 		if (o[i]) {
 			CFRelease(o[i]);
 		}
+	}
+	if (ok && source_create && source_props && width_key && height_key && orient_key) {
+		/* read the file back: what ImageIO says it is */
+		CFURLRef final = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, (CFIndex)strlen(path), false);
+		void *src = source_create(final, NULL);
+		CFDictionaryRef p = src != NULL ? source_props(src, 0, NULL) : NULL;
+		int w = 0, h = 0, o = 0;
+		CFNumberRef n;
+
+		if (p != NULL) {
+			if ((n = CFDictionaryGetValue(p, *width_key)) != NULL) CFNumberGetValue(n, kCFNumberIntType, &w);
+			if ((n = CFDictionaryGetValue(p, *height_key)) != NULL) CFNumberGetValue(n, kCFNumberIntType, &h);
+			if ((n = CFDictionaryGetValue(p, *orient_key)) != NULL) CFNumberGetValue(n, kCFNumberIntType, &o);
+			CFRelease(p);
+		}
+		if (src != NULL) {
+			CFRelease(src);
+		}
+		CFRelease(final);
+		snprintf(line, sizeof(line), "still: tap %llu: file says %dx%d orientation %d", job->tap, w, h, o);
+		say("%s", line);
+		(void)sysctlbyname("kern.redwood.host_keep", NULL, NULL, line, strlen(line));
 	}
 	CFRelease(url);
 	free(bgra);
@@ -1532,7 +1572,7 @@ still_save(struct still_job *job)
  * encode) is paid before the shutter is tapped, and its line says how much.
  */
 static void
-still_queue(const struct isp *isp, const struct redwood_camera_frame *f, size_t bytes, uint64_t tap)
+still_queue(const struct isp *isp, const struct redwood_camera_frame *f, size_t bytes, uint64_t tap, bool front)
 {
 	struct still_job *job = malloc(sizeof(*job) + bytes);
 
@@ -1544,6 +1584,7 @@ still_queue(const struct isp *isp, const struct redwood_camera_frame *f, size_t 
 		return;
 	}
 	job->tap = tap;
+	job->front = front;
 	job->asked = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 	job->isp = *isp;
 	memcpy(job->frame, f, bytes);
@@ -1713,10 +1754,10 @@ worker(void *context)
 			}
 			if (!still_warmed) {
 				still_warmed = true;
-				still_queue(&isp, f, bytes, 0);                 /* (the warm-up) */
+				still_queue(&isp, f, bytes, 0, s->front);                 /* (the warm-up) */
 			}
 			if (still_served < still_asked) {
-				still_queue(&isp, f, bytes, ++still_served);    /* one a frame: every tap its own still */
+				still_queue(&isp, f, bytes, ++still_served, s->front);    /* one a frame: every tap its own still */
 				still_queued = still_served;
 			}
 		}
