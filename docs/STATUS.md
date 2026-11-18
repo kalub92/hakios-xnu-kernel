@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-18 11:00 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-18 12:00 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -32,6 +32,7 @@ Last updated: 2026-11-18 11:00 PST. Kept current as work lands; details are in t
 
 ## In progress
 
+- Using Open Mapple (github.com/open-mapple, same code lineage, MediaTek phone): plan in `open-mapple-plan.md`; phase 1 (small items) starting
 - Microphone and video recording: analysis of what each needs (see open problems)
 - Bluetooth speaker audio (A2DP): ready for a hands-on session; no sound has been sent to a speaker yet
 
