@@ -64,8 +64,9 @@ extern void mdfs_done(void);
 extern void mdfs_phase(int p);
 /* r1_md=7 gates 2-4: the same struct as in redwood_mdfs.c */
 struct mdfs_gate_info {
-	uint32_t unimpl, bad_req, cap_ops, cap_hits, errors, errors_other, prot_reads, prot_short, prot_mut, crc_checked, crc_bad, sweep_nodes, sweep_bad, prot_same, max_req;
+	uint32_t unimpl, bad_req, cap_ops, cap_hits, errors, errors_other, prot_reads, prot_short, prot_mut, crc_checked, crc_bad, sweep_nodes, sweep_bad, prot_same, max_req, oth_mut;
 	uint64_t prot_bytes;
+	char oth_files[96];
 };
 extern void mdfs_gate(struct mdfs_gate_info *g);
 extern uint64_t redwood_emmc_nv_refused(void);
@@ -1198,7 +1199,6 @@ static const char *const at_seqA[] = { "AT+CREG=2", "AT+CGREG=2", "AT+CEREG=2", 
 static const char *const at_seqP[] = { "AT+COPS?", "AT+CSQ", "AT+CGATT?", "AT+CEREG?" };
 static const char *const at_seqQ[] = { "AT+CEREG?" };
 static const char *const at_seqS[] = { "AT+CSQ" };
-static const char *const at_seqO[] = { "AT+EFUN=0", "AT+EFUN?" };
 #define AT_NCMD 8
 static const char *const at_names[AT_NCMD] = { "AT", "ATE0", "CFUN", "EFUN", "CPIN", "ESIMS", "CGSN", "CGMR" };
 static const char *const *at_seq = at_seq6;
@@ -1216,6 +1216,11 @@ static bool imei_luhn;
 static bool radio_req, radio_go, rd_active;
 static int creg_stat = -1;
 static uint32_t rd_t_on;
+/* 2e-2 bookkeeping (RESULT 2e-2): EFUN=1 timing, operator/RAT/signal, detach, the post-radio-on channel counts */
+static bool efun1_to, at_to, detach_seen, held_ok = true;
+static uint32_t efun1_ok_ms, oth_new, oth_new_ch, n_quiet, n34, n38, late_logged;
+static int rp_rat = -1, rp_csqv = -1;
+static char rp_op[14] = "-", at_lastcmd[24];
 
 /* runs of 8 or more hex digits never reach the log (identifiers): "<N digits>" instead */
 static void
@@ -1315,6 +1320,8 @@ at_send(const char *cmd, uint32_t rel)
 		return false;
 	}
 	SAY("r1md: [%u ms] AT> %s", rel, cmd);
+	strlcpy(at_lastcmd, cmd, sizeof(at_lastcmd));
+	at_to = false;
 	return true;
 }
 
@@ -1382,6 +1389,8 @@ at_note(const char *l)
 		strlcpy(sim_cpin, v, sizeof(sim_cpin));
 	} else if (!strncmp(l, "+CEREG:", 7)) {
 		creg_stat = cereg_stat_of(l + 7);
+	} else if (strnstr(l, "ME DETACH", strlen(l))) {
+		detach_seen = true;
 	}
 }
 
@@ -1430,6 +1439,17 @@ at_finish(const char *final, uint32_t rel)
 			if (!strncmp(line, "+CFUN:", 6) || !strncmp(line, "+EFUN:", 6)) {
 				val = (int)strtol(line + 6, NULL, 10);
 			}
+			if (radio_go && !strncmp(line, "+COPS:", 6)) {
+				const char *q1 = strchr(line, '"'), *q2 = q1 ? strchr(q1 + 1, '"') : NULL;
+
+				if (q2 && q2 - q1 - 1 < (long)sizeof(rp_op)) {
+					memcpy(rp_op, q1 + 1, (size_t)(q2 - q1 - 1));
+					rp_op[q2 - q1 - 1] = 0;
+					rp_rat = q2[1] == ',' ? (int)strtol(q2 + 2, NULL, 10) : -1;
+				}
+			} else if (radio_go && !strncmp(line, "+CSQ:", 5)) {
+				rp_csqv = (int)strtol(line + 5, NULL, 10);
+			}
 			at_safe(line, one, sizeof(one));
 			if (md_level >= 7) {
 				SAY("r1md: [%u ms] AT< %s: %s", rel, cmd, one);
@@ -1465,7 +1485,8 @@ at_finish(const char *final, uint32_t rel)
 				snprintf(at_res[at_idx], sizeof(at_res[at_idx]), "%d", val);
 			}
 			/* CFUN 1 = full functionality. EFUN: any nonzero value is taken as "on" (conservative: it ends the run) */
-			if ((cf && val == 1) || (!cf && val > 0)) {
+			/* in 2e-2 the radio is ours: +EFUN: 1 from the final query is NOT a reason to cut power before the off sequence ran */
+			if (((cf && val == 1) || (!cf && val > 0)) && !rd_active) {
 				at_radio_on = true;
 			}
 		} else if (md_level == 6) {
@@ -1496,6 +1517,9 @@ at_finish(const char *final, uint32_t rel)
 			SAY("r1md: [%u ms] the SIM wants a PIN/PUK: none is ever sent, stopping", rel);
 			at_stop = true;
 		}
+	}
+	if (md_level >= 7 && !strcmp(cmd, "AT+EFUN=1") && at_last_ok && !efun1_ok_ms) {
+		efun1_ok_ms = rel - at_sent_ms + 1;     /* +1: 0 means "no OK seen" */
 	}
 	if (md_level >= 7 && !strcmp(cmd, "AT+ESIMS") && sim_esims == 0) {
 		SAY("r1md: [%u ms] +ESIMS: 0, no SIM: stopping", rel);
@@ -1536,7 +1560,11 @@ at_line(const char *l, uint32_t rel)
 		}
 		return;
 	}
-	if (at_unsol++ < (md_level >= 7 ? 200u : 80u) && (!st2a.hs2 || rel - st2a.t_hs2 <= 60000)) {
+	if (md_level >= 7 && at_is_final(l) && late_logged++ < 20) {
+		SAY("r1md: [%u ms] late final for %s: %s (no command outstanding)", rel, at_lastcmd[0] ? at_lastcmd : "(none)", l);
+		return;
+	}
+	if (at_unsol++ < (rd_t_on ? 800u : (md_level >= 7 ? 200u : 80u)) && (!st2a.hs2 || rd_t_on || rel - st2a.t_hs2 <= 60000)) {
 		if (l[0] == '+') {
 			char pre[20];
 			uint32_t n = 0;
@@ -1605,11 +1633,13 @@ at_step(uint32_t rel)
 	}
 	cmd = at_idx < at_n ? at_seq[at_idx] : "";
 	if (at_wait) {
-		uint32_t to = !strcmp(cmd, "AT+EFUN=0") ? 15000u : (!strcmp(cmd, "AT+EFUN=1") ? 30000u : 5000u);
+		uint32_t to = !strcmp(cmd, "AT+EFUN=0") ? 15000u : (!strcmp(cmd, "AT+EFUN=1") ? 10000u : 5000u);
 
 		if (rel - at_sent_ms >= to) {
 			SAY("r1md: [%u ms] AT< %s: TIMEOUT (%u s without a final result)", rel, cmd, to / 1000);
 			at_last_ok = false;
+			at_to = true;
+			efun1_to |= !strcmp(cmd, "AT+EFUN=1");
 			if (md_level == 6) {
 				snprintf(at_res[at_idx], sizeof(at_res[at_idx]), "timeout");
 			}
@@ -1646,6 +1676,38 @@ static uint32_t oth_logged[256];
 static uint32_t rpc_ops[8], rpc_nops;
 static bool rpc_bad;     /* an RPC op other than the stock set (0x4005, 0x400e) was asked, or too many different ones */
 static uint32_t pktbuf[0x4100 / 4 + 4];
+
+/* after AT+EFUN=1 (rd_t_on set): drain 4/57/59/169/171 silently; 34 and 38 drained with a few header logs; anything else logged and counted */
+static uint32_t oth_new_seen[256];
+
+static void
+post_radio_rx(uint32_t ch, int q, uint32_t L, uint32_t seq, const uint32_t *pkt, uint32_t rel)
+{
+	const uint8_t *pb = (const uint8_t *)pkt;
+
+	if (ch == 4 || ch == 57 || ch == 59 || ch == 169 || ch == 171) {
+		n_quiet++;
+	} else if (ch == 34) {
+		if (n34++ < 8) {
+			SAY("r1md: [%u ms] ch34 #%u q%d len %u: src %#x dest %#x resv %#x sap %#x msg %#x mlen %u", rel, n34, q, L, L >= 20 ? pkt[4] : 0,
+			    L >= 24 ? pkt[5] : 0, pkt[3], L >= 28 ? pkt[6] : 0, L >= 32 ? pkt[7] : 0, L >= 44 ? (uint32_t)(pb[42] | pb[43] << 8) : 0);
+		}
+	} else if (ch == 38) {
+		if (n38++ < 3) {
+			SAY("r1md: [%u ms] ch38 #%u q%d len %u: payload %02x %02x %02x %02x %02x %02x %02x %02x", rel, n38, q, L, L >= 17 ? pb[16] : 0, L >= 18 ? pb[17] : 0,
+			    L >= 19 ? pb[18] : 0, L >= 20 ? pb[19] : 0, L >= 21 ? pb[20] : 0, L >= 22 ? pb[21] : 0, L >= 23 ? pb[22] : 0, L >= 24 ? pb[23] : 0);
+		}
+	} else {
+		oth_new++;
+		if (ch >= 256 || oth_new_seen[ch]++ == 0) {
+			oth_new_ch++;
+		}
+		if (ch >= 256 || oth_new_seen[ch] <= 3) {
+			SAY("r1md: [%u ms] NEW ch %u q%d len %u seq %u: %08x %08x %08x %08x | %08x %08x", rel, ch, q, L, seq, pkt[0], pkt[1], pkt[2], pkt[3],
+			    L >= 20 ? pkt[4] : 0, L >= 24 ? pkt[5] : 0);
+		}
+	}
+}
 
 /* returns false when the queue is empty or turned out garbage */
 static bool
@@ -1787,9 +1849,11 @@ drain_one(int q, uint32_t rel)
 			oth_ch[ch]++;
 		}
 		if (ch != 4 && ch != 34 && ch != 57 && ch != 59 && ch != 169 && ch != 171) {
-			st2a.oth_bad++;
+			st2a.oth_bad++;     /* gate 7 and the pre-radio-on stop rule only; after EFUN=1 the rules in post_radio_rx apply */
 		}
-		if (md_level >= 6 && ch < 256 && oth_logged[ch]++ < 3) {
+		if (rd_t_on) {
+			post_radio_rx(ch, q, L, seq, pkt, rel);
+		} else if (md_level >= 6 && ch < 256 && oth_logged[ch]++ < 3) {
 			SAY("r1md: [%u ms] other ch %u q%d len %u seq %u: data0 %#x resv %#x op/word0 %#x (payload not logged, not handled by the kernel code)", rel, ch, q, L,
 			    seq, data0, resv, L >= 20 ? pkt[4] : 0);
 		}
@@ -2077,8 +2141,8 @@ gates_eval(uint32_t sta0, uint32_t sta1, bool exc)
 		"unimplemented %u, bad requests %u, reads cut %u (largest asked %u), overlay cap hits %u, errors %u (%u outside the known three)", g.unimpl, g.bad_req,
 		g.cap_ops, g.max_req, g.cap_hits, g.errors, g.errors_other);
 	gate_out(3, "protected_reads", (!g.prot_short && !g.prot_mut) ? 0 : 1,
-		"calibration/IMEI/protect: %u reads (%llu B), %u short or failed, %u writes/deletes/renames/creates (%u rewrites of the same bytes)", g.prot_reads,
-		g.prot_bytes, g.prot_short, g.prot_mut, g.prot_same);
+		"CALIBRAT/IMEI %u reads %lluB, %u short, %u changed; other protected-drive writes %u (files: %s)", g.prot_reads,
+		g.prot_bytes, g.prot_short, g.prot_mut, g.oth_mut, g.oth_files[0] ? g.oth_files : "none");
 	gate_out(4, "overlay_checksum", (!g.crc_bad && !g.sweep_bad && !refused) ? 0 : 1,
 		"%u overlay reads checked, %u nodes swept, bad %u+%u, eMMC NV write refusals %llu", g.crc_checked, g.sweep_nodes, g.crc_bad, g.sweep_bad, refused);
 	for (uint32_t k = 0; k < rpc_nops && on + 8 < sizeof(ops); k++) {
@@ -2148,6 +2212,93 @@ radio_stop(const char *why)
 	}
 }
 
+/* the two RESULT 2e-2 lines (each under the ~160-char log cap); said once, as soon as the off sequence ends (or at the end of the run) */
+static bool result2_said;
+static int off_try = 0, off_ph = 0, efun_final = -2;
+static uint32_t off_tm;
+static const char *off_res = "none";
+static const char *const at_seqE0[] = { "AT+EFUN=0" };
+static const char *const at_seqEQ[] = { "AT+EFUN?" };
+
+static void
+result_2e2(uint32_t rel)
+{
+	if (result2_said) {
+		return;
+	}
+	result2_said = true;
+	SAY("r1md: RESULT 2e-2: %s; EFUN=1 OK %d ms; reg stat %d at %d ms, held %s; radio on %u ms; hold %s", rp_failed ? rp_why : "completed",
+	    efun1_ok_ms ? (int)efun1_ok_ms - 1 : -1, creg_stat, rp_reg_ms ? (int)rp_reg_ms : -1, held_ok ? "yes" : "NO", rd_t_on ? rel - rd_t_on : 0,
+	    rp >= RP_HOLD ? "reached" : "not reached");
+	SAY("r1md: RESULT 2e-2b: op %s RAT %d csq %d; EFUN=0 tries %d res %s detach %s final EFUN %d; ch34 %u ch38 %u new ch %u/%u pkts, quiet %u", rp_op, rp_rat,
+	    rp_csqv, off_try, off_res, detach_seen ? "seen" : "no", efun_final, n34, n38, oth_new_ch, oth_new, n_quiet);
+}
+
+/* the off sequence: one command at a time (at_step is the only sender and sends nothing while at_wait), EFUN=0 up to 3 x 15 s 1 s apart,
+ * then AT+EFUN? to confirm; the caller powers MD1 down in every case */
+static void
+off_drive(uint32_t rel)
+{
+	if (at_wait) {
+		return;         /* the command in flight (EFUN=1 included) gets its result, or its timeout, first */
+	}
+	if (efun1_to) {         /* EFUN=1 never answered: the AT engine is not listening, EFUN=0 would not be heard either */
+		SAY("r1md: radio: AT+EFUN=1 timed out: EFUN=0 skipped, MD1 powered down");
+		off_res = "skipped";
+		rp = RP_END;
+		rd_active = false;
+		result_2e2(rel);
+		return;
+	}
+	switch (off_ph) {
+	case 0:
+		radio_load(at_seqE0, 1);        /* replaces any script not yet sent (at_wait is false here); EFUN=1 is never sent after a stop */
+		off_try++;
+		off_ph = 1;
+		break;
+	case 1:
+		if (!at_done) {
+			return;
+		}
+		off_tm = rel;
+		if (at_last_ok) {
+			off_res = "OK";
+			off_ph = 2;
+		} else if (at_to) {
+			off_res = "timeout";
+			off_ph = 4;
+		} else {
+			off_res = "error";
+			off_ph = off_try < 3 ? 3 : 4;
+		}
+		break;
+	case 2:         /* OK: 2 s of URCs (+CGEV: ME DETACH, +CEREG: 0) */
+		if (rel - off_tm >= 2000) {
+			off_ph = 4;
+		}
+		break;
+	case 3:         /* error: 1 s, then the next try */
+		if (rel - off_tm >= 1000) {
+			off_ph = 0;
+		}
+		break;
+	case 4:
+		radio_load(at_seqEQ, 1);
+		off_ph = 5;
+		break;
+	case 5:
+		if (!at_done) {
+			return;
+		}
+		efun_final = at_radio_val[1];
+		SAY("r1md: radio: off sequence done: EFUN=0 %d tries (%s), AT+EFUN? -> %d%s", off_try, off_res, efun_final, efun_final == 0 ? " (confirmed off)" : " (NOT confirmed)");
+		rp = RP_END;
+		rd_active = false;
+		result_2e2(rel);
+		break;
+	}
+}
+
 /* called every poll while rd_active */
 static void
 radio_drive(uint32_t rel)
@@ -2159,11 +2310,17 @@ radio_drive(uint32_t rel)
 	if (rp < RP_OFF) {
 		if (rd_t_on && rel - rd_t_on >= 240000) {
 			radio_stop("hard cap of 4 minutes");
+		} else if (efun1_to) {
+			radio_stop("EFUN=1 timeout");
 		} else if (creg_stat == 3) {
 			radio_stop("registration denied");
-		} else if (st2a.unanswered || rpc_bad || st2a.oth_bad || st2a.sys_late || st2a.ctl_odd) {
+		} else if (st2a.unanswered || rpc_bad || st2a.sys_late || st2a.ctl_odd || (rd_t_on ? (oth_new_ch > 3 || oth_new > 50) : st2a.oth_bad != 0)) {
 			radio_stop("unexpected traffic");
 		}
+	}
+	if (rp == RP_OFF) {
+		off_drive(rel);
+		return;
 	}
 	if (rp_new) {
 		rp_new = false;
@@ -2171,14 +2328,14 @@ radio_drive(uint32_t rel)
 			radio_load(at_seqA, 5);
 		} else if (rp == RP_POST) {
 			radio_load(at_seqP, 4);
-		} else if (rp == RP_OFF) {
-			at_wait = false;
-radio_load(at_seqO, 2);
 		}
 		return;
 	}
 	if (!at_done || at_wait) {
 		return;
+	}
+	if (rp >= RP_POST && rp < RP_OFF && creg_stat != 1 && creg_stat != 5) {
+		held_ok = false;
 	}
 	switch (rp) {
 	case RP_PRE:
@@ -2213,14 +2370,11 @@ radio_load(at_seqO, 2);
 		if (rel - rp_t >= 60000) {
 			rp = RP_OFF;
 			rp_new = true;
+			SAY("r1md: radio: hold of 60 s done: off sequence");
 		} else if (rel - rp_csq >= 10000) {
 			rp_csq = rel;
 			radio_load(at_seqS, 1);
 		}
-		break;
-	case RP_OFF:
-		rp = RP_END;
-		rd_active = false;
 		break;
 	}
 }
@@ -2335,7 +2489,7 @@ wait_hs1(void)
 						}
 						/* 2e-1: the last response + 3 s, 120 s after HS2. 2e-2: until EFUN=0 is confirmed; the cap below is the kernel's own
 						 * timer: 15 s past the 4 minutes, MD1 goes down whatever the state machine is doing */
-						if (at_radio_on || (rd_active && rd_t_on && elapsed - t_send - rd_t_on >= 255000) || (rd_active && md_ms() >= 400000) ||
+						if (at_radio_on || (rd_active && rd_t_on && elapsed - t_send - rd_t_on >= 255000) || (rd_active && md_ms() >= 400000) || (radio_go && rp == RP_END) ||
 							(!rd_active && ((st2a.hs2 && (elapsed - t_send - st2a.t_hs2 >= 120000 || (at_done && gates_done && elapsed - t_send - at_last_ms >= 3000))) ||
 							(!st2a.hs2 && elapsed - t_send >= 30000) || md_ms() >= 150000))) {
 							break;
@@ -2413,9 +2567,9 @@ for (int c = 0; c < 256 && cn < 100; c++) {
 			}
 			result_2e1(exc);
 			if (radio_go) {
-				SAY("r1md: RESULT 2e-2: %s; CEREG stat %d, registered after %u ms, at the end EFUN %d CFUN %d, radio on %u ms", rp_failed ? rp_why : "completed",
-				    creg_stat, rp_reg_ms, at_radio_val[1], at_radio_val[0], rd_t_on ? (elapsed - t_send - rd_t_on) : 0);
+				result_2e2(elapsed - t_send);
 			}
+
 		} else if (md_level >= 6) {
 			for (int c = 0; c < AT_NCMD && an < 120; c++) {
 				if (at_res[c][0]) {

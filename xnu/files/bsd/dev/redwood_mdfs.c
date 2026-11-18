@@ -692,8 +692,9 @@ static struct {
 } S;
 /* r1_md=7 gates 2-4 (the same struct is in redwood_md.c) */
 struct mdfs_gate_info {
-	uint32_t unimpl, bad_req, cap_ops, cap_hits, errors, errors_other, prot_reads, prot_short, prot_mut, crc_checked, crc_bad, sweep_nodes, sweep_bad, prot_same, max_req;
+	uint32_t unimpl, bad_req, cap_ops, cap_hits, errors, errors_other, prot_reads, prot_short, prot_mut, crc_checked, crc_bad, sweep_nodes, sweep_bad, prot_same, max_req, oth_mut;
 	uint64_t prot_bytes;
+	char oth_files[96];
 };
 static struct mdfs_gate_info G;
 static uint32_t opened_hash[1024];
@@ -783,7 +784,14 @@ promote(struct fh *f)
 static bool
 prot_path(const char *p)
 {
-	return p[0] == 'X' || p[0] == 'Y' || strnstr(p, "/CALIBRAT", 96) || strnstr(p, "/NVD_IMEI", 96);
+	return strnstr(p, "/CALIBRAT", 96) || strnstr(p, "/NVD_IMEI", 96);
+}
+
+/* the modem's own files on the protect drives (X:, Y:, e.g. NA77_005): changes are counted and named, they do not fail gate 3 */
+static bool
+xy_path(const char *p)
+{
+	return (p[0] == 'X' || p[0] == 'Y') && !prot_path(p);
 }
 
 /* a read on such a path: short only counts when it is not the end of the file (the request length is the modem's, cut or not) */
@@ -1444,8 +1452,21 @@ logit:
 				G.errors_other++;
 			}
 		}
-		if (prot_path(path_log) && (op == 0x1004 || op == 0x1007 || op == 0x1008 || op == 0x100b || op == 0x100c || op == 0x100f ||
-		    S.creates != creates0 || ((op == 0x1001 || op == 0x1011 || op == 0x1022) && (flags & 0x20000)))) {
+		bool mut_op = op == 0x1004 || op == 0x1007 || op == 0x1008 || op == 0x100b || op == 0x100c || op == 0x100f ||
+		    S.creates != creates0 || ((op == 0x1001 || op == 0x1011 || op == 0x1022) && (flags & 0x20000));
+
+		if (mut_op && xy_path(path_log)) {
+			const char *b = strrchr(path_log, '/');
+
+			b = b ? b + 1 : path_log;
+			G.oth_mut++;
+			if (!strnstr(G.oth_files, b, sizeof(G.oth_files))) {
+				size_t l = strlen(G.oth_files);
+
+				snprintf(G.oth_files + l, sizeof(G.oth_files) - l, "%s%.12s", l ? " " : "", b);
+			}
+		}
+		if (mut_op && prot_path(path_log)) {
 			G.prot_mut++;
 			G.prot_same += op == 0x1004 && wr_same;
 			SAY("r1md: fs CHANGE ON A PROTECTED PATH: op %#x \"%s\" at %u len %u, %u bytes differ from what was there%s", op, path_log, wr_pos, wr_len, wr_diff, op == 0x1004 && wr_same ? " (the bytes are the ones already there)" : "");
