@@ -263,6 +263,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
 		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
+		$DYN -o obj/cell_test src/cell_test.c   # (Stage 3b: pdp_ip0 test, started by rc.jobs with ifarg r1_md_if=1)
 		$DYN -fobjc-arc -framework Foundation -framework CoreGraphics -framework ImageIO -o obj/fbgrab src/fbgrab.m
 		# (with an entitlement for "battery_test open URL", if ldid is there: src/battery_test.c)
 		$DYN -framework CoreFoundation -framework IOKit -lsqlite3 -o obj/battery_test src/battery_test.c &&
@@ -358,6 +359,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/font_test ] && cp obj/font_test root/bin/
 	[ -f obj/metal_test ] && cp obj/metal_test root/bin/
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
+	[ -f obj/cell_test ] && cp obj/cell_test root/bin/
 	[ -f obj/logto ] && cp obj/logto root/bin/
 	[ -f obj/fbgrab ] && cp obj/fbgrab root/bin/
 	[ -f obj/battery_test ] && cp obj/battery_test root/bin/

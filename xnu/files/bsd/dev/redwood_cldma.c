@@ -9,6 +9,7 @@
  *    cell_rx() in redwood_md.c, caps 20 packets / 4096 bytes sent, 200 packets received. Polled, no interrupts.
  */
 #include <kern/kalloc.h>
+#include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <vm/vm_kern.h>
@@ -35,8 +36,9 @@ extern void redwood_md_say(bool must, const char *format, ...) __printflike(2, 3
 #define MAX_LOG         10u
 /* Stage 3a TX (docs/cellular-stage3.md C.2; ccci_hif_cldma.c cldma_gpd_handle_tx_request, cldma_reg.h) */
 #define TX_N            32              /* tgpds in the ring; only TX_MAX_PKTS are ever used, so no slot is reused */
-#define TX_BUF          512u            /* bytes per slot (the one kernel-built query is 57) */
-#define TX_MAX_PKTS     20u
+#define TX_BUF          1536u           /* bytes per slot (Stage 3b: a packet up to the 1430 MTU; 3a's one query is 57) */
+#define TX_MAX_LEN      1500u
+#define TX_MAX_PKTS     20u             /* defaults (Stage 3a); Stage 3b raises them through cldma_if_enable() */
 #define TX_MAX_BYTES    4096u
 #define RX_MAX_DATA     200u
 #define TX_STUCK_MS     2000u           /* HWO still set this long after the start command: stop rule */
@@ -44,6 +46,10 @@ extern void redwood_md_say(bool must, const char *format, ...) __printflike(2, 3
 extern void cell_rx(const uint8_t *b, uint32_t len, uint32_t ms);
 
 static vm_offset_t ao, pd, infra_b;
+/* Stage 3b: the TX ring is used by the ifnet's output (any thread) and reclaimed by the poll (md thread): cl_lock covers tx_* below, held briefly (log lines are said under it: the log has its own lock and never calls back);
+ * not taken in teardown (which may run with the other CPUs stopped). */
+static LCK_GRP_DECLARE(cl_grp, "redwood-cldma");
+static LCK_MTX_DECLARE(cl_lock, &cl_grp);
 
 static inline uint32_t
 rd(vm_offset_t b, uint32_t o)
@@ -135,7 +141,9 @@ struct tgpd {
 
 static bool tx_on;                      /* cldma_data_enable() was called: TX ring, hook, 200-packet cap */
 static uint32_t rx_cap = MAX_RX;
-static uint32_t tx_n, tx_done, tx_bytes, tx_started, tx_t0[TX_N], tx_l2_logged, dma_err0;
+/* TX ring accounting: tx_prod packets queued in all, tx_done reclaimed (the hardware cleared HWO); slot = index % TX_N; in flight = tx_prod - tx_done */
+static uint32_t tx_prod, tx_done, tx_bytes, tx_started, tx_t0[TX_N], tx_l2_logged, dma_err0;
+static uint32_t tx_cap_pkts = TX_MAX_PKTS, tx_cap_bytes = TX_MAX_BYTES, tx_full, tx_logged, tx_done_logged, tx_ref_logged;
 static volatile bool cl_started;
 static uint32_t cl_cur, cl_rx, cl_resume, cl_err, cl_logged, cl_l2_last;
 static uint64_t cl_bytes;
@@ -159,10 +167,19 @@ cldma_data_enable(void)
 	rx_cap = RX_MAX_DATA - 1;       /* the 200th packet trips the rule */
 }
 
+/* Stage 3b (r1_md_if=1): the ifnet sends interactively. Backstops a little above the caps redwood_cell.c enforces (those are what end the run cleanly). */
+void
+cldma_if_enable(uint32_t pkts_cap, uint32_t bytes_cap)
+{
+	tx_cap_pkts = pkts_cap + 50;
+	tx_cap_bytes = bytes_cap + 20000;
+	rx_cap = pkts_cap + 150;
+}
+
 uint32_t
 cldma_tx_pkts(void)
 {
-	return tx_n;
+	return tx_prod;
 }
 
 uint32_t
@@ -200,7 +217,8 @@ cldma_rx_start(uint32_t ms)
 {
 	vm_offset_t va = 0;
 	uint64_t rxsize = (uint64_t)PAGE_SIZE * 3 + (uint64_t)RING_N * BUF_BYTES;
-	uint64_t size = rxsize + (tx_on ? (uint64_t)PAGE_SIZE * 3 : 0);     /* + TX ring page, TX buffer page, TX canary page */
+	uint64_t tbytes = ((uint64_t)TX_N * TX_BUF + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
+	uint64_t size = rxsize + (tx_on ? (uint64_t)PAGE_SIZE * 2 + tbytes : 0);     /* + TX ring page, the TX buffers (whole pages), TX canary page */
 	uint32_t maxpn = (uint32_t)((0x100000000ULL >> PAGE_SHIFT) - 1);
 
 	if (!ao || !pd || (rd(infra_b, CG2_STA) & (1u << 3))) {
@@ -243,15 +261,10 @@ cldma_rx_start(uint32_t ms)
 	if (tx_on) {
 		cl.tg = (struct tgpd *)(cl.va + rxsize);
 		cl.tbufs = (uint8_t *)(cl.va + rxsize + PAGE_SIZE);
-		cl.thi = (uint32_t *)(cl.va + rxsize + 2 * (uint64_t)PAGE_SIZE);
+		cl.thi = (uint32_t *)(cl.va + rxsize + PAGE_SIZE + tbytes);
 		cl.tg_pa = cl.pa + rxsize;
 		cl.tbufs_pa = cl.tg_pa + PAGE_SIZE;
-		cl.thi_pa = cl.tg_pa + 2 * (uint64_t)PAGE_SIZE;
-		_Static_assert(TX_N * TX_BUF <= 16384, "TX buffers must fit the one page");
-		if (TX_N * TX_BUF > PAGE_SIZE) {
-			redwood_md_say(true, "r1md: cldma: NOT started (page too small for the TX buffers)");
-			return false;
-		}
+		cl.thi_pa = cl.tbufs_pa + tbytes;
 		for (uint32_t i = 0; i < PAGE_SIZE / 4; i++) {
 			cl.thi[i] = CANARY;
 		}
@@ -328,6 +341,25 @@ canary_ok(bool full)
 	return true;
 }
 
+/* cl_lock held: a tgpd whose HWO the hardware cleared is done; its slot is free again (len 0) */
+static void
+tx_reclaim(uint32_t ms)
+{
+	while (tx_done < tx_prod) {
+		struct tgpd *t = &cl.tg[tx_done % TX_N];
+
+		if (((volatile struct tgpd *)t)->flags & 1) {
+			break;
+		}
+		__asm__ volatile ("dsb ld" ::: "memory");
+		if (tx_done_logged++ < 8) {
+			redwood_md_say(true, "r1md: [%u ms] cldma tx #%u done (HWO clear) %u ms after the start", ms, tx_done + 1, ms - tx_t0[tx_done % TX_N]);
+		}
+		t->len = 0;
+		tx_done++;
+	}
+}
+
 /* each poll pass, after drain_rings. Returns true when a stop rule fired (the caller takes the off path). */
 bool
 cldma_rx_poll(uint32_t ms)
@@ -377,16 +409,21 @@ cldma_rx_poll(uint32_t ms)
 	if ((l2 & 4) || l3a || l3b) {
 		cl_err |= (l2 & 4) | (l3a ? 0x100 : 0) | (l3b ? 0x200 : 0);
 	}
-	if (tx_on && tx_n) {
-		uint32_t l2t = rd(pd, 0x800), ule = rd(pd, 0x3c), de = rd(pd, 0x870);
+	if (tx_on && tx_prod) {
+		uint32_t l2t, ule, de;
 
-		/* reclaim: a tgpd whose HWO the hardware cleared is done (its buffer is never reused anyway) */
-		while (tx_done < tx_n && !(((volatile struct tgpd *)&cl.tg[tx_done])->flags & 1)) {
-			redwood_md_say(true, "r1md: [%u ms] cldma tx #%u done (HWO clear) %u ms after the start", ms, tx_done + 1, ms - tx_t0[tx_done]);
-			tx_done++;
-		}
-		if (tx_done < tx_n && ms - tx_t0[tx_done] > TX_STUCK_MS) {
-			cl_err |= 0x1000;
+		lck_mtx_lock(&cl_lock);
+		l2t = rd(pd, 0x800);
+		ule = rd(pd, 0x3c);
+		de = rd(pd, 0x870);
+		tx_reclaim(ms);
+		if (tx_done < tx_prod) {
+			if (ms - tx_t0[tx_done % TX_N] > TX_STUCK_MS) {
+				cl_err |= 0x1000;
+			}
+			if (!(rd(pd, 0x28) & 1)) {
+				wr(pd, 0x34, 1);        /* UL_RESUME_CMD: idle with a slot still owned by the hardware = the queue went idle just before HWO was set */
+			}
 		}
 		if (l2t || ule) {
 			if (tx_l2_logged++ < 6) {
@@ -402,6 +439,7 @@ cldma_rx_poll(uint32_t ms)
 		if (de != dma_err0) {
 			cl_err |= 0x4000;
 		}
+		lck_mtx_unlock(&cl_lock);
 	}
 	if (!canary_ok(false)) {
 		cl_err |= 0x400;
@@ -426,18 +464,27 @@ cldma_tx(const uint8_t *ip, uint32_t len, uint32_t ms)
 {
 	struct tgpd *t;
 	uint8_t *buf;
+	uint32_t slot;
 
 	if (!tx_on || !cl_started || !cl.tg || cl_err) {
 		return false;
 	}
-	if (len < 20 || len > TX_BUF || tx_n >= TX_MAX_PKTS || tx_bytes + len > TX_MAX_BYTES) {
-		redwood_md_say(true, "r1md: cldma tx REFUSED: len %u, %u pkts %u B sent so far (caps %u pkts %u B)", len, tx_n, tx_bytes, TX_MAX_PKTS, TX_MAX_BYTES);
+	lck_mtx_lock(&cl_lock);
+	tx_reclaim(ms);
+	if (len < 20 || len > TX_MAX_LEN || tx_prod >= tx_cap_pkts || tx_bytes + len > tx_cap_bytes || tx_prod - tx_done >= TX_N - 1) {
+		if (tx_ref_logged++ < 6) {
+			redwood_md_say(true, "r1md: cldma tx REFUSED: len %u, %u pkts %u B sent so far (caps %u pkts %u B), %u in flight", len, tx_prod, tx_bytes, tx_cap_pkts, tx_cap_bytes, tx_prod - tx_done);
+		}
+		tx_full += tx_prod - tx_done >= TX_N - 1;
+		lck_mtx_unlock(&cl_lock);
 		return false;
 	}
-	t = &cl.tg[tx_n];
-	buf = cl.tbufs + (uint64_t)tx_n * TX_BUF;
+	slot = tx_prod % TX_N;
+	t = &cl.tg[slot];
+	buf = cl.tbufs + (uint64_t)slot * TX_BUF;
 	if ((((volatile struct tgpd *)t)->flags & 1) || ((volatile struct tgpd *)t)->len != 0) {
-		redwood_md_say(true, "r1md: cldma tx REFUSED: slot %u not free", tx_n);
+		redwood_md_say(true, "r1md: cldma tx REFUSED: slot %u not free", slot);
+		lck_mtx_unlock(&cl_lock);
 		return false;
 	}
 	memcpy(buf, ip, len);
@@ -446,10 +493,10 @@ cldma_tx(const uint8_t *ip, uint32_t len, uint32_t ms)
 	t->netif = 0;
 	t->non_used = 1;
 	__asm__ volatile ("dsb sy" ::: "memory");
-	t->flags = 0x81;                /* IOC | HWO: the hardware owns the slot from here */
+	t->flags = 0x81;                /* IOC | HWO: the hardware owns the slot from here until the reclaim */
 	__asm__ volatile ("dsb sy" ::: "memory");
-	tx_t0[tx_n] = ms;
-	tx_n++;
+	tx_t0[slot] = ms;
+	tx_prod++;
 	tx_bytes += len;
 	if (!tx_started) {
 		wr(pd, 0x30, 1);        /* UL_START_CMD, queue 0 only (the reference writes all four; only q0 has a ring here) */
@@ -459,7 +506,10 @@ cldma_tx(const uint8_t *ip, uint32_t len, uint32_t ms)
 		wr(pd, 0x34, 1);        /* UL_RESUME_CMD: the queue went idle on an empty tgpd */
 		(void)rd(pd, 0x34);
 	}
-	redwood_md_say(true, "r1md: [%u ms] cldma tx #%u len %u netif 0 queued (HWO set), UL_STATUS %#x CUR %#x", ms, tx_n, len, rd(pd, 0x28), rd(pd, 0x14));
+	if (tx_logged++ < 8) {
+		redwood_md_say(true, "r1md: [%u ms] cldma tx #%u len %u netif 0 queued (HWO set), UL_STATUS %#x CUR %#x", ms, tx_prod, len, rd(pd, 0x28), rd(pd, 0x14));
+	}
+	lck_mtx_unlock(&cl_lock);
 	return true;
 }
 
@@ -473,7 +523,7 @@ cldma_report(const char *tag, uint32_t ms)
 	redwood_md_say(true, "r1md: [%u ms] cldma counters (%s): rx %u pkts %llu B, resumes %u, cur %u, err %#x, L2RISAR %#x, STATUS %#x, started %d", ms, tag, cl_rx, cl_bytes, cl_resume, cl_cur,
 	    cl_err, cl_l2_last, cl_started ? rd(ao, 0x414) : 0, cl_started);
 	if (tx_on) {
-		redwood_md_say(true, "r1md: [%u ms] cldma tx (%s): %u pkts %u B queued, %u completed (HWO cleared), UL_STATUS %#x", ms, tag, tx_n, tx_bytes, tx_done, cl_started ? rd(pd, 0x28) : 0);
+		redwood_md_say(true, "r1md: [%u ms] cldma tx (%s): %u pkts %u B queued, %u completed (HWO cleared), UL_STATUS %#x", ms, tag, tx_prod, tx_bytes, tx_done, cl_started ? rd(pd, 0x28) : 0);
 	}
 }
 
@@ -490,7 +540,7 @@ cldma_teardown(void)
 		for (int i = 0; i < 100 && (rd(pd, 0x28) & 1); i++) {
 			delay(100);
 		}
-		redwood_md_say(true, "r1md: cldma: tx stopped: %u queued %u completed, UL_STATUS %#x", tx_n, tx_done, rd(pd, 0x28));
+		redwood_md_say(true, "r1md: cldma: tx stopped: %u queued %u completed, %u refused (ring full), UL_STATUS %#x", tx_prod, tx_done, tx_full, rd(pd, 0x28));
 	}
 	wr(pd, 0x40c, 1);               /* SO_STOP_CMD */
 	for (int i = 0; i < 100 && (rd(ao, 0x414) & 1); i++) {

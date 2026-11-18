@@ -118,6 +118,16 @@ extern bool cldma_tx(const uint8_t *ip, uint32_t len, uint32_t ms);
 extern uint32_t cldma_tx_pkts(void);
 extern uint32_t cldma_tx_bytes(void);
 extern uint32_t cldma_tx_completed(void);
+/* Stage 3b (r1_md_if=1 only): redwood_cell.c, the pdp_ip0 interface */
+extern void cldma_if_enable(uint32_t pkts_cap, uint32_t bytes_cap);
+extern bool cell_if_attach(const uint8_t ip[4], const uint8_t peer[4], const uint8_t dns[4], uint32_t mtu, uint32_t pkts, uint32_t kb, char *why, size_t whylen);
+extern void cell_if_input(const uint8_t *ip, uint32_t len);
+extern bool cell_if_tick(uint32_t rel);
+extern bool cell_if_active(void);
+extern bool cell_if_done(void);
+extern bool cell_if_exists(void);
+extern void cell_if_stats(uint32_t *txp, uint32_t *txb, uint32_t *rxp, uint32_t *rxb, uint32_t *drops, bool *caphit);
+extern void cell_if_stop(const char *why);
 
 /* SPM */
 #define SPM_PWR_STATUS          0x180
@@ -220,6 +230,10 @@ static uint32_t md_level;       /* the r1_md value: 3 = stage 1 + 2a */
 static uint64_t md_t0;
 static uint32_t rd_t_on;        /* ms (run-relative) at which AT+EFUN=1 was sent; 0 = never */
 static bool data_on, eif_on;    /* Stage 3a, see the comment at cldma_on */
+/* Stage 3b: if_on = r1_md_if=1 (or the r1_md=9 shorthand) together with data_on. if_pkts / if_kb: per-direction traffic caps (boot-args r1_md_if_pkts, r1_md_if_kb) */
+static bool if_on, if_ok;       /* if_ok: pdp_ip0 was attached and configured */
+static uint32_t if_pkts = 300, if_kb = 150, if_hold_ms = 20000, if_t0;
+static char if_why[48] = "";
 
 static inline uint32_t
 rd(vm_offset_t base, uint32_t at)
@@ -1311,7 +1325,7 @@ static bool cldma_on, cl_fatal;     /* cldma_on: boot-arg r1_md_cldma=1 (redwood
 /* Stage 3a: data_on = r1_md_data=1 together with radio_req and cldma_on (set in redwood_md_init); nothing below runs without it. eif_on: optional
  * r1_md_eif=1 (GUESS): also send AT+EPDN=0,"addr" if no IPv4 address was found by then. (EPDN ifst 20 / EIF ifst up are stock-literal, ccci_dump.txt, and always sent.) */
 static bool d_cgev, d_have_ip, d_fin;
-enum { DP_START, DP_ACT, DP_EPDN, DP_EIF, DP_PA, DP_RD, DP_EPA, DP_WAIT };
+enum { DP_START, DP_ACT, DP_EPDN, DP_EIF, DP_PA, DP_RD, DP_EPA, DP_WAIT, DP_IF };
 static int dp = DP_START;
 static const char *d_src = "-";                 /* where d_ip came from (RESULT 3a) */
 static bool d_v6seen, d_hexok;                  /* an IPv6-looking token was seen; d_hex = 8-hex-digit token (fallback, GUESS: only used if no dotted IPv4 turns up) */
@@ -1968,6 +1982,14 @@ at_line(const char *l, uint32_t rel)
 	if (at_wait) {
 		if (!strcmp(l, at_seq[at_idx])) {
 			return;         /* the echo */
+		}
+		if (data_on && !strncmp(l, "+EPDN:", 6) && !strcmp(at_seq[at_idx], at_epdn_cmd) && at_rlen + strlen(l) + 1 < sizeof(at_resp)) {
+			/* md3c2: AT+EPDN=0,"ifst",20 answered with this line and never a final result (5 s lost): the line completes the command (a late OK is logged as such) */
+			memcpy(at_resp + at_rlen, l, strlen(l));
+			at_rlen += (uint32_t)strlen(l);
+			at_resp[at_rlen++] = '\n';
+			at_finish("OK", rel);
+			return;
 		}
 		if (at_is_final(l)) {
 			at_finish(l, rel);
@@ -3079,6 +3101,10 @@ cell_rx(const uint8_t *b, uint32_t len, uint32_t ms)
 			SAY("r1cell: rx #%u len %u netif %u version %u first byte %02x", d_rxp, il, b[3] & 0x1f, ip[0] >> 4, ip[0]);
 		}
 	}
+	if (if_ok) {
+		cell_if_input(ip, il);          /* Stage 3b: the stack gets it (or the cap / v6 rules drop it) */
+		return;
+	}
 	if (d_tries == 0 || d_reply || from > 1 || il < 20 + 8 + 12) {
 		return;
 	}
@@ -3127,6 +3153,20 @@ cell_rx(const uint8_t *b, uint32_t len, uint32_t ms)
 	    ms - d_sendms[from]);
 }
 
+/* Stage 3b: the kernel's result line */
+static void
+result_3b(void)
+{
+	uint32_t txp = 0, txb = 0, rxp = 0, rxb = 0, dr = 0;
+	bool hit = false;
+
+	if (cell_if_exists()) {
+		cell_if_stats(&txp, &txb, &rxp, &rxb, &dr, &hit);
+	}
+	SAYM("r1md: RESULT 3b: if pdp_ip0 %s%s; addr-src %s; tx %u/%u rx %u/%u drops %u; caps %s", if_ok ? "attached" : "failed: ", if_ok ? "" : (if_why[0] ? if_why : (d_fin ? "not reached" : "data phase not reached")),
+	    d_have_ip ? d_src : "none", txp, txb, rxp, rxb, dr, hit ? "hit" : "ok");
+}
+
 /* the must-line, at the time and again at the end (from result_2e2) */
 static void
 result_3a(uint32_t rel)
@@ -3148,6 +3188,9 @@ result_3a(uint32_t rel)
 	} else {
 		snprintf(res, sizeof(res), "not sent: %s", rp_failed ? rp_why : "data phase not reached");
 	}
+	if (if_on) {
+		result_3b();
+	}
 	SAYM("r1md: RESULT 3a: addr-src %s; bearer %s ip %s dns %u.%u.%u.%u %u.%u.%u.%u; tx %u pkts %u bytes, rx %u pkts %u bytes; dns %s", d_have_ip ? d_src : "none", apn[0] ? apn : "-", d_have_ip ? ip : "-",
 	    d_dns[0][0], d_dns[0][1], d_dns[0][2], d_dns[0][3], d_dns[1][0], d_dns[1][1], d_dns[1][2], d_dns[1][3], cldma_tx_pkts(), cldma_tx_bytes(), d_rxp, d_rxb, res);
 }
@@ -3157,7 +3200,7 @@ static void
 data_finish(uint32_t rel, const char *why)
 {
 	d_fin = true;
-	SAYM("r1cell: [%u ms] data phase done (%s): hold 20 s", rel, why);
+	SAYM("r1cell: [%u ms] data phase done (%s): hold %u s", rel, why, if_hold_ms / 1000);
 	result_3a(rel);
 	held_started = true;
 	rp_t = rel;
@@ -3178,12 +3221,32 @@ data_fail(uint32_t rel, const char *why)
 	rp_new = true;
 }
 
+/* Stage 3b: the bearer has an address and a DNS server: pdp_ip0 up (address /32, peer = the first DNS server, default route, kern.redwood.cell_dns) */
+static bool
+if_start(uint32_t rel)
+{
+	uint8_t peer[4];
+
+	memcpy(peer, d_dns[0], 4);
+	if (!memcmp(peer, d_ip, 4)) {
+		memcpy(peer, d_ip, 4);
+		peer[3] ^= 1;
+	}
+	if_t0 = rel;
+	if_ok = cell_if_attach(d_ip, peer, d_dns[0], d_mtu > 0 ? (uint32_t)d_mtu : 1430, if_pkts, if_kb, if_why, sizeof(if_why));
+	if (!if_ok && !if_why[0]) {
+		strlcpy(if_why, "unknown", sizeof(if_why));
+	}
+	SAYM("r1cell: [%u ms] pdp_ip0: %s%s%s", rel, if_ok ? "attached and up" : "FAILED: ", if_ok ? "" : if_why, if_ok ? "" : " (off sequence)");
+	return if_ok;
+}
+
 /* called from radio_drive in state RP_DATA when no AT command is in flight */
 static void
 data_drive(uint32_t rel)
 {
-	if (rel - dp_t0 >= 30000) {
-		data_finish(rel, "30 s deadline");
+	if (rel - dp_t0 >= (if_on ? 75000u : 30000u) || (if_on && rd_t_on && rel - rd_t_on >= 150000)) {
+		data_finish(rel, if_on ? "75 s deadline" : "30 s deadline");
 		return;
 	}
 	switch (dp) {
@@ -3250,12 +3313,25 @@ data_drive(uint32_t rel)
 			data_fail(rel, d_v6seen ? "bearer is IPv6-only (no IPv4 address in any response; IPv6 not attempted)" : "no IPv4 address from any source");
 		} else if (!d_ndns) {
 			data_fail(rel, "no DNS server");
+		} else if (if_on) {
+			if (!if_start(rel)) {
+				data_fail(rel, if_why);
+			} else {
+				dp = DP_IF;
+				dp_t = rel;
+			}
 		} else if (!dns_send(0, rel)) {
 			data_fail(rel, "tx refused");
 		} else {
 			d_cur = 0;
 			dp_t = rel;
 			dp = DP_WAIT;
+		}
+		break;
+	case DP_IF:
+		/* pdp_ip0 is up: only the test tool talks (cell_test); the tick in radio_drive watches the caps and the 10 s counters */
+		if (cell_if_done()) {
+			data_finish(rel, "cell_test finished");
 		}
 		break;
 	case DP_WAIT:
@@ -3286,6 +3362,14 @@ radio_drive(uint32_t rel)
 	if (!radio_go) {
 		rd_active = false;
 		return;
+	}
+	if (if_on) {
+		if (rp >= RP_OFF) {
+			cell_if_stop("off sequence");   /* before the off sequence: down, routes and address removed (idempotent) */
+		} else if (cell_if_tick(rel) && rp < RP_OFF) {
+			cell_if_stop("traffic cap hit");
+			radio_stop("traffic cap hit");
+		}
 	}
 	if (rd_t_on) {
 		static bool a_reg, a_s3, a_60, snp[3];
@@ -3393,7 +3477,11 @@ radio_drive(uint32_t rel)
 			dp = DP_START;
 			dp_t0 = rel;
 			md_budget += 6000;
-			SAYM("r1cell: [%u ms] registered: Stage 3a data phase begins (deadline 30 s, then hold 20 s)", rel);
+			if (if_on) {
+				SAYM("r1cell: [%u ms] registered: Stage 3b data phase begins (pdp_ip0 after the bearer address; deadline 75 s or the tool's end, then hold 5 s)", rel);
+			} else {
+				SAYM("r1cell: [%u ms] registered: Stage 3a data phase begins (deadline 30 s, then hold 20 s)", rel);
+			}
 			break;
 		}
 		rp = RP_HOLD;
@@ -3404,10 +3492,10 @@ radio_drive(uint32_t rel)
 		data_drive(rel);
 		break;
 	case RP_HOLD:
-		if (rel - rp_t >= (data_on ? 20000u : 60000u)) {
+		if (rel - rp_t >= (data_on ? if_hold_ms : 60000u)) {
 			rp = RP_OFF;
 			rp_new = true;
-			SAYM("r1md: radio: hold of %u s done: off sequence", data_on ? 20u : 60u);
+			SAYM("r1md: radio: hold of %u s done: off sequence", data_on ? if_hold_ms / 1000 : 60u);
 		} else if (rel - rp_csq >= 10000) {
 			rp_csq = rel;
 			radio_load(at_seqS, 1);
@@ -3656,7 +3744,7 @@ wait_hs1(void)
 				break;
 			}
 		}
-		delay_for_interval(10, NSEC_PER_MSEC);
+		delay_for_interval(cell_if_active() ? 3 : 10, NSEC_PER_MSEC);   /* pdp_ip0 up: 3 ms, short enough for interactive latency */
 	}
 	if (md_level >= 5) {
 		uint32_t rel = sent ? elapsed - t_send : elapsed, fops, fmiss, fovl;
@@ -3761,6 +3849,9 @@ md_power_off(const char *why)
 	}
 	md_state = 2;
 	SAYM("r1md: powering MD1 down (%s)", why);
+	if (if_on && !md_quiet) {
+		cell_if_stop("MD1 power-down");         /* no-op when the off sequence already did it; never from the loader hand-back path */
+	}
 	cldma_teardown();       /* stop and reset the CLDMA receive ring first, if one was started (no-op otherwise) */
 	if (!md1_is_on()) {
 		SAYM("r1md: MD1 is already off");
@@ -3877,7 +3968,13 @@ md_thread(__unused void *parameter, __unused wait_result_t result)
 	ccif_reset();
 	if (data_on) {
 		cldma_data_enable();
+		if (if_on) {
+			cldma_if_enable(if_pkts, if_kb * 1000);
+		}
 		SAYM("r1md: Stage 3a armed (r1_md_data=1%s): TX ring, 0x400d answer, bearer binding after registration", eif_on ? ", r1_md_eif=1" : "");
+		if (if_on) {
+			SAYM("r1md: Stage 3b armed (r1_md_if=1%s): pdp_ip0 after the bearer address, caps %u pkts %u KB per direction, data phase <= 75 s then hold 5 s", md_level == 7 && eif_on ? " / r1_md=9 shorthand" : "", if_pkts, if_kb);
+		}
 	}
 	if (cldma_on && !cldma_rx_start(md_ms())) {
 		md_power_off("cldma rx not started");
@@ -3919,8 +4016,14 @@ redwood_md_init(void)
 	bool on;
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("r1_md", &arg, sizeof(arg)) || (arg < 1 || arg > 7)) {
+	bool sh9 = false;
+
+	if (!PE_parse_boot_argn("r1_md", &arg, sizeof(arg)) || (arg < 1 || (arg > 7 && arg != 9))) {
 		return;
+	}
+	if (arg == 9) {         /* shorthand (the kernel command line is length-limited): 7 + r1_md_cldma=1 + r1_md_data=1 + r1_md_if=1 + r1_md_eif=1 */
+		sh9 = true;
+		arg = 7;
 	}
 	md_level = arg;
 	if (arg == 7) {
@@ -3930,10 +4033,20 @@ redwood_md_init(void)
 		at_n = sizeof(at_seq7) / sizeof(at_seq7[0]);
 		radio_req = PE_parse_boot_argn("r1_md_radio", &v, sizeof(v)) && v == 1;
 		/* the CLDMA receive ring is started ONLY with r1_md_cldma=1; without it not one CLDMA register is written (snapshots are reads) */
-		cldma_on = PE_parse_boot_argn("r1_md_cldma", &v, sizeof(v)) && v == 1;
+		cldma_on = sh9 || (PE_parse_boot_argn("r1_md_cldma", &v, sizeof(v)) && v == 1);
 		/* Stage 3a: r1_md_data=1 only counts together with r1_md_radio=1 and r1_md_cldma=1 (the ten gates and registration are checked at run time) */
-		data_on = radio_req && cldma_on && PE_parse_boot_argn("r1_md_data", &v, sizeof(v)) && v == 1;
-		eif_on = data_on && PE_parse_boot_argn("r1_md_eif", &v, sizeof(v)) && v == 1;
+		data_on = radio_req && cldma_on && (sh9 || (PE_parse_boot_argn("r1_md_data", &v, sizeof(v)) && v == 1));
+		eif_on = data_on && (sh9 || (PE_parse_boot_argn("r1_md_eif", &v, sizeof(v)) && v == 1));
+		if_on = data_on && (sh9 || (PE_parse_boot_argn("r1_md_if", &v, sizeof(v)) && v == 1));
+		if (if_on) {
+			if (PE_parse_boot_argn("r1_md_if_pkts", &v, sizeof(v)) && v >= 10 && v <= 2000) {
+				if_pkts = v;
+			}
+			if (PE_parse_boot_argn("r1_md_if_kb", &v, sizeof(v)) && v >= 4 && v <= 2000) {
+				if_kb = v;
+			}
+			if_hold_ms = 5000;
+		}
 		imei_h_set = PE_parse_boot_argn("r1_md_imei_h", &imei_h, sizeof(imei_h));
 		had_wifi = PE_parse_boot_argn("wifi", &v, sizeof(v)) && v != 0;
 		(void)PE_parse_boot_argn("connsys_step", &g_connsys, sizeof(g_connsys));
