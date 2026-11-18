@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-18 12:00 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-18 12:40 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -32,14 +32,15 @@ Last updated: 2026-11-18 12:00 PST. Kept current as work lands; details are in t
 
 ## In progress
 
-- Using Open Mapple (github.com/open-mapple, same code lineage, MediaTek phone): plan in `open-mapple-plan.md`; phase 1 (small items) starting
+- Using Open Mapple (github.com/open-mapple, same code lineage, MediaTek phone): plan in `open-mapple-plan.md`; phase 1 small items done (volume guard, UI-activity CPU boost with no measured gain yet, boot-args length check); pass benchmark and profiler next
+- Microphone: spec written (`microphone-spec.md`), implementation waiting for the owner's OK to change the audio driver
 - Microphone and video recording: analysis of what each needs (see open problems)
 - Bluetooth speaker audio (A2DP): ready for a hands-on session; no sound has been sent to a speaker yet
 
 ## Open problems
 
 - Microphone records silence: the kernel audio driver has no capture (uplink) path at all
-- Video recording fails: no H.264 encoder on the system ("Cannot Encode"), no movie file written
+- Video recording fails in two places: Camera's capture graph loops as soon as Video mode is selected (before any encoder is asked for), and neither of Apple's dormant software encoders (H.264, HEVC) will create a session when registered (-12908)
 - Cellular alongside Wi-Fi (Wi-Fi should win) is untested: unattended runs have no Wi-Fi
 - All audio went silent after a speaker was paired (likely the route moved to a Bluetooth output that could not carry sound; not confirmed)
 - Safari audio spins and never plays; a Safari file download would not start (untested unattended: no Wi-Fi in those runs)

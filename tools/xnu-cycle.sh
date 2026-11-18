@@ -21,6 +21,14 @@ EPOCH=$(date +%s)
 RUN_ID=$(( EPOCH & 0x7fffffff ))   # r1: tags the loader marker (expdb restores old ones)
 TEST_FLAGS=(-DRUN_ID=${RUN_ID}u -DXNU_WDT_SECONDS=0 -DXNU_CORES=$CORES -DXNU_WATCH_SECONDS=$WATCH
 	"-DXNU_RETURN_AFTER=\"$SECS\"" "-DXNU_EXTRA_ARGS=\"$XNU_ARGS epoch=$EPOCH\"")
+# The loader's command line is 608 bytes (mtkloader.c BOOT_LINE_LENGTH): longer is cut silently. Rebuild its string here and fail
+# loudly (XNU_VERBOSE=0 is the default; -v would add 3). With r1_md= the loader appends up to 160 more.
+FULL="debug=0x8 serial=3 rd=md0 emmc_root=1 $XNU_ARGS epoch=$EPOCH loader_return_after=$SECS"
+LIMIT=607; case "$XNU_ARGS" in *r1_md=*) LIMIT=447;; esac
+if [ ${#FULL} -gt $LIMIT ]; then
+	echo "xnu-cycle.sh: BOOT-ARGS TOO LONG: ${#FULL} chars > $LIMIT (kernel command line is 607, 447 with r1_md=): shorten the extra args. Nothing flashed."
+	exit 1
+fi
 # XNU_STAY=1 (r1): the image boots XNU at every power-on and stays there. Holding the side button
 # for three seconds ends the run and starts Android once (the loader's watcher); a reboot of Android
 # is XNU again. Nothing is asked of Android and no log is waited for.

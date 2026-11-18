@@ -219,7 +219,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			{ ${LDID:-ldid} -Ssrc/bt_test.entitlements obj/bt_test 2>/dev/null ||
 			  echo "build.sh: no ldid: bt_test is unsigned, and TCC may not let it use Bluetooth"; }
 		$DYN -fobjc-arc -framework Foundation -framework AVFoundation -o obj/camera_avtest src/camera_avtest.m
-		$DYN -fobjc-arc -framework Foundation -framework AVFoundation -framework CoreMedia -framework CoreVideo -o obj/video_test src/video_test.m
+		$DYN -fobjc-arc -framework Foundation -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox -o obj/video_test src/video_test.m
 		# (the microphone as an application records: allowed to, by an entitlement, if ldid is there)
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/record_test src/record_test.c &&
 			{ ${LDID:-ldid} -Ssrc/record_test.entitlements obj/record_test 2>/dev/null ||
@@ -294,7 +294,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-app.dylib -lobjc \
 			-o obj/libredwood-app.dylib src/inject_app.c
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-media.dylib -framework CoreFoundation -framework CoreMedia \
-			-framework CoreVideo -framework IOSurface -lobjc \
+			-framework CoreVideo -framework IOSurface -framework VideoToolbox -lobjc \
 			-o obj/libredwood-media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
 		# ... the Apple ID / App Store libraries (APPLEID=1; ported from origin/AppleID). inside
 		# mobileactivationd, the dev-fused MobileGestalt answers (src/inject_mad.c); inside

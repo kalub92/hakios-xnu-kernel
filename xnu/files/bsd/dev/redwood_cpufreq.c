@@ -1480,6 +1480,27 @@ redwood_r1_gov_screen(bool off)
 	r1_gov_off = off;
 }
 
+/*
+ * r1_boost (default 1 with r1_gov=1, r1_boost=0 = off): a frame swap or a touch report holds the governor high for 250 ms
+ * (the next sample sees "busy"), under the same rules as the load: not while latched (thermal drop, end of run) or screen off.
+ * Idea and 250 ms from Open Mapple mt6781_cpufreq.c, mt6781_cpufreq_ui_activity (APSL).
+ */
+#define R1_BOOST_MS 250
+static bool r1_boost_on;
+static volatile uint64_t r1_boost_until;
+static uint64_t r1_boost_abs;
+static uint32_t r1_boost_signals, r1_boost_ups;
+
+void redwood_r1_ui_activity(void);
+void
+redwood_r1_ui_activity(void)
+{
+	if (r1_boost_on) {
+		r1_boost_until = mach_absolute_time() + r1_boost_abs;
+		r1_boost_signals++;
+	}
+}
+
 static void
 r1_gov_thread(void *arg __unused, wait_result_t wr __unused)
 {
@@ -1491,7 +1512,7 @@ r1_gov_thread(void *arg __unused, wait_result_t wr __unused)
 	for (;;) {
 		uint64_t now, ns;
 		uint32_t top = 0;
-		bool high, go_up, go_down;
+		bool high, go_up, go_down, boost;
 
 		delay_for_interval(50, NSEC_PER_MSEC);
 		now = mach_absolute_time();
@@ -1505,12 +1526,13 @@ r1_gov_thread(void *arg __unused, wait_result_t wr __unused)
 			idle_before[i] = idle;
 			top = MAX(top, (uint32_t)(100 * busy / (now - then)));
 		}
+		boost = r1_boost_on && now < r1_boost_until;
 		high = r1_raised[0];
 		if (high) {
 			high_ns += now - then;
 		}
 		then = now;
-		low_run = top < 30 ? low_run + 1 : 0;
+		low_run = top < 30 && !boost ? low_run + 1 : 0;
 		longest_low = MAX(longest_low, low_run);
 		if (top >= 70) {
 			n_hi++;
@@ -1521,14 +1543,15 @@ r1_gov_thread(void *arg __unused, wait_result_t wr __unused)
 		}
 		if (++samples % 200 == 0) {
 			absolutetime_to_nanoseconds(now - started, &ns);
-			redwood_keep("r1gov: up %u down %u, %u%% of time high, last switch %u us; samples busiest core >=70 %u, 30-69 %u, <30 %u, longest low run %u",
-			    r1_gov_ups, r1_gov_downs, ns ? (uint32_t)(100 * high_ns / (now - started)) : 0, r1_gov_last_us, n_hi, n_mid, n_lo, longest_low);
+			redwood_keep("r1gov: up %u down %u, %u%% of time high, last switch %u us; samples busiest core >=70 %u, 30-69 %u, <30 %u, longest low run %u; boost %s signals %u ups %u",
+			    r1_gov_ups, r1_gov_downs, ns ? (uint32_t)(100 * high_ns / (now - started)) : 0, r1_gov_last_us, n_hi, n_mid, n_lo, longest_low,
+			    r1_boost_on ? "on" : "off", r1_boost_signals, r1_boost_ups);
 		}
 		if (dead || r1_latched) {
 			continue;
 		}
 		absolutetime_to_nanoseconds(now - switched, &ns);
-		go_up = !high && !r1_gov_off && top >= 70 && (switched == 0 || ns >= 200 * NSEC_PER_MSEC);
+		go_up = !high && !r1_gov_off && (top >= 70 || boost) && (switched == 0 || ns >= 200 * NSEC_PER_MSEC);
 		go_down = high && (r1_gov_off || low_run >= 10) && (switched == 0 || ns >= 200 * NSEC_PER_MSEC);
 		if (!go_up && !go_down) {
 			continue;
@@ -1544,6 +1567,7 @@ r1_gov_thread(void *arg __unused, wait_result_t wr __unused)
 					}
 				}
 				r1_gov_ups++;
+				r1_boost_ups += boost;
 			} else {
 				r1_restore();
 				r1_gov_downs++;
@@ -1613,11 +1637,16 @@ r1_init(void)
 	if (PE_parse_boot_argn("r1_gov", &gov, sizeof(gov)) && gov == 1 && r1_row[0] != NULL) {
 		thread_t thread;
 
+		uint32_t boost_arg = 1;
+
 		r1_gov_on = true;
+		(void)PE_parse_boot_argn("r1_boost", &boost_arg, sizeof(boost_arg));
+		r1_boost_on = boost_arg != 0;
+		nanoseconds_to_absolutetime(R1_BOOST_MS * NSEC_PER_MSEC, &r1_boost_abs);
 		if (kernel_thread_start(r1_gov_thread, NULL, &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 		}
-		SAY("r1gov: on: low = LK's clocks, high = r1_cpufreq");
+		SAY("r1gov: on: low = LK's clocks, high = r1_cpufreq; UI boost %s", r1_boost_on ? "on (250 ms)" : "off");
 	}
 	if (PE_parse_boot_argn("membench", &bench, sizeof(bench)) && bench == 1) {
 		memory_bench();

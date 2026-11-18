@@ -26,6 +26,7 @@
 static uint32_t touch_lat = 2;          /* 2: not yet looked up */
 
 extern void loader_log_line(const char *line);
+extern void redwood_r1_ui_activity(void);
 
 /*
  * A "tl:" line, for the kernel's drivers: into the loader's log as it is written -- the kernel's own
@@ -139,6 +140,7 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 void
 redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
 {
+	redwood_r1_ui_activity();       /* r1_boost: a touch holds the CPU clocks high for 250 ms */
 	touch_post(type, finger, x, y, true);
 }
 

@@ -1179,25 +1179,338 @@ camera_app_probe(void)
 }
 
 /*
+ * vdiag=1 (docs/video-recording-spec.md 3.1, run vd0): what the video path does, logs only (host_line). Read from kern.bootargs; if the
+ * sandbox will not let a process read it, "vdiag: boot-args not readable" says so.
+ */
+#include <VideoToolbox/VideoToolbox.h>
+#include <CoreMedia/CoreMedia.h>
+
+static bool
+boot_arg_has(const char *word)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	static int readable = -1;
+
+	readable = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0;
+	if (!readable) {
+		host_line("vdiag: boot-args not readable by %s", getprogname());
+		return false;
+	}
+	for (const char *at = args; (at = strstr(at, word)) != NULL; at++) {
+		if ((at == args || at[-1] == ' ') && (at[strlen(word)] == ' ' || at[strlen(word)] == 0)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool vdiag_on, in_mediaserverd;
+
+static void
+fourcc(unsigned code, char *out)
+{
+	for (int i = 0; i < 4; i++) {
+		unsigned char c = (code >> (24 - 8 * i)) & 0xff;
+
+		out[i] = c >= 32 && c < 127 ? (char)c : '?';
+	}
+	out[4] = 0;
+}
+
+static void
+cf_short(CFTypeRef value, char *out, size_t size)
+{
+	CFStringRef text = value ? CFCopyDescription(value) : NULL;
+
+	out[0] = 0;
+	if (text != NULL) {
+		CFStringGetCString(text, out, (CFIndex)size, kCFStringEncodingUTF8);
+		CFRelease(text);
+	}
+	for (char *c = out; *c; c++) {
+		if (*c == '\n' || *c == '\t') {
+			*c = ' ';
+		}
+	}
+}
+
+/* 1: the encoders VideoToolbox knows, the hidden and the hardware ones too */
+static void
+vdiag_encoder_list(const char *who)
+{
+	CFStringRef hidden = dlsym(RTLD_DEFAULT, "kVTVideoEncoderListOption_RevealHiddenEncoders") ? *(CFStringRef *)dlsym(RTLD_DEFAULT, "kVTVideoEncoderListOption_RevealHiddenEncoders") : NULL;
+	CFStringRef hw = dlsym(RTLD_DEFAULT, "kVTVideoEncoderListOption_RevealHardwareAcceleratedEncoders") ? *(CFStringRef *)dlsym(RTLD_DEFAULT, "kVTVideoEncoderListOption_RevealHardwareAcceleratedEncoders") : NULL;
+	CFArrayRef list = NULL;
+	CFMutableDictionaryRef options = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	OSStatus status;
+
+	if (hidden != NULL) {
+		CFDictionarySetValue(options, hidden, kCFBooleanTrue);
+	}
+	if (hw != NULL) {
+		CFDictionarySetValue(options, hw, kCFBooleanTrue);
+	}
+	status = VTCopyVideoEncoderList(options, &list);
+	host_line("vdiag: %s: VTCopyVideoEncoderList (hidden key %s, hw key %s) status %d, %ld encoder(s)", who, hidden ? "yes" : "no", hw ? "yes" : "no",
+	    (int)status, list ? (long)CFArrayGetCount(list) : -1L);
+	for (CFIndex i = 0; list != NULL && i < CFArrayGetCount(list) && i < 40; i++) {
+		char text[300];
+
+		cf_short(CFArrayGetValueAtIndex(list, i), text, sizeof(text));
+		host_line("vdiag: %s: encoder %ld: %.280s", who, (long)i, text);
+	}
+	if (list != NULL) {
+		CFRelease(list);
+	}
+	CFRelease(options);
+}
+
+/* 2, 3: VTCompressionSessionCreate and the first 25 VTSessionSetProperty calls on its sessions */
+static void *vdiag_sessions[8];
+static unsigned vdiag_nsessions, vdiag_nprops;
+
+static OSStatus
+vd_session_create(CFAllocatorRef allocator, int32_t width, int32_t height, CMVideoCodecType codec, CFDictionaryRef spec, CFDictionaryRef source,
+    CFAllocatorRef compressed, VTCompressionOutputCallback callback, void *refcon, VTCompressionSessionRef *out)
+{
+	OSStatus status = VTCompressionSessionCreate(allocator, width, height, codec, spec, source, compressed, callback, refcon, out);
+
+	if (vdiag_on && in_mediaserverd) {
+		char cc[5], sp[400], src[300];
+
+		fourcc(codec, cc);
+		cf_short(spec, sp, sizeof(sp));
+		cf_short(source, src, sizeof(src));
+		host_line("vdiag: VTCompressionSessionCreate %dx%d '%s' status %d caller %#lx", (int)width, (int)height, cc, (int)status,
+		    (unsigned long)__builtin_return_address(0) - slide);
+		host_line("vdiag:   spec %.350s", sp);
+		host_line("vdiag:   source %.250s", src);
+		if (status == 0 && out != NULL && *out != NULL && vdiag_nsessions < 8) {
+			vdiag_sessions[vdiag_nsessions++] = (void *)*out;
+		}
+	}
+	return status;
+}
+
+static OSStatus
+vd_set_property(VTSessionRef session, CFStringRef key, CFTypeRef value)
+{
+	OSStatus status = VTSessionSetProperty(session, key, value);
+
+	if (vdiag_on && in_mediaserverd && vdiag_nprops < 25) {
+		for (unsigned i = 0; i < vdiag_nsessions; i++) {
+			if (vdiag_sessions[i] == (void *)session) {
+				char k[100], v[120];
+
+				vdiag_nprops++;
+				cf_short(key, k, sizeof(k));
+				cf_short(value, v, sizeof(v));
+				host_line("vdiag: VTSessionSetProperty %.90s = %.110s -> %d", k, v, (int)status);
+				break;
+			}
+		}
+	}
+	return status;
+}
+
+__attribute__((used)) static const struct {
+	const void *replacement;
+	const void *replacee;
+} vdiag_interpose[] __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *)vd_session_create, (const void *)VTCompressionSessionCreate },
+	{ (const void *)vd_set_property, (const void *)VTSessionSetProperty },
+};
+
+/*
+ * 4, 7, 8: a method of a class of Apple's wrapped so that the first 3 calls and every 30th say their six integer arguments (after self and the
+ * selector) and the result, and the original runs unchanged. Six integer registers pass through whatever the arguments are (objects,
+ * CMTime halves, ints; none of these takes a float).
+ */
+typedef uint64_t (*vd_imp)(id, SEL, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+
+static bool
+vd_wrap(const char *class_name, const char *selector, bool class_method, void (*extra)(const char *, uint64_t *, uint64_t, bool))
+{
+	Class cls = objc_getClass(class_name);
+	Method m = cls ? (class_method ? class_getClassMethod(cls, sel_registerName(selector)) : class_getInstanceMethod(cls, sel_registerName(selector))) : NULL;
+
+	if (m == NULL) {
+		return false;
+	}
+	vd_imp orig = (vd_imp)method_getImplementation(m);
+	SEL sel = sel_registerName(selector);
+	__block unsigned calls = 0;
+	const char *cn = class_name, *sn = selector;
+
+	method_setImplementation(m, imp_implementationWithBlock((id)^uint64_t(id me, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+		uint64_t args[6] = { a, b, c, d, e, f }, result;
+		unsigned n = __sync_add_and_fetch(&calls, 1);
+		bool say_it = n <= 3 || n % 30 == 0;
+
+		if (say_it && extra != NULL) {
+			extra(sn, args, 0, true);
+		}
+		if (say_it) {
+			host_line("vdiag: -[%s %s] #%u in: %#llx %#llx %#llx %#llx", cn, sn, n, a, b, c, d);
+		}
+		result = orig(me, sel, a, b, c, d, e, f);
+		if (say_it) {
+			host_line("vdiag: -[%s %s] #%u out: %#llx", cn, sn, n, result);
+		}
+		return result;
+	}));
+	host_line("vdiag: -[%s %s] wrapped", class_name, selector);
+	return true;
+}
+
+/* retried every 5 s for 10 minutes: CMCapture's classes exist when the camera first starts. _writeBuffer:forInputIndex: has the buffer in a, the input in b. */
+static void
+vd_wrap_sinks(void)
+{
+	static bool done[4];
+	static const char *const w[4][2] = {
+		{ "BWQuickTimeMovieFileSinkNode", "_doStartRecordingAtTime:withSettings:sensorVideoPort:" },
+		{ "BWQuickTimeMovieFileSinkNode", "_writeBuffer:forInputIndex:" },
+		{ "BWQuickTimeMovieFileSinkNode", "_doEndRecordingAtTime:earlyTerminationErrCode:" },
+		{ "BWFileCoordinatorNode", "_doStartingToRecordWithSBuf:inputIndex:sbufPTS:" },
+	};
+	static unsigned tries;
+	bool all = true;
+
+	for (unsigned i = 0; i < 4; i++) {
+		done[i] = done[i] || vd_wrap(w[i][0], w[i][1], false, NULL);
+		all &= done[i];
+	}
+	if (!all && ++tries < 120) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+			vd_wrap_sinks();
+		});
+	} else if (!all) {
+		host_line("vdiag: some movie sink methods never appeared");
+	}
+}
+
+/* a url of the arguments as text, for the Camera app's calls (a = first argument is an NSURL) */
+static void
+vd_url_text(const char *selector, uint64_t *args, uint64_t unused, bool say_it)
+{
+	(void)unused;
+	if (say_it && args[0] > 0x100000000ULL) {
+		host_line("vdiag: %s: %.250s", selector, text_of_object((id)(uintptr_t)args[0]));
+	}
+}
+
+static void
+vd_wrap_delegate_class(Class cls)
+{
+	static Class seen[8];
+	static unsigned nseen;
+	const char *name = class_getName(cls);
+
+	for (unsigned i = 0; i < nseen; i++) {
+		if (seen[i] == cls) {
+			return;
+		}
+	}
+	if (nseen < 8) {
+		seen[nseen++] = cls;
+	}
+	vd_wrap(name, "captureOutput:didStartRecordingToOutputFileAtURL:fromConnections:", false, vd_url_text);
+	vd_wrap(name, "captureOutput:didFinishRecordingToOutputFileAtURL:fromConnections:error:", false, NULL);
+}
+
+static void
+vd_record_start(const char *selector, uint64_t *args, uint64_t unused, bool say_it)
+{
+	(void)unused;
+	if (!say_it) {
+		return;
+	}
+	vd_url_text(selector, args, 0, true);
+	if (args[1] > 0x100000000ULL) {
+		id delegate = (id)(uintptr_t)args[1];
+
+		vd_wrap_delegate_class(object_getClass(delegate));
+	}
+}
+
+/* 7, 8, 9: the Camera app's storage check and recording call, and the video configuration getters */
+static void
+vdiag_camera_app(void)
+{
+	Class prefs = objc_getClass("CAMUserPreferences");
+	unsigned count = 0;
+	Method *methods = prefs ? class_copyMethodList(prefs, &count) : NULL;
+
+	if (!vd_wrap("CAMStorageController", "hasDiskSpaceToAllowCaptureWithConfiguration:allowPurging:verbose:", false, NULL)) {
+		host_line("vdiag: CAMStorageController hasDiskSpaceToAllowCapture... NOT FOUND");
+	}
+	if (!vd_wrap("CAMStorageController", "minAvailableBytesNeededForCaptureForWidth:height:useHEVC:", false, NULL)) {
+		host_line("vdiag: CAMStorageController minAvailableBytesNeeded... NOT FOUND");
+	}
+	if (!vd_wrap("AVCaptureMovieFileOutput", "startRecordingToOutputFileURL:recordingDelegate:", false, vd_record_start)) {
+		host_line("vdiag: AVCaptureMovieFileOutput startRecording... NOT FOUND");
+	}
+	for (unsigned i = 0; methods != NULL && i < count; i++) {
+		const char *name = sel_getName(method_getName(methods[i]));
+
+		if (strstr(name, "ideoConfig") != NULL || strstr(name, "ideoResolution") != NULL) {
+			host_line("vdiag: CAMUserPreferences method %s (types %s)", name, method_getTypeEncoding(methods[i]));
+		}
+	}
+	free(methods);
+	Class cap = objc_getClass("CAMCaptureCapabilities");
+	host_line("vdiag: CAMCaptureCapabilities %s", cap ? "present" : "absent");
+}
+
+/* 10 s of mediaserverd: say the encoders */
+static void
+vdiag_media_start(void)
+{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		vdiag_encoder_list("mediaserverd");
+	});
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		vd_wrap_sinks();
+	});
+}
+
+/* 5: formats of mediaserverd's own log lines about the compressor and the movie sink, 120 lines of their own */
+static bool
+vdiag_log_match(const char *format)
+{
+	static const char *const words[] = { "VideoCompressor", "MovieFileSink", "FileCoordinator", "ecording", "ncoder", "OutOfDiskSpace" };
+
+	for (unsigned i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		if (strstr(format, words[i]) != NULL) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
  * L4 (docs/bluetooth-audio.md): what mediaserverd's own logging says of Bluetooth routes, for a hands-on look at why audio went quiet
  * after a pairing: formats naming "luetooth", "route change", "BTAudioHALPlugin" or "port with name", with their string arguments, 40 lines.
  * (Only for libraries outside the dyld cache; those of the cache may not be interposable.)
  */
 extern void _os_log_impl(void *dso, void *log, int type, const char *format, uint8_t *buf, uint32_t size);
-static bool in_mediaserverd;
-
 static void
 os_log_media(void *dso, void *log, int type, const char *format, uint8_t *buf, uint32_t size)
 {
-	static unsigned said;
+	static unsigned said, said_video;
+	bool bt = in_mediaserverd && format != NULL && said < 40 && (strstr(format, "luetooth") != NULL || strstr(format, "route change") != NULL ||
+	    strstr(format, "BTAudioHALPlugin") != NULL || strstr(format, "port with name") != NULL);
+	bool video = !bt && vdiag_on && in_mediaserverd && format != NULL && said_video < 120 && vdiag_log_match(format);
 
-	if (in_mediaserverd && format != NULL && said < 40 && (strstr(format, "luetooth") != NULL || strstr(format, "route change") != NULL ||
-	    strstr(format, "BTAudioHALPlugin") != NULL || strstr(format, "port with name") != NULL)) {
+	if (bt || video) {
+		said_video += video;
 		char text[300] = "";
 		const uint8_t *at = buf != NULL && size >= 2 ? buf + 2 : NULL, *end = buf + size;
 		unsigned arg = 0, count = buf != NULL && size >= 2 ? buf[1] : 0;
 
-		said++;
+		said += bt;
 		for (const char *f = format; at != NULL && *f != 0 && arg < count && at + 2 <= end; f++) {
 			if (*f != '%' || f[1] == '%') {
 				f += *f == '%';
@@ -1243,6 +1556,11 @@ redwood_media_init(void)
 		CFPreferencesSetAppValue(CFSTR("CAMUserPreferenceEnableResponsiveShutter"), kCFBooleanFalse, CFSTR("com.apple.camera"));
 		camera_app_guard();
 		camera_app_probe();
+		if ((vdiag_on = boot_arg_has("vdiag=1"))) {
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 14 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+				vdiag_camera_app();
+			});
+		}
 		return;
 	}
 	if (name != NULL && strcmp(name, "assetsd") == 0) {
@@ -1253,6 +1571,9 @@ redwood_media_init(void)
 		return;
 	}
 	in_mediaserverd = true;
+	if ((vdiag_on = boot_arg_has("vdiag=1"))) {
+		host_line("vdiag: on in mediaserverd");
+	}
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
 	torch = open("/dev/redwood-torch", O_WRONLY);
 	camera = access("/dev/redwood-camera", F_OK) == 0;
@@ -1264,6 +1585,9 @@ redwood_media_init(void)
 		say("redwood: mediaserverd: the kernel has a camera (/dev/redwood-camera)\n");
 	}
 	_dyld_register_func_for_add_image(image_added);         /* also called for every image already there */
+	if (vdiag_on) {
+		vdiag_media_start();
+	}
 	{
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;

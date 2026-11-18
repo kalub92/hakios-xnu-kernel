@@ -70,6 +70,7 @@ redwood_core_mhz(int *cpu)
 
 extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
 extern "C" void redwood_keep(const char * format, ...) __printflike(1, 2);
+extern "C" void redwood_r1_ui_activity(void);
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -1331,6 +1332,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	uint64_t now = mach_absolute_time(), period, pause;
 
 	gLiveFB = this;
+	redwood_r1_ui_activity();       /* r1_boost: a swap holds the CPU clocks high for 250 ms */
 
 	/* (a frame that is late on the panel was late here already, or it was not: for telling whose it is) */
 	nanoseconds_to_absolutetime(framePeriodNs() * 5 / 4, &period);
