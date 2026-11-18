@@ -1,0 +1,390 @@
+diff -u -r a/src/imagination/vulkan/pvr_arch_device.c b/src/imagination/vulkan/pvr_arch_device.c
+--- a/src/imagination/vulkan/pvr_arch_device.c
++++ b/src/imagination/vulkan/pvr_arch_device.c
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include "pvr_device.h"
++#include "pvr_mrt.h"
+ 
+ #include "vk_log.h"
+ 
+@@ -914,6 +915,8 @@
+       goto err_pvr_finish_graphics_static_clear_state;
+ 
+    pvr_device_init_tile_buffer_state(device);
++   simple_mtx_init(&device->loadop_cache.mtx, mtx_plain);
++   device->loadop_cache.enabled = -1;
+ 
+    result = pvr_arch_queues_create(device, pCreateInfo);
+    if (result != VK_SUCCESS)
+@@ -1054,6 +1057,7 @@
+    pvr_robustness_buffer_finish(device);
+    pvr_spm_finish_scratch_buffer_store(device);
+    pvr_arch_queues_destroy(device);
++   pvr_arch_loadop_cache_finish(device);
+    pvr_device_finish_tile_buffer_state(device);
+    pvr_arch_device_finish_spm_load_state(device);
+    pvr_device_finish_graphics_static_clear_state(device);
+diff -u -r a/src/imagination/vulkan/pvr_arch_mrt.c b/src/imagination/vulkan/pvr_arch_mrt.c
+--- a/src/imagination/vulkan/pvr_arch_mrt.c
++++ b/src/imagination/vulkan/pvr_arch_mrt.c
+@@ -19,6 +19,9 @@
+ 
+ #include "hwdef/rogue_hw_utils.h"
+ #include "util/macros.h"
++#include "util/hash_table.h"
++#include "util/os_time.h"
++#include "util/u_math.h"
+ #include "vulkan/vulkan_core.h"
+ #include "vulkan/runtime/vk_graphics_state.h"
+ #include "vulkan/runtime/vk_image.h"
+@@ -296,6 +299,192 @@
+    return false;
+ }
+ 
++
++/*
++ * Darwin on redwood: the load-op shader of a dynamic render pass, kept for the device's life.
++ *
++ * With dynamic rendering (Zink) every vkCmdBeginRendering with a load or clear made a load-op
++ * shader through the compiler plus two PDS programs, 2 ms of a 3.3 ms pass, and freed them at the
++ * end of the command buffer. What pvr_uscgen_loadop() reads (pvr_usc.c) is all in the key below:
++ * the clear/load/2d-view-of-3d/msaa masks, depth_clear_to_reg, and for each render target of the
++ * clear|load mask its format and where its MRT resource lives (type, register or tile buffer,
++ * offset). The device (pco_ctx, dev_info) is the cache's owner. Never read besides: the PDS
++ * programs depend on the shader's entry offset, temps and msaa, which the entry keeps with it.
++ * What came out -- the three programs and four counts -- is shared by every load op of the key
++ * (progs_cached: pvr_load_op_fini does not free them). PVR_LOADOP_CACHE=0 turns it off; past
++ * PVR_LOADOP_CACHE_MAX entries a pass is made the old way, and a line says so.
++ */
++#include <stdlib.h>
++extern int sysctlbyname(const char *, void *, size_t *, void *, size_t);
++
++struct pvr_loadop_key {
++   uint16_t rt_clear_mask, rt_load_mask, rt_2d_view_3d_mask, unresolved_msaa_mask;
++   int32_t depth_clear_to_reg;
++   uint32_t color_init_count;
++   struct {
++      uint32_t format;
++      uint32_t type;
++      uint32_t a, b; /* register: output_reg, 0. memory: tile_buffer, offset_dw */
++   } rt[PVR_LOAD_OP_CLEARS_LOADS_MAX_RTS];
++};
++
++struct pvr_loadop_entry {
++   struct pvr_loadop_key key;
++   uint32_t hash;
++   struct pvr_suballoc_bo *usc_frag_prog_bo;
++   struct pvr_pds_upload pds_frag_prog;
++   struct pvr_pds_upload pds_tex_state_prog;
++   uint32_t const_shareds_count, shareds_count, num_tile_buffers, temps_count;
++};
++
++static void pvr_loadop_cache_say(struct pvr_device *device, int64_t now)
++{
++   char line[200];
++
++   snprintf(line,
++            sizeof(line),
++            "!MESA: pvr: load-op cache: %u entries, %u hits, %u misses, %u uncached (cache full)",
++            device->loadop_cache.count,
++            device->loadop_cache.hits,
++            device->loadop_cache.misses,
++            device->loadop_cache.full);
++   device->loadop_cache.said = now;
++   device->loadop_cache.hits = device->loadop_cache.misses = device->loadop_cache.full = 0;
++   sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
++}
++
++static void pvr_loadop_key_init(struct pvr_loadop_key *key, const struct pvr_load_op *load_op)
++{
++   const struct usc_mrt_setup *mrt_setup = load_op->clears_loads_state.mrt_setup;
++   const unsigned rt_mask = load_op->clears_loads_state.rt_clear_mask | load_op->clears_loads_state.rt_load_mask;
++
++   memset(key, 0, sizeof(*key));
++   key->rt_clear_mask = load_op->clears_loads_state.rt_clear_mask;
++   key->rt_load_mask = load_op->clears_loads_state.rt_load_mask;
++   key->rt_2d_view_3d_mask = load_op->clears_loads_state.rt_2d_view_3d_mask;
++   key->unresolved_msaa_mask = load_op->clears_loads_state.unresolved_msaa_mask;
++   key->depth_clear_to_reg = load_op->clears_loads_state.depth_clear_to_reg;
++   u_foreach_bit (i, rt_mask) {
++      const struct usc_mrt_resource *res = &mrt_setup->mrt_resources[i];
++
++      key->rt[i].format = load_op->clears_loads_state.dest_vk_format[i];
++      key->rt[i].type = res->type;
++      if (res->type == USC_MRT_RESOURCE_TYPE_OUTPUT_REG) {
++         key->rt[i].a = res->reg.output_reg;
++      } else {
++         key->rt[i].a = res->mem.tile_buffer;
++         key->rt[i].b = res->mem.offset_dw;
++      }
++   }
++}
++
++static VkResult pvr_load_op_shader_get_cached(struct pvr_device *device,
++                                              const VkAllocationCallbacks *alloc,
++                                              struct pvr_load_op *load_op)
++{
++   struct pvr_loadop_key key;
++   struct pvr_loadop_entry *entry = NULL;
++   uint32_t hash;
++   VkResult result;
++   int64_t now;
++
++   simple_mtx_lock(&device->loadop_cache.mtx);
++   if (device->loadop_cache.enabled < 0) {
++      const char *env = getenv("PVR_LOADOP_CACHE");
++
++      device->loadop_cache.enabled = !(env && !strcmp(env, "0"));
++   }
++   if (!device->loadop_cache.enabled ||
++       load_op->clears_loads_state.depth_clear_to_reg != PVR_NO_DEPTH_CLEAR_TO_REG) {
++      simple_mtx_unlock(&device->loadop_cache.mtx);
++      return pvr_arch_load_op_shader_generate(device, alloc, load_op);
++   }
++
++   pvr_loadop_key_init(&key, load_op);
++   hash = _mesa_hash_data(&key, sizeof(key));
++
++   for (uint32_t i = 0; i < device->loadop_cache.count; i++) {
++      struct pvr_loadop_entry *e = device->loadop_cache.entries[i];
++
++      if (e->hash == hash && !memcmp(&e->key, &key, sizeof(key))) {
++         entry = e;
++         break;
++      }
++   }
++
++   if (entry) {
++      device->loadop_cache.hits++;
++   } else {
++      /* a miss: made with the lock held, so two threads do not make the same one (rare: the lock is
++       * held for a compile only the first time a kind of pass is seen) */
++      device->loadop_cache.misses++;
++      result = pvr_arch_load_op_shader_generate(device, alloc, load_op);
++      if (result != VK_SUCCESS) {
++         simple_mtx_unlock(&device->loadop_cache.mtx);
++         return result;
++      }
++
++      if (device->loadop_cache.count >= PVR_LOADOP_CACHE_MAX ||
++          !(entry = calloc(1, sizeof(*entry)))) {
++         /* the load op keeps what it made (progs_cached stays false: it frees them) */
++         device->loadop_cache.full++;
++         now = os_time_get_nano();
++         if (!device->loadop_cache.said || now - device->loadop_cache.said > 10000000000ll)
++            pvr_loadop_cache_say(device, now);
++         simple_mtx_unlock(&device->loadop_cache.mtx);
++         return VK_SUCCESS;
++      }
++
++      entry->key = key;
++      entry->hash = hash;
++      entry->usc_frag_prog_bo = load_op->usc_frag_prog_bo;
++      entry->pds_frag_prog = load_op->pds_frag_prog;
++      entry->pds_tex_state_prog = load_op->pds_tex_state_prog;
++      entry->const_shareds_count = load_op->const_shareds_count;
++      entry->shareds_count = load_op->shareds_count;
++      entry->num_tile_buffers = load_op->num_tile_buffers;
++      entry->temps_count = load_op->temps_count;
++      device->loadop_cache.entries[device->loadop_cache.count++] = entry;
++
++      /* the entry owns the programs now */
++      load_op->progs_cached = true;
++      now = os_time_get_nano();
++      if (!device->loadop_cache.said || now - device->loadop_cache.said > 10000000000ll)
++         pvr_loadop_cache_say(device, now);
++      simple_mtx_unlock(&device->loadop_cache.mtx);
++      return VK_SUCCESS;
++   }
++
++   load_op->progs_cached = true;
++   load_op->usc_frag_prog_bo = entry->usc_frag_prog_bo;
++   load_op->pds_frag_prog = entry->pds_frag_prog;
++   load_op->pds_tex_state_prog = entry->pds_tex_state_prog;
++   load_op->const_shareds_count = entry->const_shareds_count;
++   load_op->shareds_count = entry->shareds_count;
++   load_op->num_tile_buffers = entry->num_tile_buffers;
++   load_op->temps_count = entry->temps_count;
++
++   now = os_time_get_nano();
++   if (!device->loadop_cache.said || now - device->loadop_cache.said > 10000000000ll)
++      pvr_loadop_cache_say(device, now);
++   simple_mtx_unlock(&device->loadop_cache.mtx);
++   return VK_SUCCESS;
++}
++
++void pvr_arch_loadop_cache_finish(struct pvr_device *device)
++{
++   for (uint32_t i = 0; i < device->loadop_cache.count; i++) {
++      struct pvr_loadop_entry *e = device->loadop_cache.entries[i];
++
++      pvr_bo_suballoc_free(e->pds_tex_state_prog.pvr_bo);
++      pvr_bo_suballoc_free(e->pds_frag_prog.pvr_bo);
++      pvr_bo_suballoc_free(e->usc_frag_prog_bo);
++      free(e);
++   }
++   device->loadop_cache.count = 0;
++   simple_mtx_destroy(&device->loadop_cache.mtx);
++}
++
+ static VkResult pvr_mrt_load_op_init(struct pvr_device *device,
+                                      const VkAllocationCallbacks *alloc,
+                                      const struct pvr_render_pass_info *rp_info,
+@@ -345,7 +534,7 @@
+ 
+    load_op->clears_loads_state.mrt_setup = &dr_info->hw_render.init_setup;
+ 
+-   result = pvr_arch_load_op_shader_generate(device, alloc, load_op);
++   result = pvr_load_op_shader_get_cached(device, alloc, load_op);
+    if (result != VK_SUCCESS) {
+       vk_free2(&device->vk.alloc, alloc, load_op);
+       return result;
+@@ -362,6 +551,9 @@
+ 
+ static void pvr_load_op_fini(struct pvr_load_op *load_op)
+ {
++   if (load_op->progs_cached)
++      return;
++
+    pvr_bo_suballoc_free(load_op->pds_tex_state_prog.pvr_bo);
+    pvr_bo_suballoc_free(load_op->pds_frag_prog.pvr_bo);
+    pvr_bo_suballoc_free(load_op->usc_frag_prog_bo);
+diff -u -r a/src/imagination/vulkan/pvr_device.h b/src/imagination/vulkan/pvr_device.h
+--- a/src/imagination/vulkan/pvr_device.h
++++ b/src/imagination/vulkan/pvr_device.h
+@@ -136,6 +136,17 @@
+       uint32_t buffer_count;
+    } tile_buffer_state;
+ 
++   /* Darwin on redwood: load-op shaders and PDS programs kept for the device's life (pvr_arch_mrt.c). */
++#define PVR_LOADOP_CACHE_MAX 256
++   struct {
++      simple_mtx_t mtx;
++      int enabled; /* -1: PVR_LOADOP_CACHE not read yet */
++      uint32_t count;
++      uint32_t hits, misses, full;
++      int64_t said;
++      void *entries[PVR_LOADOP_CACHE_MAX];
++   } loadop_cache;
++
+    struct pvr_spm_scratch_buffer_store spm_scratch_buffer_store;
+ 
+    struct pvr_bo_store *bo_store;
+diff -u -r a/src/imagination/vulkan/pvr_mrt.h b/src/imagination/vulkan/pvr_mrt.h
+--- a/src/imagination/vulkan/pvr_mrt.h
++++ b/src/imagination/vulkan/pvr_mrt.h
+@@ -104,6 +104,9 @@
+ struct pvr_load_op {
+    bool is_hw_object;
+ 
++   /* Darwin on redwood: the programs below belong to the device's load-op cache (pvr_arch_mrt.c), not to this load op. */
++   bool progs_cached;
++
+    struct pvr_suballoc_bo *usc_frag_prog_bo;
+    uint32_t const_shareds_count;
+    uint32_t shareds_count;
+@@ -227,6 +230,10 @@
+ 
+ #   define pvr_arch_mrt_load_op_state_cleanup \
+       PVR_PER_ARCH(mrt_load_op_state_cleanup)
++
++void PVR_PER_ARCH(loadop_cache_finish)(struct pvr_device *device);
++
++#   define pvr_arch_loadop_cache_finish PVR_PER_ARCH(loadop_cache_finish)
+ 
+ #endif /* PVR_PER_ARCH */
+ 
+diff -u -r a/src/imagination/vulkan/pvr_usc.c b/src/imagination/vulkan/pvr_usc.c
+--- a/src/imagination/vulkan/pvr_usc.c
++++ b/src/imagination/vulkan/pvr_usc.c
+@@ -193,9 +193,11 @@
+  * once is kept by them, for good -- PVR_EOT_KEPT of them, and past that they are compiled as
+  * before.
+  */
++#include "util/hash_table.h"
++#include "util/os_time.h"
+ #include "util/simple_mtx.h"
+ 
+-#define PVR_EOT_KEPT 32
++#define PVR_EOT_KEPT 1024 /* (was 32: the state words hold surface addresses, so a window server makes many kinds; past this they are compiled as before) */
+ 
+ struct pvr_eot_key {
+    const void *ctx;
+@@ -209,11 +211,15 @@
+ 
+ static struct {
+    struct pvr_eot_key key;
++   uint32_t hash;
+    void *data;
+    unsigned size;
+    unsigned temps;
+ } pvr_eot_kept[PVR_EOT_KEPT];
+ static unsigned pvr_eot_kept_count;
++static unsigned pvr_eot_hits, pvr_eot_misses, pvr_eot_unkept; /* (counters, said every ten seconds) */
++static int64_t pvr_eot_said;
++extern int sysctlbyname(const char *, void *, size_t *, void *, size_t);
+ static simple_mtx_t pvr_eot_kept_mtx = SIMPLE_MTX_INITIALIZER;
+ 
+ bool pvr_usc_eot_kept(pco_ctx *ctx,
+@@ -244,22 +250,37 @@
+           props->tile_buffer_addrs,
+           sizeof(key.tile_buffer_addrs));
+ 
++   const uint32_t hash = _mesa_hash_data(&key, sizeof(key));
++   /* PVR_LOADOP_CACHE=0 (one switch for both caches): the old limit of 32 */
++   static int limit;
++   if (!limit) {
++      const char *env = getenv("PVR_LOADOP_CACHE");
++
++      limit = env && !strcmp(env, "0") ? 32 : PVR_EOT_KEPT;
++   }
++
+    simple_mtx_lock(&pvr_eot_kept_mtx);
+    for (unsigned i = 0; i < pvr_eot_kept_count && !found; i++) {
+-      if (!memcmp(&pvr_eot_kept[i].key, &key, sizeof(key))) {
++      if (pvr_eot_kept[i].hash == hash && !memcmp(&pvr_eot_kept[i].key, &key, sizeof(key))) {
+          *data_out = pvr_eot_kept[i].data;
+          *size_out = pvr_eot_kept[i].size;
+          *temps_out = pvr_eot_kept[i].temps;
+          found = true;
++         pvr_eot_hits++;
+       }
+    }
+ 
+-   if (!found && pvr_eot_kept_count < PVR_EOT_KEPT) {
++   if (!found)
++      pvr_eot_misses++;
++   if (!found && pvr_eot_kept_count >= limit)
++      pvr_eot_unkept++;
++   if (!found && pvr_eot_kept_count < limit) {
+       eot = pvr_usc_eot(ctx, props, dev_info);
+       data = malloc(pco_shader_binary_size(eot));
+       if (data) {
+          memcpy(data, pco_shader_binary_data(eot), pco_shader_binary_size(eot));
+          pvr_eot_kept[pvr_eot_kept_count].key = key;
++         pvr_eot_kept[pvr_eot_kept_count].hash = hash;
+          pvr_eot_kept[pvr_eot_kept_count].data = data;
+          pvr_eot_kept[pvr_eot_kept_count].size = pco_shader_binary_size(eot);
+          pvr_eot_kept[pvr_eot_kept_count].temps =
+@@ -271,6 +292,19 @@
+          found = true;
+       }
+       ralloc_free(eot);
++   }
++   {
++      const int64_t now = os_time_get_nano();
++
++      if (!pvr_eot_said || now - pvr_eot_said > 10000000000ll) {
++         char line[160];
++
++         snprintf(line, sizeof(line), "!MESA: pvr: eot kept: %u programs, %u hits, %u misses, %u past the limit",
++                  pvr_eot_kept_count, pvr_eot_hits, pvr_eot_misses, pvr_eot_unkept);
++         pvr_eot_hits = pvr_eot_misses = pvr_eot_unkept = 0;
++         pvr_eot_said = now;
++         sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
++      }
+    }
+    simple_mtx_unlock(&pvr_eot_kept_mtx);
+ 

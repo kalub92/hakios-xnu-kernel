@@ -141,3 +141,77 @@ python3 tools/swprof.py pb1 sp2 sp3 sp4
 BASE = `fbscale=1 r1_clk=1 r1_cpufreq=2200 r1_gov=1 r1_gpu=680 glyuv=1 cam_fps=0 nopill=1` (r1-auto adds its own base). `bb_prof` counts from the window server's start
 (about log second 35.6): 115 puts the 5 s of samples at log 150-156, inside the swipes that begin at 146.5. The swipes were over after about 9 s
 in every run (the 40-swipe line is more than the phase needs).
+
+## 6. Load-op cache (2026-11-18)
+
+Change 1 of the ranking in 4, done: the PowerVR Vulkan driver keeps what it generates for a pass. Patch `tools/mesa/pvr/pvr-zz-loadop-cache.patch` (applied last by
+`tools/mk-mesa-pvr.sh`; the changed files are `pvr_arch_mrt.c`, `pvr_mrt.h`, `pvr_device.h`, `pvr_arch_device.c`, `pvr_usc.c`). No upstream design to backport: Mesa main has no load-op
+cache for dynamic rendering (checked the same files upstream, nothing; the load op is made in `pvr_mrt_load_op_init` and freed with the command buffer).
+
+- **Load-op shader.** `pvr_mrt_load_op_init` asks `pvr_load_op_shader_get_cached` instead of `pvr_arch_load_op_shader_generate`. Device-level cache, `simple_mtx` around lookup and
+  generate, at most 256 entries (past it: made the old way and one "cache full" count in the 10 s line), freed at `vkDestroyDevice` (`pvr_arch_loadop_cache_finish`).
+  What is kept is everything the generator produces: the USC program BO, the two PDS programs (they depend on the shader's entry offset, temps and msaa) and the four counts (`temps`, `const_shareds`,
+  `shareds`, `num_tile_buffers`). A load op that uses cached programs has `progs_cached` set, so `pvr_load_op_fini` does not free them.
+  **Key = what `pvr_uscgen_loadop` reads**: rt_clear_mask, rt_load_mask, rt_2d_view_3d_mask, unresolved_msaa_mask, depth_clear_to_reg (a load op that clears depth to a register is not cached), and per
+  render target of clear|load the destination VkFormat plus its MRT resource (type, output register or tile buffer index, tile buffer offset). The per-pass data (clear colours, texture states, tile buffer
+  addresses) are not in the shader: they go in the shared registers at submit time as before.
+- **End-of-tile shader.** Already kept by an earlier patch (`pvr_usc_eot_kept`, key = the PBE state words, which hold surface addresses) but at 32 entries for good: in the swipes 38% of the lookups missed
+  (1478 of 3870 in lc1) and the compiler ran for each. Limit now 1024 with a hash in front of the compare; the swipes make about 95 kinds (417 in the whole autotest + Settings scenario). The "per pass EOT state" is not
+  cachable beyond the shader: the PDS data segment, the PBE words and the BO uploads depend on the framebuffer's addresses and are cheap (the compiler was the cost).
+- **Kill switch.** Boot-arg `pvr_loadop_cache=0` (userland/src/eagl.c sets env `PVR_LOADOP_CACHE=0` in the Zink process; `glenv=PVR_LOADOP_CACHE=0` does the same): load-op cache off AND the EOT limit back to 32, i.e. the old behaviour, for A/B.
+- **Log line** every 10 s per process: `!MESA: pvr: load-op cache: N entries, H hits, M misses, F uncached (cache full)` and `!MESA: pvr: eot kept: N programs, H hits, M misses, P past the limit`.
+
+### Numbers (same BASE as before: `fbscale=1 r1_clk=1 r1_cpufreq=2200 r1_gov=1 r1_gpu=680 glyuv=1 cam_fps=0 nopill=1`, governor on, 4 cores)
+
+Swipe scenario, `swprof=1 bb_prof=115 bb_prof_all=1`. lc3 = cache off (`pvr_loadop_cache=0`), lc1 = load-op cache on with the EOT limit still 32, lc2 = both on (final).
+Logs `logs/lc1`, `lc2`, `lc3` (and sp2/sp3 of section 2 for the old build: same as lc3).
+
+| | lc3 off (= sp2/sp3) | lc1 load-op only | lc2 both |
+|---|---|---|---|
+| GL frame time in eagl, ms | 10.8 | 6.4 | **4.4** |
+| of it in glFlush, ms | 9.4 | 5.2 | **3.3** |
+| display swaps per second (5 s window) | 9 | 15 | **21** |
+| GL frames in the log window | 471 | 705 | 952 |
+| render thread running samples (of 12000) | 2458 (20%) | 2016 | **1061 (9%)** |
+| `pvr_rogue_CmdBeginRendering` inclusive samples | 1509 (61% of running) | 865 | 65 (6%) |
+| `pvr_rogue_load_op_shader_generate` | 1001 (41%) | 0 | 0 |
+| `pvr_usc_eot` (compiler) | 532 (22%) | 741 | 0 |
+| cache lines | - | load-op 3 entries, 1935 hits, 0 misses; EOT 1478 of 3870 missed | load-op 3 entries, 2593 hits (miss only at first use); EOT 95 programs, 5134 hits, 52 misses |
+
+The swap rate is now probably limited by the scenario (a swipe of 250 ms and a 0.35 s wait, 0.6 s per swipe) and by CoreAnimation's own pacing, not by the render thread: 21 swaps a second is the peak of the 5 s
+window, the swipes themselves last 24 s. The render thread is idle 91%. What is left in `glFlush`: `_tc_sync` / fence waits for Zink's queue thread, `zink_draw`, `glBindFramebuffer` and
+`glGetFramebufferAttachmentParameteriv` marshalling.
+
+Pass benchmark (pb1 before, pb2 after; CPU ms per pass, rest of process, 375x500, 200 passes a case; noise about 0.2):
+
+| case | pb1 before | pb2 after |
+|---|---|---|
+| clear / store, 1 draw | 3.27 | 1.78 |
+| clear / discard, 1 draw | 2.78 | 1.30 |
+| load / store, 1 draw | 3.40 | 1.64 |
+| load / discard, 1 draw | 1.38 | 1.40 |
+| dontcare / store, 1 draw | 1.28 | 1.50 |
+| dontcare / discard, 1 draw | 1.61 | 1.52 |
+| clear / store, 8 draws | 2.88 | 1.31 |
+| clear / discard, 8 draws | 2.89 | 1.56 |
+| load / store, 8 draws | 3.45 | 1.73 |
+| load / discard, 8 draws | 1.53 | 1.70 |
+| dontcare / store, 8 draws | 1.51 | 1.26 |
+| dontcare / discard, 8 draws | 1.66 | 1.46 |
+| load / store plain, 2 / 8 draws | 3.38 / 3.39 | 1.54 / 1.57 |
+
+LOAD and CLEAR now cost what DONT_CARE costs (1.3-1.8 ms of driver CPU, the rest is kernel calls and Zink); the 2 ms difference is gone.
+
+Regression (`reg1`, default build with the final lib, `autotest=1 settings=1`, 440 s): camera: taps 0, 1, 2 written (408, 157, 148 ms) and taps 1, 2 "THE PHOTO IS IN THE LIBRARY"; home phase 5.8 ms a frame (4.2 in glFlush), 12.4 swaps/s; Settings
+launched (`!auto: settings`, no crash line). The only fbshot picture that survived the log's tail is the home screen (`logs/reg1-shot2.png`): icons, dock, wallpaper correct, no corruption. The Camera and Settings pictures were
+NOT captured (shots every 40 s from 100 s; the pstore tail kept two shots and one of them did not decode), so rendering of Camera and Settings is not confirmed by a picture in this run: run `settings=1` with `SHOTS="fbshot=5 fbshot_every=5 fbshot_w=70"` (as btS1) to see it.
+No GPU fault, no panic, run ended `reason 0 (end)`.
+
+### Reproducing
+
+```
+tools/mk-mesa-pvr.sh   # ZINK=1: applies tools/mesa/pvr/*.patch when they change (a new source tree and a full rebuild), else ninja only
+userland build (NOTE of HANDOFF-2026-11-16.md, RC_JOBS=rc.jobs.swprof) + payload
+SHOTS= tools/r1-auto.sh lc2 "<BASE> swprof=1 bb_prof=115 bb_prof_all=1" 180                       # cache on
+SHOTS= tools/r1-auto.sh lc3 "<BASE> swprof=1 bb_prof=115 bb_prof_all=1 pvr_loadop_cache=0" 180   # off
+```

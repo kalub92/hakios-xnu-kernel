@@ -4945,6 +4945,11 @@ install(void)
 		say("redwood-gl: a frame is waited for %s\n", wait_for_frames == 3 ? "by the display and the surface's readers (glwait=3)" :
 		    wait_for_frames ? "here, before it is handed to the display" :
 		    "by the display's driver, not here");
+		/* boot-arg pvr_loadop_cache=0: the Vulkan driver's load-op cache off (tools/mesa/pvr/pvr-zz-loadop-cache.patch), for A/B */
+		if (strstr(arguments, "pvr_loadop_cache=0") != NULL) {
+			setenv("PVR_LOADOP_CACHE", "0", 1);
+			say("redwood-gl: the PowerVR load-op cache is off (pvr_loadop_cache=0)\n");
+		}
 		for (argument = arguments; (argument = strstr(argument, "glenv=")) != NULL; argument += 6) {
 			char setting[128];
 			size_t length = strcspn(argument + 6, " ");
