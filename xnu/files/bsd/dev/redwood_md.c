@@ -75,7 +75,43 @@ extern bool redwood_r1_temp(int *celsius);
 
 /* md_quiet: on the way back to the loader (the other CPUs stopped, the log's lock may be held by one) nothing is said */
 static volatile bool md_quiet;
-#define SAY(...) do { if (!md_quiet) redwood_host_keep_add(__VA_ARGS__); } while (0)
+/* Log budget (docs/cellular-attach-2.md 5c): SAY = bulk, dropped (and counted in md_cut) once ~20 KB of r1md output went out (26 KB after radio-on);
+ * SAYM = must-lines (results, gate summary, radio on/off, registration URCs, CCIF bits >= 16, errors, exceptions): never dropped. Lines are <= 191 chars. */
+static uint32_t md_bytes, md_cut, md_sup, md_budget = 20000;   /* md_sup: lines deduplicated on purpose */
+
+void redwood_md_say(bool must, const char *format, ...) __printflike(2, 3);
+void
+redwood_md_say(bool must, const char *format, ...)
+{
+	char b[192];
+	va_list ap;
+	size_t l;
+
+	if (md_quiet) {
+		return;
+	}
+	va_start(ap, format);
+	vsnprintf(b, sizeof(b), format, ap);
+	va_end(ap);
+	l = strlen(b) + 1;
+	if (!must && md_bytes > md_budget) {
+		md_cut++;
+		return;
+	}
+	md_bytes += (uint32_t)l;
+	redwood_host_keep_add("%s", b);
+}
+#define SAY(...)  redwood_md_say(false, __VA_ARGS__)
+#define SAYM(...) redwood_md_say(true, __VA_ARGS__)
+/* redwood_cldma.c */
+extern void cldma_maps(vm_offset_t infra);
+extern void cldma_snap(const char *why, uint32_t ms, bool md_on);
+extern bool cldma_rx_start(uint32_t ms);
+extern bool cldma_rx_poll(uint32_t ms);
+extern void cldma_teardown(void);
+extern void cldma_report(const char *tag, uint32_t ms);
+extern uint32_t cldma_rx_count(void);
+extern uint32_t cldma_rx_err(void);
 
 /* SPM */
 #define SPM_PWR_STATUS          0x180
@@ -176,6 +212,7 @@ static bool found_vm_valid;
 static volatile int md_state;
 static uint32_t md_level;       /* the r1_md value: 3 = stage 1 + 2a */
 static uint64_t md_t0;
+static uint32_t rd_t_on;        /* ms (run-relative) at which AT+EFUN=1 was sent; 0 = never */
 
 static inline uint32_t
 rd(vm_offset_t base, uint32_t at)
@@ -283,7 +320,7 @@ poll_infra(uint32_t reg, uint32_t mask, uint32_t want, const char *what)
 		}
 		delay(10);
 	}
-	SAY("r1md: [%u ms] %s: infra %#x = %#x, wanted %#x under %#x: TIMED OUT", md_ms(), what, reg, v, want, mask);
+	SAYM("r1md: [%u ms] %s: infra %#x = %#x, wanted %#x under %#x: TIMED OUT", md_ms(), what, reg, v, want, mask);
 	return false;
 }
 
@@ -307,7 +344,7 @@ vmodem_on(void)
 	uint32_t con0 = 0, elr0 = 0, dbg0 = 0;
 
 	if (!pw_read(VMODEM_CON0, &con0) || !pw_read(VMODEM_ELR0, &elr0) || !pw_read(VMODEM_DBG0, &dbg0)) {
-		SAY("r1md: VMODEM: the PMIC wrapper did not answer");
+		SAYM("r1md: VMODEM: the PMIC wrapper did not answer");
 		return false;
 	}
 	found_vm_con0 = con0;
@@ -343,7 +380,7 @@ md1_domain_on(void)
 	for (int i = 0; i < 100000 && !(on = md1_is_on()); i++) {
 		delay(10);
 	}
-	SAY("r1md: [%u ms] MD1 power ack: %s, PWR_STATUS %#x/%#x MD1_PWR_CON %#x", md_ms(), on ? "on" : "NOT ON", rd(spm, SPM_PWR_STATUS),
+	SAYM("r1md: [%u ms] MD1 power ack: %s, PWR_STATUS %#x/%#x MD1_PWR_CON %#x", md_ms(), on ? "on" : "NOT ON", rd(spm, SPM_PWR_STATUS),
 	    rd(spm, SPM_PWR_STATUS_2ND), rd(spm, SPM_MD1_PWR_CON));
 	if (!on) {
 		return false;
@@ -390,11 +427,11 @@ md_reachable(void)
 	uint32_t sta1 = rd(infra, INFRA_PROTECTEN_STA1);
 
 	if (!md1_is_on()) {
-		SAY("r1md: MD1 is not powered, not touching MD registers");
+		SAYM("r1md: MD1 is not powered, not touching MD registers");
 		return false;
 	}
 	if (sta1 & PERI2MD_PROT) {
-		SAY("r1md: PERI2MD protection is active (STA1 %#x), not touching MD registers", sta1);
+		SAYM("r1md: PERI2MD protection is active (STA1 %#x), not touching MD registers", sta1);
 		return false;
 	}
 	return true;
@@ -560,7 +597,7 @@ zero_range(uint32_t off, uint32_t len)
 #define RING_MAGIC_HEAD         0xaabbaabbu
 #define RING_MAGIC_TAIL         0xccddeeffu
 #define RX_QUEUES               7
-#define MAX_PKT_LOG             40
+#define MAX_PKT_LOG             15
 
 static uint32_t rb_off[CCIF_QUEUE_NUM], rb_total;
 
@@ -619,9 +656,9 @@ ccb_ctrl_write(void)
 			meta += sum;
 		}
 	}
-	SAY("r1md: ccb ctrl: %d rows, dhl %#x mdm %#x meta %#x (the META row is a GUESS: haretic's 63K ul table)", CCB_ROWS, dhl, mdm, meta);
+	SAYM("r1md: ccb ctrl: %d rows, dhl %#x mdm %#x meta %#x (the META row is a GUESS: haretic's 63K ul table)", CCB_ROWS, dhl, mdm, meta);
 	if (dhl != 0x70000 || mdm != 0x8000 || meta != 0x100000 || dhl + mdm + meta != 0x178000) {
-		SAY("r1md: CCB SUM WRONG (%#x, want 0x178000)", dhl + mdm + meta);
+		SAYM("r1md: CCB SUM WRONG (%#x, want 0x178000)", dhl + mdm + meta);
 		return false;
 	}
 	return true;
@@ -687,7 +724,7 @@ send_rt_data(const uint32_t *hs1_words)
 
 	for (int i = 0; i < MD_FEATURE_COUNT; i++) {
 		if ((feat[i] & 0xf) == 2 && rt_feat[i].sup != 2) {
-			SAY("r1md: 2a: MD requires feature %d we lack", i);
+			SAYM("r1md: 2a: MD requires feature %d we lack", i);
 			return false;
 		}
 	}
@@ -749,7 +786,7 @@ send_rt_data(const uint32_t *hs1_words)
 		delay_for_interval(10, NSEC_PER_MSEC);
 		busy = rd(ccif, APCCIF_BUSY);
 		if (busy & CCIF_BUSY_BIT15) {
-			SAY("r1md: 2a: CCIF still busy (%#x): the reply is NOT sent", busy);
+			SAYM("r1md: 2a: CCIF still busy (%#x): the reply is NOT sent", busy);
 			return false;
 		}
 	}
@@ -777,7 +814,7 @@ rb_word(vm_offset_t buf, uint32_t len, uint32_t pos)
 
 /* ---- sub-stage 2b: the TX path and the answers ---- */
 
-static uint32_t tx_seq[128];
+static uint32_t tx_seq[128], tx_logged;
 static uint32_t last_ans_op, last_ans_ms, ee_have;
 static char ee_text[64];
 
@@ -796,12 +833,12 @@ ring_tx(int q, uint32_t ch, uint32_t h0, uint32_t h1, uint32_t resv, const uint3
 	uint32_t L = CCCI_HEADER_LEN + bodybytes, padded = (L + 16 + 7) & ~7u, avail, seq, asrt, pos;
 
 	if (r >= len || w >= len || (r & 3) || (w & 3)) {
-		SAY("r1md: TX q%d ring pointers odd (r %#x w %#x): not sent", q, r, w);
+		SAYM("r1md: TX q%d ring pointers odd (r %#x w %#x): not sent", q, r, w);
 		return false;
 	}
 	avail = (r == w) ? len - 1 : (r < w ? len - w - 1 + r : r - w - 1);
 	if (padded >= avail) {
-		SAY("r1md: TX q%d full (need %#x, free %#x): not sent", q, padded, avail);
+		SAYM("r1md: TX q%d full (need %#x, free %#x): not sent", q, padded, avail);
 		return false;
 	}
 	seq = tx_seq[ch & 127]++ & 0x7fff;
@@ -828,7 +865,7 @@ ring_tx(int q, uint32_t ch, uint32_t h0, uint32_t h1, uint32_t resv, const uint3
 		wr(ccif, APCCIF_BUSY, 1u << q);
 		wr(ccif, 0x0c, q);      /* TCHNUM */
 	}
-	if (md_level < 5 || ch != 15) {
+	if (tx_logged++ < 5) {
 		SAY("r1md: [%u ms] tx q%d ch %u seq %u len %u", rel, q, ch, seq, L);
 	}
 	return true;
@@ -884,6 +921,9 @@ static const struct gpio_name gpio_names[] = {
 };
 
 /* the kernel's RPC answers (1.8). Returns the answer's op for the log, or 0 when nothing is sent (userspace ops). */
+static bool rpc_quiet;
+#define RSAY(...) do { if (!rpc_quiet) SAY(__VA_ARGS__); } while (0)
+
 static void
 rpc_serve(const uint32_t *pkt, uint32_t L, uint32_t ncopy, uint32_t rel)
 {
@@ -894,13 +934,13 @@ rpc_serve(const uint32_t *pkt, uint32_t L, uint32_t ncopy, uint32_t rel)
 	bool send = true;
 
 	if (L < 24 || ncopy < L || nargs > 6) {
-		SAY("r1md: RPC REQUEST NOT PARSED: op %#x nargs %u len %u (copied %u): NOT ANSWERED", op, nargs, L, ncopy);
+		SAYM("r1md: RPC REQUEST NOT PARSED: op %#x nargs %u len %u (copied %u): NOT ANSWERED", op, nargs, L, ncopy);
 		st2a.unanswered++;
 		return;
 	}
 	for (uint32_t i = 0; i < nargs; i++) {
 		if (off + 4 > L || off + 4 + ((pkt[off / 4] + 3) & ~3u) > L) {
-			SAY("r1md: RPC REQUEST BAD ARGS: op %#x arg %u: NOT ANSWERED", op, i);
+			SAYM("r1md: RPC REQUEST BAD ARGS: op %#x arg %u: NOT ANSWERED", op, i);
 			st2a.unanswered++;
 			return;
 		}
@@ -933,7 +973,7 @@ rpc_serve(const uint32_t *pkt, uint32_t L, uint32_t ncopy, uint32_t rel)
 			}
 		}
 		if (found < 0) {
-			SAY("r1md: RPC 0x4002 UNKNOWN GPIO NAME \"%s\" -> -5", name);
+			SAYM("r1md: RPC 0x4002 UNKNOWN GPIO NAME \"%s\" -> -5", name);
 			st = -5;
 			ob_word((uint32_t)-5);
 			ob_word((uint32_t)-5);
@@ -941,7 +981,7 @@ rpc_serve(const uint32_t *pkt, uint32_t L, uint32_t ncopy, uint32_t rel)
 			ob_word(gpio_names[found].pin);
 			ob_word(gpio_names[found].pin);
 		}
-		SAY("r1md: rpc op 0x4002 name \"%s\" -> pin %d", name, found < 0 ? -5 : (int)gpio_names[found].pin);
+		RSAY("r1md: rpc op 0x4002 name \"%s\" -> pin %d", name, found < 0 ? -5 : (int)gpio_names[found].pin);
 		break;
 	}
 	case 0x4005: {  /* GET_EINT_ATTR (name, ..., u32 type) */
@@ -949,12 +989,12 @@ rpc_serve(const uint32_t *pkt, uint32_t L, uint32_t ncopy, uint32_t rel)
 		int sim = strnstr(name, "SIM1", 48) ? 0 : (strnstr(name, "SIM2", 48) ? 1 : -1);
 
 		if (sim < 0 || !strnstr(name, "HOT_PLUG_EINT", 48) || nargs < 2) {
-			SAY("r1md: RPC 0x4005 UNKNOWN EINT NAME \"%s\" (nargs %u type %u) -> -11", name, nargs, type);
+			SAYM("r1md: RPC 0x4005 UNKNOWN EINT NAME \"%s\" (nargs %u type %u) -> -11", name, nargs, type);
 			ob_word((uint32_t)-11);
 			ob_word((uint32_t)-11);
 			st = -11;
 		} else if (type == 2 || type == 3 || type > 6) {
-			SAY("r1md: rpc op 0x4005 \"%s\" type %u (POLA/SENS/unknown: not in the DT) -> -12", name, type);
+			RSAY("r1md: rpc op 0x4005 \"%s\" type %u (POLA/SENS/unknown: not in the DT) -> -12", name, type);
 			ob_word((uint32_t)-12);
 			ob_word((uint32_t)-12);
 			st = -12;
@@ -962,37 +1002,37 @@ rpc_serve(const uint32_t *pkt, uint32_t L, uint32_t ncopy, uint32_t rel)
 			val = type == 6 ? (uint32_t)(sim + 1) : (type == 0 ? (uint32_t)sim : (type == 1 ? 10000u : 0u));
 			ob_word(0);
 			ob_word(val);
-			SAY("r1md: rpc op 0x4005 \"%s\" type %u -> 0, %u", name, type, val);
+			RSAY("r1md: rpc op 0x4005 \"%s\" type %u -> 0, %u", name, type, val);
 		}
 		break;
 	}
 	case 0x400e:    /* DTSI_QUERY: both md_attr_node properties are 0x0f0f0f0f */
 		ob_word(0);
 		ob_fill(68, 0x0f);
-		SAY("r1md: rpc op 0x400e DTSI_QUERY (arg0 len %u) -> 0, 68 x 0x0f", nargs ? alen[0] : 0);
+		RSAY("r1md: rpc op 0x400e DTSI_QUERY (arg0 len %u) -> 0, 68 x 0x0f", nargs ? alen[0] : 0);
 		break;
 	case 0x4006:
 	case 0x4007:    /* GPIO_VAL / ADC_VAL: no level known (GUESS 0); ADC -1 */
 		ob_word(op == 0x4007 ? (uint32_t)-1 : 0);
 		ob_word(op == 0x4007 ? (uint32_t)-1 : 0);
-		SAY("r1md: RPC op %#x \"%s\" answered with a GUESS (%d)", op, name, op == 0x4007 ? -1 : 0);
+		SAYM("r1md: RPC op %#x \"%s\" answered with a GUESS (%d)", op, name, op == 0x4007 ? -1 : 0);
 		break;
 	case 0x4003:
 	case 0x4001:
 		ob_word((uint32_t)-5);
 		ob_word((uint32_t)-5);
-		SAY("r1md: rpc op %#x -> -5, -5", op);
+		RSAY("r1md: rpc op %#x -> -5, -5", op);
 		break;
 	case 0x4004:
 		ob_word((uint32_t)-5);
 		ob_word((uint32_t)-5);
 		ob_word((uint32_t)-5);
-		SAY("r1md: rpc op 0x4004 -> -5 x3");
+		RSAY("r1md: rpc op 0x4004 -> -5 x3");
 		break;
 	case 0x4009:    /* GET_GPIO_ADC: {4, 0} + 32 (161-byte input) or 88 (425-byte input) bytes of 0x0f; no pins found (log) */
 		ob_word(0);
 		ob_fill(nargs && alen[0] >= 400 ? 88 : 32, 0x0f);
-		SAY("r1md: rpc op 0x4009 GET_GPIO_ADC (arg0 len %u) -> 0, %u x 0x0f (no found pins)", nargs ? alen[0] : 0, nargs && alen[0] >= 400 ? 88 : 32);
+		RSAY("r1md: rpc op 0x4009 GET_GPIO_ADC (arg0 len %u) -> 0, %u x 0x0f (no found pins)", nargs ? alen[0] : 0, nargs && alen[0] >= 400 ? 88 : 32);
 		break;
 	case 0x4012: {
 		uint32_t rnd = 0;
@@ -1000,26 +1040,26 @@ rpc_serve(const uint32_t *pkt, uint32_t L, uint32_t ncopy, uint32_t rel)
 		read_random(&rnd, sizeof(rnd));
 		ob_word(0);
 		ob_word(rnd);
-		SAY("r1md: rpc op 0x4012 TRNG -> 0, <random>");
+		RSAY("r1md: rpc op 0x4012 TRNG -> 0, <random>");
 		break;
 	}
 	case 0x4013:    /* QUERY_CARD_TYPE: the inputs echoed */
 		for (uint32_t i = 0; i < nargs; i++) {
 			ob_copy(pb + aoff[i], alen[i]);
 		}
-		SAY("r1md: rpc op 0x4013 QUERY_CARD_TYPE: %u inputs echoed", nargs);
+		RSAY("r1md: rpc op 0x4013 QUERY_CARD_TYPE: %u inputs echoed", nargs);
 		break;
 	case 0x4321:
 		ob_word(1);
 		ob_word(0xa5a5);
-		SAY("r1md: rpc op 0x4321 IT_OP -> 1, 0xa5a5");
+		RSAY("r1md: rpc op 0x4321 IT_OP -> 1, 0xa5a5");
 		break;
 	case 0x400f: case 0x4010: case 0x4011: case 0x4014: case 0x4015:
-		SAY("r1md: USER-SPACE RPC op %#x nargs %u arg0 len %u: logged, NOT ANSWERED", op, nargs, nargs ? alen[0] : 0);
+		SAYM("r1md: USER-SPACE RPC op %#x nargs %u arg0 len %u: logged, NOT ANSWERED", op, nargs, nargs ? alen[0] : 0);
 		send = false;
 		break;
 	default:
-		SAY("r1md: UNKNOWN RPC op %#x nargs %u arg0 len %u \"%s\": answered -1", op, nargs, nargs ? alen[0] : 0, name);
+		SAYM("r1md: UNKNOWN RPC op %#x nargs %u arg0 len %u \"%s\": answered -1", op, nargs, nargs ? alen[0] : 0, name);
 		ob_word((uint32_t)-1);
 		st = -1;
 		break;
@@ -1095,6 +1135,26 @@ static uint8_t *fs_req[FS_SLOTS];
 static uint32_t fs_have[FS_SLOTS], fs_last_ms, fs_bad;
 static uint32_t *fs_out, fs_frag[1 + FS_FRAG / 4];
 
+/* attempt 3: every FS request after EFUN=1 (the attach window), logged compactly (cap 25) + counters for RESULT 2f-A */
+static uint32_t fsw_ops, fsw_err, fsw_wr, fsw_logged;
+
+static void
+fs_window(uint32_t op, uint32_t rel)
+{
+	const char *l = mdfs_last(), *a = strnstr(l, " -> ", strlen(l));
+
+	fsw_ops++;
+	if (a && strtol(a + 4, NULL, 10) < 0) {
+		fsw_err++;
+	}
+	if (op == 0x1004 || op == 0x1025) {
+		fsw_wr++;
+	}
+	if (fsw_logged++ < 25) {
+		SAYM("r1md: [%u ms] fs* op %#x %s", rel, op, l);
+	}
+}
+
 static void
 fs_rx(const uint32_t *pkt, uint32_t L, uint32_t data0, uint32_t slot, uint32_t rel)
 {
@@ -1102,7 +1162,7 @@ fs_rx(const uint32_t *pkt, uint32_t L, uint32_t data0, uint32_t slot, uint32_t r
 
 	if (slot >= FS_SLOTS || L < 0x14 || L > FS_BUF || fs_out == NULL) {
 		fs_bad++;
-		SAY("r1md: fs REQUEST DROPPED: slot %u len %u", slot, L);
+		SAYM("r1md: fs REQUEST DROPPED: slot %u len %u", slot, L);
 		return;
 	}
 	if (fs_req[slot] == NULL && (fs_req[slot] = kalloc_data(FS_BUF, Z_WAITOK | Z_ZERO)) == NULL) {
@@ -1117,13 +1177,16 @@ fs_rx(const uint32_t *pkt, uint32_t L, uint32_t data0, uint32_t slot, uint32_t r
 	} else {
 		fs_bad++;
 		fs_have[slot] = 0;
-		SAY("r1md: fs request too long: dropped");
+		SAYM("r1md: fs request too long: dropped");
 		return;
 	}
 	if (data0 & 0x80000000u) {
 		return;         /* more fragments follow */
 	}
 	n = mdfs_handle(fs_req[slot] + 0x10, fs_have[slot] - 0x10, fs_out);
+	if (rd_t_on) {
+		fs_window(*(const uint32_t *)(fs_req[slot] + 0x10), rel);
+	}
 	fs_have[slot] = 0;
 	fs_last_ms = rel;
 	body = n - 4;
@@ -1137,7 +1200,7 @@ fs_rx(const uint32_t *pkt, uint32_t L, uint32_t data0, uint32_t slot, uint32_t r
 			delay_for_interval(1, NSEC_PER_MSEC);
 		}
 		if (!ok) {
-			SAY("r1md: fs REPLY NOT SENT (the TX ring stayed full)");
+			SAYM("r1md: fs REPLY NOT SENT (the TX ring stayed full)");
 			return;
 		}
 		sent += chunk;
@@ -1226,9 +1289,9 @@ static int creg_stat = -1;
 /* attempt 2: EPS registration evidence, reject cause, RRC state, kept for RESULT 2e-2 */
 static bool eps_reg, stat3_pend, rej_perm, held_started, final_diag;
 static int cs_stat = -1, ereg_stat = -1, rej_type = -1, rej_cause = -1, cscon_n;
-static uint32_t n_stat3, diag_rounds, cscon1_ms_v, eps_reg_at;
+static uint32_t n_stat3, diag_rounds, cscon1_ms_v, eps_reg_at, stat3_ms_v;
+static bool cldma_on, cl_fatal;     /* cldma_on: boot-arg r1_md_cldma=1 (redwood_cldma.c) */
 static char eps_seq[28], eps_src[12] = "-", eiareg_s[40], ceer_s[64];
-static uint32_t rd_t_on;
 /* 2e-2 bookkeeping (RESULT 2e-2): EFUN=1 timing, operator/RAT/signal, detach, the post-radio-on channel counts */
 static bool efun1_to, at_to, detach_seen, held_ok = true;
 static uint32_t efun1_ok_ms, oth_new, oth_new_ch, n_quiet, n34, n38, late_logged;
@@ -1310,6 +1373,92 @@ fnv32(const char *s, uint32_t n)
 	return h;
 }
 
+/* the periodic queries: their echo is not logged and their response only when it differs from the last one */
+static bool
+at_periodic(const char *c)
+{
+	return !strcmp(c, "AT+CEREG?") || !strcmp(c, "AT+CSQ") || !strcmp(c, "AT+CSCON?") || !strcmp(c, "AT+EREG?") || !strcmp(c, "AT+COPS?") ||
+	       !strcmp(c, "AT+CGATT?");
+}
+
+static bool at_is_urc(const char *cmd, const char *l);
+
+/* hash of the response's non-URC lines and the final result; true = the same as the last response to this command */
+static bool
+at_same_as_last(const char *cmd, const char *final)
+{
+	static uint32_t keys[8], sigs[8], nk;
+	uint32_t h = fnv32(final, (uint32_t)strlen(final)), ck = fnv32(cmd, (uint32_t)strlen(cmd)), k;
+	char tmp[120];
+
+	for (const char *p = at_resp; p < at_resp + at_rlen;) {
+		const char *e = memchr(p, '\n', (size_t)(at_resp + at_rlen - p));
+		uint32_t n = e ? (uint32_t)(e - p) : (uint32_t)(at_resp + at_rlen - p);
+
+		n = n < sizeof(tmp) - 1 ? n : (uint32_t)sizeof(tmp) - 1;
+		memcpy(tmp, p, n);
+		tmp[n] = 0;
+		if (!at_is_urc(cmd, tmp)) {
+			h = (h ^ fnv32(tmp, n)) * 16777619u;
+		}
+		p = e ? e + 1 : at_resp + at_rlen;
+	}
+	for (k = 0; k < nk && keys[k] != ck; k++) {
+	}
+	if (k < nk && sigs[k] == h) {
+		return true;
+	}
+	if (k == nk && nk < 8) {
+		keys[nk++] = ck;
+	}
+	if (k < 8) {
+		sigs[k] = h;
+	}
+	return false;
+}
+
+static uint32_t csv_split(const char *v, char f[][20], uint32_t n);
+
+/* +ECSQ: log the first 3, then only a rsrp (x4, field 7) move of 3 dB or more, or the cell lost/found (field 1 = 255) */
+static bool
+ecsq_log(const char *l)
+{
+	static uint32_t n;
+	static int last, lost;
+	char f[10][20];
+	uint32_t nf = csv_split(l + 6, f, 10);
+	int rsrp, lnow;
+	bool chg;
+
+	if (nf < 7) {
+		return true;
+	}
+	rsrp = (int)strtol(f[6], NULL, 10);
+	lnow = strtol(f[0], NULL, 10) == 255;
+	chg = lnow != lost || (!lnow && (rsrp > last ? rsrp - last : last - rsrp) >= 12);
+	if (n++ < 3 || chg) {
+		last = rsrp;
+		lost = lnow;
+		return true;
+	}
+	return false;
+}
+
+static bool
+urc_must(const char *l)
+{
+	static const char *const p[] = { "+CEREG", "+CREG", "+CGREG", "+EREG", "+EGREG", "+CSCON", "+EIAREG", "+CGEV", "+ECCAUSE", "+PSBEARER", "+EPSB", "+EIND" };
+
+	for (unsigned i = 0; i < sizeof(p) / sizeof(p[0]); i++) {
+		size_t n = strlen(p[i]);
+
+		if (!strncmp(l, p[i], n) && l[n] == ':') {
+			return true;
+		}
+	}
+	return false;
+}
+
 static bool
 at_send(const char *cmd, uint32_t rel)
 {
@@ -1324,7 +1473,7 @@ at_send(const char *cmd, uint32_t rel)
 		listed = false;
 	}
 	if (!listed || n > 20) {
-		SAY("r1md: at REFUSED \"%s\" (not on the whitelist)", cmd);
+		SAYM("r1md: at REFUSED \"%s\" (not on the whitelist)", cmd);
 		at_refused = true;
 		return false;
 	}
@@ -1334,7 +1483,9 @@ at_send(const char *cmd, uint32_t rel)
 	if (!ring_tx(5, 12, 0, CCCI_HEADER_LEN + n + 1, 0, body, n + 1, rel)) {
 		return false;
 	}
-	SAY("r1md: [%u ms] AT> %s", rel, cmd);
+	if (!(rd_t_on && at_periodic(cmd))) {
+		SAY("r1md: [%u ms] AT> %s", rel, cmd);
+	}
 	strlcpy(at_lastcmd, cmd, sizeof(at_lastcmd));
 	at_to = false;
 	return true;
@@ -1403,6 +1554,9 @@ fnum(char f[][20], uint32_t nf, uint32_t i)
 	return (i < nf && f[i][0] >= '0' && f[i][0] <= '9') ? (int)strtol(f[i], NULL, 10) : -1;
 }
 
+static uint32_t chg_n;          /* radio: +CEREG / +CSCON change lines (cap 24 together) */
+static int cscon_last = -2;
+
 static void
 eps_mark(const char *src, uint32_t rel)
 {
@@ -1438,9 +1592,15 @@ reg_note(bool is_cereg, const char *v, bool query_ctx, uint32_t rel)
 			eps_seq[sl++] = (char)('0' + stat % 10);
 			eps_seq[sl] = 0;
 		}
+		if (stat != creg_stat && rd_t_on && chg_n++ < 24) {
+			SAYM("r1md: [%u ms] radio: +CEREG stat %d (was %d), EFUN=1 +%u ms", rel, stat, creg_stat, rel - rd_t_on);
+		}
 		if (stat == 3 && creg_stat != 3) {
 			n_stat3++;
 			stat3_pend = true;
+			if (!stat3_ms_v && rd_t_on) {
+				stat3_ms_v = rel - rd_t_on + 1;
+			}
 		}
 		creg_stat = stat;
 		if (stat == 1 || stat == 5) {
@@ -1497,6 +1657,10 @@ at_note(const char *l, uint32_t rel)
 		const char *c = strchr(l, ',');
 		bool q = wq && !strcmp(at_seq[at_idx], "AT+CSCON?") && c && nf > 1;      /* query: +CSCON: <n>,<mode>[,...] */
 
+		if (rd_t_on && fnum(f, nf, q ? 1 : 0) != cscon_last && chg_n++ < 24) {
+			SAYM("r1md: [%u ms] radio: +CSCON %d (was %d), EFUN=1 +%u ms", rel, fnum(f, nf, q ? 1 : 0), cscon_last, rel - rd_t_on);
+		}
+		cscon_last = fnum(f, nf, q ? 1 : 0);
 		if (fnum(f, nf, q ? 1 : 0) == 1 && rd_t_on && !cscon1_ms_v) {
 			cscon1_ms_v = rel - rd_t_on + 1;
 		}
@@ -1568,13 +1732,17 @@ at_finish(const char *final, uint32_t rel)
 	int val = -1;
 	bool is_id = !strcmp(cmd, "AT+CGSN"), is_cpin = !strcmp(cmd, "AT+CPIN?");
 	uint32_t digits = 0, sn = 0;
-	bool luhn = false;
+	bool luhn = false, suppress = false;
 	char idbuf[20];
 
 	show[0] = 0;
 	idbuf[0] = 0;
 	at_last_ok = !strcmp(final, "OK");
 	at_resp[at_rlen] = 0;
+	if (md_level >= 7 && rd_t_on && at_periodic(cmd) && at_same_as_last(cmd, final)) {
+		suppress = true;
+		md_sup++;
+	}
 	for (line = at_resp; line && *line; line = next) {
 		next = strchr(line, '\n');
 		if (next) {
@@ -1617,7 +1785,9 @@ at_finish(const char *final, uint32_t rel)
 			}
 			at_safe(line, one, sizeof(one));
 			if (md_level >= 7) {
-				SAY("r1md: [%u ms] AT< %s: %s%s", rel, cmd, at_is_urc(cmd, line) ? "[urc] " : "", one);
+				if (!suppress || at_is_urc(cmd, line)) {
+					redwood_md_say(at_is_urc(cmd, line) && urc_must(line), "r1md: [%u ms] AT< %s: %s%s", rel, cmd, at_is_urc(cmd, line) ? "[urc] " : "", one);
+				}
 			} else {
 				sn += (uint32_t)snprintf(show + sn, sizeof(show) - sn, "%s%s", sn ? "|" : "", one);
 			}
@@ -1638,7 +1808,9 @@ at_finish(const char *final, uint32_t rel)
 		}
 	} else {
 		if (md_level >= 7) {
-			SAY("r1md: [%u ms] AT< %s: %s", rel, cmd, final);
+			if (!suppress) {
+				SAY("r1md: [%u ms] AT< %s: %s", rel, cmd, final);
+			}
 		} else {
 			SAY("r1md: [%u ms] AT< %s: %s; text \"%s\"", rel, cmd, final, show);
 		}
@@ -1671,7 +1843,7 @@ at_finish(const char *final, uint32_t rel)
 
 			snprintf(sim_cpin, sizeof(sim_cpin), "CME %d", e);
 			if (e == 14 && rel - cpin_t0 < 20000) {     /* busy: the SIM is still starting; ask again in 2 s, up to 20 s in all */
-				SAY("r1md: [%u ms] CPIN busy: asking again in 2 s", rel);
+				SAYM("r1md: [%u ms] CPIN busy: asking again in 2 s", rel);
 				at_wait = false;
 				at_last_ms = rel;
 				at_not_before = rel + 2000;
@@ -1679,7 +1851,7 @@ at_finish(const char *final, uint32_t rel)
 			}
 		}
 		if (!strcmp(sim_cpin, "SIM PIN") || !strcmp(sim_cpin, "SIM PUK")) {
-			SAY("r1md: [%u ms] the SIM wants a PIN/PUK: none is ever sent, stopping", rel);
+			SAYM("r1md: [%u ms] the SIM wants a PIN/PUK: none is ever sent, stopping", rel);
 			at_stop = true;
 		}
 	}
@@ -1687,14 +1859,14 @@ at_finish(const char *final, uint32_t rel)
 		efun1_ok_ms = rel - at_sent_ms + 1;     /* +1: 0 means "no OK seen" */
 	}
 	if (md_level >= 7 && !strcmp(cmd, "AT+ESIMS") && sim_esims == 0) {
-		SAY("r1md: [%u ms] +ESIMS: 0, no SIM: stopping", rel);
+		SAYM("r1md: [%u ms] +ESIMS: 0, no SIM: stopping", rel);
 		at_stop = true;
 	}
 	at_wait = false;
 	at_last_ms = rel;
 	at_idx++;
 	if (at_radio_on && !rd_active) {
-		SAY("r1md: *** RADIO ON BY DEFAULT (CFUN %d, EFUN %d): nothing more is sent, the run ends now ***", at_radio_val[0], at_radio_val[1]);
+		SAYM("r1md: *** RADIO ON BY DEFAULT (CFUN %d, EFUN %d): nothing more is sent, the run ends now ***", at_radio_val[0], at_radio_val[1]);
 		at_done = true;
 	} else if (at_stop || at_idx >= at_n) {
 		at_done = true;
@@ -1726,7 +1898,7 @@ at_line(const char *l, uint32_t rel)
 		return;
 	}
 	if (md_level >= 7 && at_is_final(l) && late_logged++ < 20) {
-		SAY("r1md: [%u ms] late final for %s: %s (no command outstanding)", rel, at_lastcmd[0] ? at_lastcmd : "(none)", l);
+		SAYM("r1md: [%u ms] late final for %s: %s (no command outstanding)", rel, at_lastcmd[0] ? at_lastcmd : "(none)", l);
 		return;
 	}
 	if (at_unsol++ < (rd_t_on ? 800u : (md_level >= 7 ? 200u : 80u)) && (!st2a.hs2 || rd_t_on || rel - st2a.t_hs2 <= 60000)) {
@@ -1738,7 +1910,11 @@ at_line(const char *l, uint32_t rel)
 				char one[120];
 
 				at_safe(l, one, sizeof(one));
-				SAY("r1md: [%u ms] AT unsolicited %s", rel, one);
+				if (!strncmp(l, "+ECSQ:", 6) && !ecsq_log(l)) {
+					md_sup++;
+					return;
+				}
+				redwood_md_say(urc_must(l), "r1md: [%u ms] AT unsolicited %s", rel, one);
 				return;
 			}
 			while (l[n] && l[n] != ':' && n < sizeof(pre) - 1) {
@@ -1801,7 +1977,7 @@ at_step(uint32_t rel)
 		uint32_t to = !strcmp(cmd, "AT+EFUN=0") ? 30000u : (!strcmp(cmd, "AT+EFUN=1") ? 10000u : 5000u);
 
 		if (rel - at_sent_ms >= to) {
-			SAY("r1md: [%u ms] AT< %s: TIMEOUT (%u s without a final result)", rel, cmd, to / 1000);
+			SAYM("r1md: [%u ms] AT< %s: TIMEOUT (%u s without a final result)", rel, cmd, to / 1000);
 			at_dump(cmd, rel);
 			at_last_ok = false;
 			at_to = true;
@@ -1824,11 +2000,15 @@ at_step(uint32_t rel)
 	if (!strcmp(at_seq[at_idx], "AT+CPIN?") && !cpin_t0) {
 		cpin_t0 = rel;
 	}
+	if (!strcmp(at_seq[at_idx], "AT+EFUN=1")) {
+		cldma_snap("pre-radio", rel, md1_is_on());
+	}
 	if (at_send(at_seq[at_idx], rel)) {
 		at_wait = true;
 		at_sent_ms = rel;
 		if (!strcmp(at_seq[at_idx], "AT+EFUN=1")) {
 			rd_t_on = rel;
+			md_budget = 26000;      /* the radio phase gets its own headroom */
 		}
 	} else {
 		if (md_level == 6) {
@@ -1838,7 +2018,7 @@ at_step(uint32_t rel)
 	}
 }
 
-static uint32_t oth_logged[256];
+static uint32_t oth_logged[256], rpc_keys[32], rpc_nkeys, rpc_dups, rpc_win;
 static uint32_t rpc_ops[8], rpc_nops;
 static bool rpc_bad;     /* an RPC op other than the stock set (0x4005, 0x400e) was asked, or too many different ones */
 static uint32_t pktbuf[0x4100 / 4 + 4];
@@ -1885,7 +2065,7 @@ drain_one(int q, uint32_t rel)
 	const uint8_t *pb = (const uint8_t *)pkt;
 
 	if (r >= len || w >= len || (r & 3) || (w & 3)) {
-		SAY("r1md: q%d rx ring garbage at %#x (w %#x)", q, r, w);
+		SAYM("r1md: q%d rx ring garbage at %#x (w %#x)", q, r, w);
 		st2a.garbage[q] = true;
 		return false;
 	}
@@ -1897,7 +2077,7 @@ drain_one(int q, uint32_t rel)
 	padded = (L + 16 + 7) & ~7u;
 	if (rb_word(buf, len, r) != RING_MAGIC_HEAD || L < CCCI_HEADER_LEN || L > 0x4100 || padded > avail ||
 	    rb_word(buf, len, r + 8 + ((L + 7) & ~7u)) != RING_MAGIC_TAIL || rb_word(buf, len, r + 12 + ((L + 7) & ~7u)) != RING_MAGIC_TAIL) {
-		SAY("r1md: q%d rx ring garbage at %#x (w %#x): head %#x len %#x foot %#x %#x", q, r, w, rb_word(buf, len, r), L,
+		SAYM("r1md: q%d rx ring garbage at %#x (w %#x): head %#x len %#x foot %#x %#x", q, r, w, rb_word(buf, len, r), L,
 		    rb_word(buf, len, r + 8 + ((L + 7) & ~7u)), rb_word(buf, len, r + 12 + ((L + 7) & ~7u)));
 		st2a.garbage[q] = true;
 		return false;
@@ -1931,7 +2111,7 @@ drain_one(int q, uint32_t rel)
 	if (ch == 0) {
 		st2a.ctl++;
 		if (data1 == 0 && resv != MD_INIT_CHK_ID) {
-			SAY("r1md: [%u ms] HS2 (MD_NORMAL_BOOT) received", rel);
+			SAYM("r1md: [%u ms] HS2 (MD_NORMAL_BOOT) received", rel);
 			st2a.hs2 = true;
 			st2a.t_hs2 = rel;
 			if (md_level >= 6) {
@@ -1995,9 +2175,27 @@ drain_one(int q, uint32_t rel)
 			}
 			name[n] = 0;
 		}
-		SAY("r1md: rpc request op %#x nargs %u arg0 len %u \"%s\" (buffer %u)", op, nargs, L >= 28 ? pkt[6] : 0, name, resv);
+		{
+			uint32_t key = fnv32(name, (uint32_t)strlen(name)) ^ (op * 2654435761u), k;
+
+			for (k = 0; k < rpc_nkeys && rpc_keys[k] != key; k++) {
+			}
+			rpc_quiet = k < rpc_nkeys;
+			if (rpc_quiet) {
+				rpc_dups++;
+			} else {
+				if (rpc_nkeys < 32) {
+					rpc_keys[rpc_nkeys++] = key;
+				}
+				SAY("r1md: rpc request op %#x nargs %u arg0 len %u \"%s\" (buffer %u)", op, nargs, L >= 28 ? pkt[6] : 0, name, resv);
+			}
+		}
+		if (rd_t_on) {
+			rpc_win++;
+		}
 		if (md_level >= 4) {
 			rpc_serve(pkt, L, ncopy, rel);
+			rpc_quiet = false;
 		}
 	} else if (ch == 2) {
 		st2a.sys++;
@@ -2047,7 +2245,7 @@ ee_dump(bool strings)
 			for (uint32_t l = 0; l < 4; l++) {
 				volatile uint32_t *x = p + (base + l * 32) / 4;
 
-				SAY("r1md: ee dbg +%#x: %08x %08x %08x %08x %08x %08x %08x %08x", base + l * 32, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]);
+				SAYM("r1md: ee dbg +%#x: %08x %08x %08x %08x %08x %08x %08x %08x", base + l * 32, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]);
 			}
 		}
 		return;
@@ -2074,7 +2272,7 @@ ee_dump(bool strings)
 				strlcpy(ee_text, s, sizeof(ee_text));
 				ee_have = (strnstr(s, ".c", 61) || strnstr(s, ".h", 61)) ? 2 : 1;
 			}
-			SAY("r1md: ee str +%#x: \"%s\"", start, s);
+			SAYM("r1md: ee str +%#x: \"%s\"", start, s);
 			runs++;
 		}
 		i++;
@@ -2235,10 +2433,10 @@ read_hs1(uint32_t elapsed)
 	SAY("r1md: [%u ms] ccci_header data0 %#x data1 %#x channel %u seq %u reserved %#x", elapsed, data0, data1, chseq & 0xffff,
 	    (chseq >> 16) & 0x7fff, reserved);
 	if ((chseq & 0xffff) != 0 || data1 != MD_INIT_START_BOOT || reserved != MD_INIT_CHK_ID) {
-		SAY("r1md: [%u ms] the CCIF SRAM message is NOT HS1", elapsed);
+		SAYM("r1md: [%u ms] the CCIF SRAM message is NOT HS1", elapsed);
 		return false;
 	}
-	SAY("r1md: [%u ms] HS1 (MD_INIT_START_BOOT, CHK_ID) received from the modem in the CCIF SRAM", elapsed);
+	SAYM("r1md: [%u ms] HS1 (MD_INIT_START_BOOT, CHK_ID) received from the modem in the CCIF SRAM", elapsed);
 	SAY("r1md: [%u ms] md_query_ap_feature head %#x tail %#x: %s", elapsed, head, tail,
 	    (head == MD_FEATURE_QUERY_PATTERN && tail == MD_FEATURE_QUERY_PATTERN) ? "pattern 0x49434343 present (both)" : "PATTERN WRONG");
 	for (int i = 0; i < MD_FEATURE_COUNT; i++) {
@@ -2269,7 +2467,9 @@ gate_out(int n, const char *name, int res, const char *fmt, ...)
 	va_start(ap, fmt);
 	vsnprintf(d, sizeof(d), fmt, ap);
 	va_end(ap);
-	SAY("r1md: gate %d %s: %s %s", n, name, res == 0 ? "pass" : (res == 1 ? "FAIL" : "pending reference"), d);
+	if (res != 0) {         /* passing gates are in the summary line "gates N/10" */
+		SAYM("r1md: gate %d %s: %s %s", n, name, res == 1 ? "FAIL" : "pending reference", d);
+	}
 	if (res == 0) {
 		gates_pass++;
 	} else {
@@ -2330,6 +2530,7 @@ gates_eval(uint32_t sta0, uint32_t sta1, bool exc)
 	gate_out(10, "physical", (bat && (soc >= 30 || chg) && tmp && temp < 50 && !had_wifi && g_connsys < 12) ? 0 : 1,
 		"battery %d%% charger %s%s, SoC %d C%s, Wi-Fi %s (wifi arg %u, connsys_step %u)", soc, chg ? "in" : "out", bat ? "" : " (not read)", temp,
 		tmp ? "" : " (not read)", (had_wifi || g_connsys >= 12) ? "ON" : "off", had_wifi, g_connsys);
+	SAYM("r1md: gates %u/10%s%s", gates_pass, gates_bad[0] ? "; not passed: " : "", gates_bad);
 }
 
 /* the one RESULT 2e-1 line: said as soon as the gates are in (the kept log fills up; the verbose summaries come after) */
@@ -2344,7 +2545,7 @@ result_2e1(bool exc)
 		return;
 	}
 	result_said = true;
-	SAY("r1md: RESULT 2e-1: SIM %s (ESIMS %d), EFUN %d CFUN %d%s, gates passed %u of 10%s%s", sim, sim_esims, at_radio_val[1], at_radio_val[0],
+	SAYM("r1md: RESULT 2e-1: SIM %s (ESIMS %d), EFUN %d CFUN %d%s, gates passed %u of 10%s%s", sim, sim_esims, at_radio_val[1], at_radio_val[0],
 	    at_radio_on ? " RADIO ON BY DEFAULT" : "", gates_pass, gates_bad[0] ? ", not passed: " : "", gates_bad);
 }
 
@@ -2355,6 +2556,8 @@ static int rp = RP_PRE;
 static bool rp_new = true, rp_failed;
 static uint32_t rp_t, rp_ereg, rp_csq, rp_reg_ms;
 static char rp_why[40];
+
+static void result_2fa(const char *tag, uint32_t rel);
 
 static void
 radio_load(const char *const *seq, uint32_t n)
@@ -2370,7 +2573,7 @@ static void
 radio_stop(const char *why)
 {
 	if (rp < RP_OFF) {
-		SAY("r1md: radio: stopping (%s): AT+EFUN=0", why);
+		SAYM("r1md: radio: stopping (%s): AT+EFUN=0", why);
 		strlcpy(rp_why, why, sizeof(rp_why));
 		rp_failed = true;
 		rp = RP_OFF;
@@ -2380,6 +2583,8 @@ radio_stop(const char *why)
 
 /* the two RESULT 2e-2 lines (each under the ~160-char log cap); said once, as soon as the off sequence ends (or at the end of the run) */
 static bool result2_said;
+static const char *res_tag = "end";
+static uint32_t res_rel;
 static int off_try = 0, off_ph = 0, efun_final = -2;
 static uint32_t off_tm;
 static const char *off_res = "none";
@@ -2395,6 +2600,7 @@ result_2e2(uint32_t rel)
 		return;
 	}
 	result2_said = true;
+	res_rel = rel;
 	if (cscon1_ms_v) {
 		snprintf(cs, sizeof(cs), "%d ms", (int)cscon1_ms_v - 1);
 	} else {
@@ -2405,13 +2611,14 @@ result_2e2(uint32_t rel)
 	} else {
 		strlcpy(rg, "never", sizeof(rg));
 	}
-	SAY("r1md: RESULT 2e-2: %s; EFUN=1 OK %d ms; CSCON1 %s; eps %s; reg %s; held %s", rp_failed ? rp_why : "completed", efun1_ok_ms ? (int)efun1_ok_ms - 1 : -1, cs,
+	SAYM("r1md: RESULT 2e-2: %s; EFUN=1 OK %d ms; CSCON1 %s; eps %s; reg %s; held %s", rp_failed ? rp_why : "completed", efun1_ok_ms ? (int)efun1_ok_ms - 1 : -1, cs,
 	    eps_seq[0] ? eps_seq : "-", rg, held_started ? (held_ok ? "yes" : "NO") : "n/a");
-	SAY("r1md: RESULT 2e-2b: reject type %d cause %d n3 %u cs %d; op %s RAT %d csq %d; EFUN=0 x%d %s, EFUN? %d, detach %s; on %u ms", rej_type, rej_cause, n_stat3,
+	SAYM("r1md: RESULT 2e-2b: reject type %d cause %d n3 %u cs %d; op %s RAT %d csq %d; EFUN=0 x%d %s, EFUN? %d, detach %s; on %u ms", rej_type, rej_cause, n_stat3,
 	    cs_stat, rp_op, rp_rat, rp_csqv, off_try, off_res, efun_final, detach_seen ? "seen" : "no", rd_t_on ? rel - rd_t_on : 0);
-	SAY("r1md: RESULT 2e-2c: ch34 %u ch38 %u new ch %u/%u pkts quiet %u; eiareg \"%s\"; diag rounds %u; ereg stat %d; hold %s", n34, n38, oth_new_ch, oth_new, n_quiet,
+	SAYM("r1md: RESULT 2e-2c: ch34 %u ch38 %u new ch %u/%u pkts quiet %u; eiareg \"%s\"; diag rounds %u; ereg stat %d; hold %s", n34, n38, oth_new_ch, oth_new, n_quiet,
 	    eiareg_s, diag_rounds, ereg_stat, held_started ? "reached" : "not reached");
-	SAY("r1md: RESULT 2e-2d: ceer \"%s\"", ceer_s);
+	SAYM("r1md: RESULT 2e-2d: ceer \"%s\"", ceer_s);
+	result_2fa(res_tag, rel);
 }
 
 /* the off sequence: one command at a time (at_step is the only sender and sends nothing while at_wait). Plain AT+EFUN=0 (30 s), a quiet wait,
@@ -2425,7 +2632,7 @@ off_drive(uint32_t rel)
 		return;         /* the command in flight (EFUN=1 included) gets its result, or its timeout, first */
 	}
 	if (efun1_to) {         /* EFUN=1 never answered: the AT engine is not listening, EFUN=0 would not be heard either */
-		SAY("r1md: radio: AT+EFUN=1 timed out: EFUN=0 skipped, MD1 powered down");
+		SAYM("r1md: radio: AT+EFUN=1 timed out: EFUN=0 skipped, MD1 powered down");
 		off_res = "skipped";
 		rp = RP_END;
 		rd_active = false;
@@ -2466,7 +2673,7 @@ off_drive(uint32_t rel)
 			off_ph = 0;     /* not confirmed off: one more EFUN=0 + EFUN? */
 			break;
 		}
-		SAY("r1md: radio: off sequence done: EFUN=0 %d tries (%s), AT+EFUN? -> %d%s", off_try, off_res, efun_final, efun_final == 0 ? " (confirmed off)" : " (NOT confirmed)");
+		SAYM("r1md: radio: off sequence done: EFUN=0 %d tries (%s), AT+EFUN? -> %d%s", off_try, off_res, efun_final, efun_final == 0 ? " (confirmed off)" : " (NOT confirmed)");
 		rp = RP_END;
 		rd_active = false;
 		result_2e2(rel);
@@ -2483,6 +2690,31 @@ radio_drive(uint32_t rel)
 	if (!radio_go) {
 		rd_active = false;
 		return;
+	}
+	if (rd_t_on) {
+		static bool a_reg, a_s3, a_60, snp[3];
+
+		if (eps_reg && !a_reg) {
+			a_reg = true;
+			result_2fa("reg", rel);
+		}
+		if (n_stat3 && !a_s3) {
+			a_s3 = true;
+			cldma_snap("first stat 3", rel, md1_is_on());
+			result_2fa("stat3", rel);
+		}
+		if (t >= 60000 && !a_60) {
+			a_60 = true;
+			result_2fa("60s", rel);
+		}
+		for (int i = 0; i < 3; i++) {
+			static const uint32_t at_ms[3] = { 1000, 5000, 15000 };
+
+			if (t >= at_ms[i] && !snp[i]) {
+				snp[i] = true;
+				cldma_snap(i == 0 ? "+1s" : (i == 1 ? "+5s" : "+15s"), rel, md1_is_on());
+			}
+		}
 	}
 	if (rp < RP_OFF) {
 		if (rd_t_on && t >= 240000) {
@@ -2527,14 +2759,14 @@ radio_drive(uint32_t rel)
 	case RP_WAIT:
 		if (eps_reg) {
 			rp_reg_ms = eps_reg_at - 1;
-			SAY("r1md: radio: registered (%s) %u ms after the radio-on command", eps_src, rp_reg_ms);
+			SAYM("r1md: radio: registered (%s) %u ms after the radio-on command", eps_src, rp_reg_ms);
 			rp = RP_POST;
 			rp_new = true;
 		} else if (stat3_pend && diag_rounds < 3) {
 			/* a single stat 3 is not final (T3411 retries): read the cause and keep listening, unless the cause is a permanent one */
 			stat3_pend = false;
 			diag_rounds++;
-			SAY("r1md: radio: EPS stat 3 (#%u): diagnostics round %u (CEER, CEREG?, EREG?, EGREG?, CSCON?)", n_stat3, diag_rounds);
+			SAYM("r1md: radio: EPS stat 3 (#%u): diagnostics round %u (CEER, CEREG?, EREG?, EGREG?, CSCON?)", n_stat3, diag_rounds);
 			radio_load(at_seqD, sizeof(at_seqD) / sizeof(at_seqD[0]));
 		} else if (rej_perm && diag_rounds) {
 			char why[40];
@@ -2568,13 +2800,82 @@ radio_drive(uint32_t rel)
 		if (rel - rp_t >= 60000) {
 			rp = RP_OFF;
 			rp_new = true;
-			SAY("r1md: radio: hold of 60 s done: off sequence");
+			SAYM("r1md: radio: hold of 60 s done: off sequence");
 		} else if (rel - rp_csq >= 10000) {
 			rp_csq = rel;
 			radio_load(at_seqS, 1);
 		}
 		break;
 	}
+}
+
+/* ---- attempt 3: per-bit RCHNUM accounting (docs/cellular-attach-2.md 5a, 5d) ---- */
+
+static uint32_t bit_cnt[32], bit_first[32], bit_last[32], bit_edges;
+static struct { bool pend; uint32_t t, bit, n; } busy_chk;
+
+/* rch as read; apbusy was read before the ack was written. Every edge of a bit >= 16 is logged (cap 6) with both CCIFs' RCHNUM/BUSY and 4 SRAM words. */
+static void
+ccif_bits_note(uint32_t rch, uint32_t apbusy, uint32_t elapsed)
+{
+	for (int b = 0; b < 32; b++) {
+		if (rch & (1u << b)) {
+			if (!bit_cnt[b]++) {
+				bit_first[b] = elapsed;
+			}
+			bit_last[b] = elapsed;
+		}
+	}
+	if (!(rch >> 16)) {
+		return;
+	}
+	for (int b = 16; b < 32; b++) {
+		if (!(rch & (1u << b)) || bit_edges++ >= 6) {
+			continue;
+		}
+		SAYM("r1md: [%u ms] CCIF bit %d #%u: AP RCHNUM %#x BUSY %#x, MD RCHNUM %#x BUSY %#x; SRAM %08x %08x %08x %08x", elapsed, b, bit_cnt[b], rch, apbusy,
+		    rd(mdccif, APCCIF_RCHNUM), rd(mdccif, APCCIF_BUSY), rd(ccif, APCCIF_CHDATA + 0x100), rd(ccif, APCCIF_CHDATA + 0x104), rd(ccif, APCCIF_CHDATA + 0x108),
+		    rd(ccif, APCCIF_CHDATA + 0x10c));
+		if (!busy_chk.pend) {
+			busy_chk.pend = true;
+			busy_chk.t = elapsed;
+			busy_chk.bit = (uint32_t)b;
+			busy_chk.n = bit_cnt[b];
+		}
+	}
+	cldma_snap("ccif bit>=16", elapsed, md1_is_on());
+}
+
+/* 10 ms after the ack: did the MD-side BUSY bit clear (proves the ack reaches the modem side) */
+static void
+ccif_busy_check(uint32_t elapsed)
+{
+	if (busy_chk.pend && elapsed - busy_chk.t >= 10) {
+		uint32_t mb = rd(mdccif, APCCIF_BUSY);
+
+		busy_chk.pend = false;
+		SAYM("r1md: [%u ms] CCIF bit %u #%u: MD BUSY %u ms after the ack %#x: bit %s", elapsed, busy_chk.bit, busy_chk.n, elapsed - busy_chk.t, mb,
+		    (mb >> busy_chk.bit) & 1 ? "STILL SET" : "cleared");
+	}
+}
+
+/* RESULT 2f-A: the one line that answers "attached? T3410? bit 20? FS in the window?" (said at registration, first stat 3, +60 s, the end, after power-down) */
+static void
+result_2fa(const char *tag, uint32_t rel)
+{
+	char bits[56];
+	size_t n = 0;
+	int cs = cscon1_ms_v ? (int)cscon1_ms_v - 1 : -1, s3 = stat3_ms_v ? (int)stat3_ms_v - 1 : -1;
+
+	bits[0] = 0;
+	for (int b = 16; b < 32 && n + 16 < sizeof(bits); b++) {
+		if (bit_cnt[b]) {
+			n += (size_t)snprintf(bits + n, sizeof(bits) - n, "%s%d:%u@%u", n ? "," : "", b, bit_cnt[b], bit_first[b]);
+		}
+	}
+	cldma_report(tag, rel);
+	SAYM("r1md: RESULT 2f-A [%u ms] %s: cscon1 %d ms, stat3 %d ms (t3410 %d), bits>=16 {%s}, fs* %u (err %u wr %u), rpc* %u, cldma rx %u err %#x, cut %u+%u", rel, tag, cs, s3,
+	    (cs >= 0 && s3 >= 0) ? s3 - cs : -1, bits, fsw_ops, fsw_err, fsw_wr, rpc_win, cldma_rx_count(), cldma_rx_err(), md_cut, md_sup + rpc_dups);
 }
 
 /* up to 10 s of the boot status and the CCIF; read only except for the interrupt ack md_ccif_isr does */
@@ -2584,7 +2885,7 @@ wait_hs1(void)
 	uint32_t sta0 = ~0u, sta1 = ~0u, trace[15], last_trace[15] = { 0 }, seen = 0, rch, s0, s1, elapsed, next_sec = 0;
 	uint32_t ntrace = 0, rxrd = 0, rxwr = 0;
 	int bsoc, bchg;
-	bool hs1 = false, rx_said = false, sent = false, exc = false, failed = false;
+	bool hs1 = false, rx_said = false, sent = false, exc = false, failed = false, exc_radio = false;
 	int after_hs1 = 0;
 	uint32_t t_send = 0;
 	uint64_t t_start = mach_absolute_time(), ns;
@@ -2605,7 +2906,7 @@ wait_hs1(void)
 			trace[i] = rd(ccif, APCCIF_CHDATA + 4 * i);
 		}
 		if (memcmp(trace, last_trace, sizeof(trace)) != 0) {
-			if (ntrace++ < 24) {
+			if (ntrace++ < 6) {
 				SAY("r1md: [%u ms] CCIF boot trace %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", elapsed,
 				    trace[0], trace[1], trace[2], trace[3], trace[4], trace[5], trace[6], trace[7], trace[8], trace[9], trace[10], trace[11],
 				    trace[12], trace[13], trace[14]);
@@ -2618,12 +2919,18 @@ wait_hs1(void)
 			next_sec += 1000;
 		}
 		rch = rd(ccif, APCCIF_RCHNUM);
+		ccif_busy_check(elapsed);
 		if (rch) {
-			if (rch & ~seen) {
-				SAY("r1md: [%u ms] CCIF RCHNUM %#x (new %#x)", elapsed, rch, rch & ~seen);
+			uint32_t apbusy = rd(ccif, APCCIF_BUSY);
+
+			if (rch & ~seen & 0xffff) {
+				SAY("r1md: [%u ms] CCIF RCHNUM %#x (new %#x)", elapsed, rch, rch & ~seen & 0xffff);
 			}
 			seen |= rch;
-			wr(ccif, APCCIF_ACK, rch & 0xffff);     /* md_ccif_isr(): ack first, the low 16 channels; the SRAM content stays */
+			/* stock acks every bit: md_ccif_isr (irq0) the low 16, md_cd_ccif_isr (irq1) bits 15..30. The ring bits lose nothing: the rings are
+			 * drained every pass whatever RCHNUM says, and a bit raised again after this ack is just the next RCHNUM. Nothing is sent back on bit 20. */
+			wr(ccif, APCCIF_ACK, rch);
+			ccif_bits_note(rch, apbusy, elapsed);
 			if (rch & (1u << CCIF_RX_SRAM)) {
 				bool h = read_hs1(elapsed);
 
@@ -2642,15 +2949,26 @@ wait_hs1(void)
 					}
 				}
 			}
-			if (rch & (1u << CCIF_RX_EXCEPTION_INIT)) {
+			if ((rch & (1u << CCIF_RX_EXCEPTION_INIT)) && rd_t_on) {
+				/* EFUN=1 was sent: an MD exception does NOT end the watch. Dump once, then the off sequence runs (EFUN=0 will probably time out
+				 * on a dead AT engine, but the radio-off attempt and the EFUN? confirm are tried); power-down only after it, or at the 255/400 s caps. */
+				if (!exc_radio) {
+					exc_radio = true;
+					SAYM("r1md: [%u ms] D2H_EXCEPTION_INIT with the radio on (%u ms after EFUN=1): off sequence follows", elapsed - t_send, elapsed - t_send - rd_t_on);
+					ee_dump(false);
+					delay_for_interval(300, NSEC_PER_MSEC);
+					ee_dump(true);
+					radio_stop("MD exception");
+				}
+			} else if (rch & (1u << CCIF_RX_EXCEPTION_INIT)) {
 				if (md_level >= 3 && sent) {
-					SAY("r1md: [%u ms] D2H_EXCEPTION_INIT after the runtime data", elapsed - t_send);
+					SAYM("r1md: [%u ms] D2H_EXCEPTION_INIT after the runtime data", elapsed - t_send);
 					ee_dump(false);
 					delay_for_interval(300, NSEC_PER_MSEC);
 					ee_dump(true);
 					exc = true;
 				} else {
-					SAY("r1md: [%u ms] the modem raised D2H_EXCEPTION_INIT: it hit an exception", elapsed);
+					SAYM("r1md: [%u ms] the modem raised D2H_EXCEPTION_INIT: it hit an exception", elapsed);
 				}
 				break;
 			}
@@ -2666,6 +2984,13 @@ wait_hs1(void)
 		if (md_level >= 3) {
 			if (sent) {
 				drain_rings(elapsed - t_send);
+				if (cldma_on && cldma_rx_poll(elapsed - t_send)) {
+					if (rd_active) {
+						radio_stop("cldma stop rule");
+					} else {
+						cl_fatal = true;
+					}
+				}
 				if (md_level >= 6) {
 					at_step(elapsed - t_send);
 					if (md_level >= 7) {
@@ -2673,13 +2998,13 @@ wait_hs1(void)
 							gates_eval(sta0, sta1, exc);
 							result_2e1(exc);
 							if (!radio_req) {
-								SAY("r1md: radio-on NOT requested: stopping at 2e-1");
+								SAYM("r1md: radio-on NOT requested: stopping at 2e-1");
 							} else if (gates_pass != 10) {
-								SAY("r1md: radio-on REFUSED: gates passed %u of 10 (not passed: %s)", gates_pass, gates_bad);
+								SAYM("r1md: radio-on REFUSED: gates passed %u of 10 (not passed: %s)", gates_pass, gates_bad);
 							} else if (!at_radio_on) {
 								radio_go = true;
 								rd_active = true;
-								SAY("r1md: radio-on requested and all ten gates passed: 2e-2 begins (hard cap 4 min)");
+								SAYM("r1md: radio-on requested and all ten gates passed: 2e-2 begins (hard cap 4 min)");
 							}
 						}
 						if (rd_active) {
@@ -2687,7 +3012,7 @@ wait_hs1(void)
 						}
 						/* 2e-1: the last response + 3 s, 120 s after HS2. 2e-2: until EFUN=0 is confirmed; the cap below is the kernel's own
 						 * timer: 15 s past the 4 minutes, MD1 goes down whatever the state machine is doing */
-						if (at_radio_on || (rd_active && rd_t_on && elapsed - t_send - rd_t_on >= 255000) || (rd_active && md_ms() >= 400000) || (radio_go && rp == RP_END) ||
+						if (at_radio_on || cl_fatal || (rd_active && rd_t_on && elapsed - t_send - rd_t_on >= 255000) || (rd_active && md_ms() >= 400000) || (radio_go && rp == RP_END) ||
 							(!rd_active && ((st2a.hs2 && (elapsed - t_send - st2a.t_hs2 >= 120000 || (at_done && gates_done && elapsed - t_send - at_last_ms >= 3000))) ||
 							(!st2a.hs2 && elapsed - t_send >= 30000) || md_ms() >= 150000))) {
 							break;
@@ -2750,12 +3075,12 @@ for (int c = 0; c < 256 && cn < 100; c++) {
 		}
 		if (exc) {
 			SAY("r1md: last fs exchange before the exception: %s", mdfs_last());
-			SAY("r1md: %s: MD EXCEPTION %u ms after the reply; last answer op %#x; text \"%s\"; fs %u ops %u missing; jnl %s", rt, rel, last_ans_op,
+			SAYM("r1md: %s: MD EXCEPTION %u ms after the reply; last answer op %#x; text \"%s\"; fs %u ops %u missing; jnl %s", rt, rel, last_ans_op,
 			    ee_have ? ee_text : "none found", fops, fmiss, mdfs_jnl());
 		} else if (st2a.hs2) {
 			SAY("r1md: %s: HS2 at %u ms after the reply; fs %u ops %u missing, overlay %u B; jnl %s", rt, st2a.t_hs2, fops, fmiss, fovl, mdfs_jnl());
 		} else {
-			SAY("r1md: %s: NO HS2 in %u ms%s; fs %u ops %u missing, overlay %u B; jnl %s", rt, rel,
+			SAYM("r1md: %s: NO HS2 in %u ms%s; fs %u ops %u missing, overlay %u B; jnl %s", rt, rel,
 			    failed ? " (the reply was not sent)" : (hs1 ? "" : " (no HS1 either)"), fops, fmiss, fovl, mdfs_jnl());
 			SAY("r1md: last fs exchange: %s", mdfs_last());
 		}
@@ -2765,6 +3090,10 @@ for (int c = 0; c < 256 && cn < 100; c++) {
 			}
 			result_2e1(exc);
 			if (radio_go) {
+				if (rp != RP_END && !rp_failed) {      /* the loop ended while the radio state machine had not: say why, never "completed" */
+					strlcpy(rp_why, at_radio_on ? "radio on by query" : (cl_fatal ? "cldma stop rule" : "watch ended early"), sizeof(rp_why));
+					rp_failed = true;
+				}
 				result_2e2(elapsed - t_send);
 			}
 
@@ -2776,12 +3105,12 @@ for (int c = 0; c < 256 && cn < 100; c++) {
 			}
 			atsum[an] = 0;
 			if (at_ready) {
-				SAY("r1md: RESULT 2d: AT ready at %u ms after HS2; %s%s", at_ready_ms - st2a.t_hs2, an ? atsum : "no command sent",
+				SAYM("r1md: RESULT 2d: AT ready at %u ms after HS2; %s%s", at_ready_ms - st2a.t_hs2, an ? atsum : "no command sent",
 				    at_radio_on ? "RADIO ON, STOPPED" : (at_refused ? "REFUSED" : ""));
 			} else if (exc) {
-				SAY("r1md: RESULT 2d: MD EXCEPTION, AT never ready; text \"%s\"", ee_have ? ee_text : "none found");
+				SAYM("r1md: RESULT 2d: MD EXCEPTION, AT never ready; text \"%s\"", ee_have ? ee_text : "none found");
 			} else {
-				SAY("r1md: RESULT 2d: AT never ready (%s); no AT command sent", st2a.hs2 ? "HS2 seen" : "NO HS2");
+				SAYM("r1md: RESULT 2d: AT never ready (%s); no AT command sent", st2a.hs2 ? "HS2 seen" : "NO HS2");
 			}
 		}
 	} else if (md_level >= 3) {
@@ -2790,20 +3119,20 @@ for (int c = 0; c < 256 && cn < 100; c++) {
 		const char *tag = md_level >= 4 ? "2b" : "2a";
 
 		if (exc) {
-			SAY("r1md: RESULT %s: MD EXCEPTION %u ms after the reply; last answer op %#x at %u ms; text \"%s\"", tag, rel, last_ans_op, last_ans_ms,
+			SAYM("r1md: RESULT %s: MD EXCEPTION %u ms after the reply; last answer op %#x at %u ms; text \"%s\"", tag, rel, last_ans_op, last_ans_ms,
 			    ee_have ? ee_text : "none found");
 		} else if (st2a.hs2) {
-			SAY("r1md: RESULT %s: HS2 at %u ms after the reply; rx packets %u (fs %u rpc %u ctl %u sys %u other %u), answers %u, unanswered %u", tag,
+			SAYM("r1md: RESULT %s: HS2 at %u ms after the reply; rx packets %u (fs %u rpc %u ctl %u sys %u other %u), answers %u, unanswered %u", tag,
 			    st2a.t_hs2, st2a.pkts, st2a.fs, st2a.rpc, st2a.ctl, st2a.sys, st2a.other, st2a.answered, st2a.unanswered);
 		} else {
-			SAY("r1md: RESULT %s: NO HS2 in %u ms%s; rx packets %u (fs %u rpc %u ctl %u sys %u other %u), answers %u, unanswered %u, boot status %#x %#x", tag, rel,
+			SAYM("r1md: RESULT %s: NO HS2 in %u ms%s; rx packets %u (fs %u rpc %u ctl %u sys %u other %u), answers %u, unanswered %u, boot status %#x %#x", tag, rel,
 			    failed ? " (the reply was not sent)" : (hs1 ? "" : " (no HS1 either)"), st2a.pkts, st2a.fs, st2a.rpc, st2a.ctl, st2a.sys,
 			    st2a.other, st2a.answered, st2a.unanswered, sta0, sta1);
 		}
 	} else if (hs1) {
-		SAY("r1md: RESULT: HS1 SEEN; boot status %#x %#x, CCIF channels seen %#x, %u ms", sta0, sta1, seen, elapsed);
+		SAYM("r1md: RESULT: HS1 SEEN; boot status %#x %#x, CCIF channels seen %#x, %u ms", sta0, sta1, seen, elapsed);
 	} else {
-		SAY("r1md: RESULT: NO HS1 after %u ms; boot status %#x %#x (%s), CCIF channels seen %#x", elapsed, sta0, sta1, boot_sta_desc(sta0), seen);
+		SAYM("r1md: RESULT: NO HS1 after %u ms; boot status %#x %#x (%s), CCIF channels seen %#x", elapsed, sta0, sta1, boot_sta_desc(sta0), seen);
 	}
 	return hs1;
 }
@@ -2824,9 +3153,10 @@ md_power_off(const char *why)
 		return;
 	}
 	md_state = 2;
-	SAY("r1md: powering MD1 down (%s)", why);
+	SAYM("r1md: powering MD1 down (%s)", why);
+	cldma_teardown();       /* stop and reset the CLDMA receive ring first, if one was started (no-op otherwise) */
 	if (!md1_is_on()) {
-		SAY("r1md: MD1 is already off");
+		SAYM("r1md: MD1 is already off");
 	} else {
 		ccif_reset();
 		wr(infra, INFRA_PROTECTEN_SET, PERI2MD_PROT);
@@ -2852,7 +3182,7 @@ md_power_off(const char *why)
 			delay(10);
 		}
 		if (md1_is_on()) {
-			SAY("r1md: MD1 still powered after the power-off sequence (PWR_STATUS %#x/%#x)", rd(spm, SPM_PWR_STATUS), rd(spm, SPM_PWR_STATUS_2ND));
+			SAYM("r1md: MD1 still powered after the power-off sequence (PWR_STATUS %#x/%#x)", rd(spm, SPM_PWR_STATUS), rd(spm, SPM_PWR_STATUS_2ND));
 			goto stuck;
 		}
 		clrb(spm, SPM_MD1_PWR_CON, PWR_RST_B);
@@ -2892,13 +3222,13 @@ md_thread(__unused void *parameter, __unused wait_result_t result)
 	if (md_level >= 5) {
 		fs_out = kalloc_data(0x4200, Z_WAITOK | Z_ZERO);
 		if (fs_out == NULL || !mdfs_init()) {
-			SAY("r1md: RESULT %s: NO MODEM START: the NV partitions could not be mounted read only (nothing was powered)", md_level >= 6 ? "2d" : "2c");
+			SAYM("r1md: RESULT %s: NO MODEM START: the NV partitions could not be mounted read only (nothing was powered)", md_level >= 6 ? "2d" : "2c");
 			md_state = 2;
 			goto out;
 		}
 	}
 	if (md1_is_on()) {
-		SAY("r1md: MD1 is already powered; something else owns the modem: not touching it");
+		SAYM("r1md: MD1 is already powered; something else owns the modem: not touching it");
 		md_state = 2;
 		goto out;
 	}
@@ -2932,11 +3262,16 @@ md_thread(__unused void *parameter, __unused wait_result_t result)
 	SAY("r1md: stage 1 done: MD1 powered, PLLs up, MD WDT off, modem parked");
 	/* stage 2 of the reference: clocks, shared memory, CCIF, release, HS1 */
 	clocks_on();
+	cldma_maps(infra);
 	if (!smem_prepare()) {
 		md_power_off("shared memory");
 		goto out;
 	}
 	ccif_reset();
+	if (cldma_on && !cldma_rx_start(md_ms())) {
+		md_power_off("cldma rx not started");
+		goto out;
+	}
 	if (!let_md_go()) {
 		md_power_off("release");
 		goto out;
@@ -2944,6 +3279,11 @@ md_thread(__unused void *parameter, __unused wait_result_t result)
 	(void)wait_hs1();
 	dump_status("after wait");
 	md_power_off("end of the HS1 watch");
+	if (radio_go) {         /* the last thing the driver says: the results again, after the modem is down */
+		result2_said = false;
+		res_tag = "off";
+		result_2e2(res_rel);
+	}
 	mdfs_done();
 out:
 	SAY("r1md: stage 1 done");
@@ -2978,6 +3318,8 @@ redwood_md_init(void)
 		at_seq = at_seq7;
 		at_n = sizeof(at_seq7) / sizeof(at_seq7[0]);
 		radio_req = PE_parse_boot_argn("r1_md_radio", &v, sizeof(v)) && v == 1;
+		/* the CLDMA receive ring is started ONLY with r1_md_cldma=1; without it not one CLDMA register is written (snapshots are reads) */
+		cldma_on = PE_parse_boot_argn("r1_md_cldma", &v, sizeof(v)) && v == 1;
 		imei_h_set = PE_parse_boot_argn("r1_md_imei_h", &imei_h, sizeof(imei_h));
 		had_wifi = PE_parse_boot_argn("wifi", &v, sizeof(v)) && v != 0;
 		(void)PE_parse_boot_argn("connsys_step", &g_connsys, sizeof(g_connsys));
@@ -3025,12 +3367,12 @@ redwood_md_init(void)
 	    !PE_parse_boot_argn("r1_md_ccb", &h_ccb, sizeof(h_ccb)) || !PE_parse_boot_argn("r1_md_ccb_sz", &h_ccb_sz, sizeof(h_ccb_sz)) ||
 	    !PE_parse_boot_argn("r1_md_img", &h_img, sizeof(h_img)) || !PE_parse_boot_argn("r1_md_img_sz", &h_img_sz, sizeof(h_img_sz)) ||
 	    !h_smem || !h_smem_sz || !h_img || !h_img_sz) {
-		SAY("r1md: stage 1 REFUSED: the loader's handoff (r1_md_smem= ... r1_md_img_sz=) is not in the boot-args");
+		SAYM("r1md: stage 1 REFUSED: the loader's handoff (r1_md_smem= ... r1_md_img_sz=) is not in the boot-args");
 		return;
 	}
 	(void)PE_parse_boot_argn("r1_md_dfd", &h_dfd, sizeof(h_dfd));
 	if ((cg1 & ((1u << 23) | (1u << 26))) || !ccif) {
-		SAY("r1md: stage 1 REFUSED: the CCIF clocks are gated (CG1 %#x), the reference expects them ungated", cg1);
+		SAYM("r1md: stage 1 REFUSED: the CCIF clocks are gated (CG1 %#x), the reference expects them ungated", cg1);
 		return;
 	}
 	mdccif = ml_io_map(0x1020a000UL, 0x1000);

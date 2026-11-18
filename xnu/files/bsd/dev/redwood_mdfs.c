@@ -31,7 +31,7 @@ extern uint32_t redwood_host_keep_len;
 #define NFH         128
 #define NOPS        0x26
 #define FS_MAX_READ 0x4000u     /* a reply must stay under the stream limit 0x40c8; a READ/CMPT_READ is cut to this */
-#define LOG_FULL    400u
+#define LOG_FULL    30u     /* attempt 3 (log budget): 30 per-request lines; the attach window is logged by redwood_md.c (fs*) */
 
 static inline uint32_t le32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static inline uint32_t le16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
@@ -1473,7 +1473,7 @@ logit:
 		}
 		snprintf(last_req, sizeof(last_req), "#%u %s \"%s\" %s -> %d", S.ops, op >= 0x1001 && op <= 0x1000 + NOPS && opname[op - 0x1000] ?
 		    opname[op - 0x1000] : "?", path_log, extra, shown);
-		if ((S.logged < LOG_FULL && (S.ops <= LOG_FULL)) || (phase && op != 0x1022 && S.logged < 4 * LOG_FULL)) {
+		if (S.logged < LOG_FULL && S.ops <= LOG_FULL) {
 			S.logged++;
 			FSAY("r1md: fs #%u %s \"%s\" %s -> %d%s", S.ops, op >= 0x1001 && op <= 0x1000 + NOPS && opname[op - 0x1000] ? opname[op - 0x1000] : "?",
 			    path_log, extra, shown, loud ? " (NOT SUPPORTED)" : "");
