@@ -112,6 +112,12 @@ extern void cldma_teardown(void);
 extern void cldma_report(const char *tag, uint32_t ms);
 extern uint32_t cldma_rx_count(void);
 extern uint32_t cldma_rx_err(void);
+/* Stage 3a (r1_md_data=1 only) */
+extern void cldma_data_enable(void);
+extern bool cldma_tx(const uint8_t *ip, uint32_t len, uint32_t ms);
+extern uint32_t cldma_tx_pkts(void);
+extern uint32_t cldma_tx_bytes(void);
+extern uint32_t cldma_tx_completed(void);
 
 /* SPM */
 #define SPM_PWR_STATUS          0x180
@@ -213,6 +219,7 @@ static volatile int md_state;
 static uint32_t md_level;       /* the r1_md value: 3 = stage 1 + 2a */
 static uint64_t md_t0;
 static uint32_t rd_t_on;        /* ms (run-relative) at which AT+EFUN=1 was sent; 0 = never */
+static bool data_on, eif_on;    /* Stage 3a, see the comment at cldma_on */
 
 static inline uint32_t
 rd(vm_offset_t base, uint32_t at)
@@ -1058,6 +1065,16 @@ rpc_serve(const uint32_t *pkt, uint32_t L, uint32_t ncopy, uint32_t rel)
 		SAYM("r1md: USER-SPACE RPC op %#x nargs %u arg0 len %u: logged, NOT ANSWERED", op, nargs, nargs ? alen[0] : 0);
 		send = false;
 		break;
+	case 0x400d:    /* IPC_RPC_CCCI_LHIF_MAPPING (port_rpc.c ccci_rpc_remap_queue): arg0 = {u32 net_if, u32 lhif_q}; reply 2 x {4, 0}. Only with r1_md_data=1 */
+		if (data_on) {
+			uint32_t nif = nargs && alen[0] >= 8 ? *(const uint32_t *)(pb + aoff[0]) : 0xffff, lq = nargs && alen[0] >= 8 ? *(const uint32_t *)(pb + aoff[0] + 4) : 0xffff;
+
+			ob_word(0);
+			ob_word(0);
+			SAYM("r1md: rpc op 0x400d LHIF_MAPPING net_if %u lhif_q %u (2 = UL Q0 -> CLDMA txq 0) -> 0, 0", nif, lq);
+			break;
+		}
+		__attribute__((fallthrough));
 	default:
 		SAYM("r1md: UNKNOWN RPC op %#x nargs %u arg0 len %u \"%s\": answered -1", op, nargs, nargs ? alen[0] : 0, name);
 		ob_word((uint32_t)-1);
@@ -1291,6 +1308,22 @@ static bool eps_reg, stat3_pend, rej_perm, held_started, final_diag;
 static int cs_stat = -1, ereg_stat = -1, rej_type = -1, rej_cause = -1, cscon_n;
 static uint32_t n_stat3, diag_rounds, cscon1_ms_v, eps_reg_at, stat3_ms_v;
 static bool cldma_on, cl_fatal;     /* cldma_on: boot-arg r1_md_cldma=1 (redwood_cldma.c) */
+/* Stage 3a: data_on = r1_md_data=1 together with radio_req and cldma_on (set in redwood_md_init); nothing below runs without it. eif_on: optional
+ * r1_md_eif=1 (GUESS): also send AT+EPDN=0,"addr" if no IPv4 address was found by then. (EPDN ifst 20 / EIF ifst up are stock-literal, ccci_dump.txt, and always sent.) */
+static bool d_cgev, d_have_ip, d_fin;
+enum { DP_START, DP_ACT, DP_EPDN, DP_EIF, DP_PA, DP_RD, DP_EPA, DP_WAIT };
+static int dp = DP_START;
+static const char *d_src = "-";                 /* where d_ip came from (RESULT 3a) */
+static bool d_v6seen, d_hexok;                  /* an IPv6-looking token was seen; d_hex = 8-hex-digit token (fallback, GUESS: only used if no dotted IPv4 turns up) */
+static uint8_t d_hex[4];
+static uint32_t d_scan_logged;
+static void data_scan(const char *src, const char *l, bool accept);
+static char d_apn[40], d_res[64] = "";
+static uint8_t d_ip[4], d_dns[2][4];
+static uint32_t d_ndns, d_cur, d_tries, d_rxp, d_rxb, d_rx_logged, d_sendms[2], d_ncontrdp;
+static int d_mtu = -1;
+static bool d_reply;
+static void contrdp_parse(const char *line);
 static char eps_seq[28], eps_src[12] = "-", eiareg_s[40], ceer_s[64];
 /* 2e-2 bookkeeping (RESULT 2e-2): EFUN=1 timing, operator/RAT/signal, detach, the post-radio-on channel counts */
 static bool efun1_to, at_to, detach_seen, held_ok = true;
@@ -1324,7 +1357,8 @@ at_scrub(const char *in, char *out, uint32_t outsz)
 }
 
 /* a line for the log: the value of an identifier URC only as its length, anything else with long digit runs masked */
-static const char *const id_pfx[] = { "+ICCID", "+CIMI", "+CNUM", "+EIMSI", "+CGSN", "+EGMR", "+ESIMAPP", "+ESIMIND", "+ECIMI" };
+static const char *const id_pfx[] = { "+ICCID", "+CIMI", "+CNUM", "+EIMSI", "+CGSN", "+EGMR", "+ESIMAPP", "+ESIMIND", "+ECIMI",
+	"+CGCONTRDP", "+EPDN", "+EIF" /* Stage 3a: addresses; contrdp_parse logs the masked values */ };
 
 static void
 at_safe(const char *l, char *out, uint32_t outsz)
@@ -1459,10 +1493,25 @@ urc_must(const char *l)
 	return false;
 }
 
+/* Stage 3a, only with data_on (the stock RIL's bearer binding, docs/cellular-stage3.md C.1; EAPNSET/EIAAPN, which write the APN table, are NOT sent) */
+static const char at_apn_cmd[] = "AT+EAPNACT=1,\"RESELLER\",\"default\",0,,\"dnn=RESELLER\",,0";
+/* stock literal (ccci_dump.txt 80.7017/80.7028 s, libmtk-ril 0x11d9e2 / 0x12851d): sent right after the +EIF URCs; the +EPDN reply carries addresses */
+static const char at_epdn_cmd[] = "AT+EPDN=0,\"ifst\",20";
+static const char at_eif_cmd[] = "AT+EIF=100, \"ifst\", \"up\", 1";
+static const char at_pa_cmd[] = "AT+CGPADDR=0";
+static const char at_epa_cmd[] = "AT+EPDN=0,\"addr\"";        /* libmtk-ril 0x103f57 only, never seen on the wire: GUESS, r1_md_eif=1 only */
+static const char at_rd_cmd[] = "AT+CGCONTRDP=0";
+static const char *const at_seqAPN[] = { at_apn_cmd };
+static const char *const at_seqEPDN[] = { at_epdn_cmd };
+static const char *const at_seqEIF[] = { at_eif_cmd };
+static const char *const at_seqPA[] = { at_pa_cmd };
+static const char *const at_seqEPA[] = { at_epa_cmd };
+static const char *const at_seqRD[] = { at_rd_cmd };
+
 static bool
 at_send(const char *cmd, uint32_t rel)
 {
-	uint32_t body[17], n = (uint32_t)strlen(cmd);
+	uint32_t body[17], n = (uint32_t)strlen(cmd), maxlen = 20;
 	bool listed = false;
 
 	for (unsigned i = 0; i < sizeof(at_white) / sizeof(at_white[0]); i++) {
@@ -1472,7 +1521,15 @@ at_send(const char *cmd, uint32_t rel)
 	if (!strcmp(cmd, "AT+EFUN=1") && !(md_level == 7 && radio_req && radio_go)) {
 		listed = false;
 	}
-	if (!listed || n > 20) {
+	if (data_on && md_level == 7 && radio_go) {
+		if (!strcmp(cmd, at_apn_cmd) || !strcmp(cmd, at_epdn_cmd) || !strcmp(cmd, at_eif_cmd) || (eif_on && !strcmp(cmd, at_epa_cmd))) {
+			listed = true;
+			maxlen = 60;            /* the long ones: EAPNACT, EPDN ifst, EIF ifst (+ EPDN addr with r1_md_eif=1) only; the body holds 67 characters */
+		} else if (!strcmp(cmd, at_rd_cmd) || !strcmp(cmd, at_pa_cmd)) {
+			listed = true;
+		}
+	}
+	if (!listed || n > maxlen) {
 		SAYM("r1md: at REFUSED \"%s\" (not on the whitelist)", cmd);
 		at_refused = true;
 		return false;
@@ -1627,6 +1684,17 @@ at_note(const char *l, uint32_t rel)
 {
 	bool wq = at_wait && at_idx < at_n;
 
+	if (data_on && dp >= DP_ACT && !d_fin) {      /* Stage 3a: every line of the data phase, in or out of a response, URCs included */
+		if (!strncmp(l, "+EIF:", 5)) {
+			data_scan("EIF", l + 5, true);
+		} else if (!strncmp(l, "+EPDN:", 6)) {
+			data_scan("EPDN", l + 6, true);
+		} else if (!strncmp(l, "+CGPADDR:", 9)) {
+			data_scan("CGPADDR", l + 9, true);
+		} else if (!strncmp(l, "+EAPNINFO:", 10)) {
+			data_scan("EAPNINFO", l + 10, false);
+		}
+	}
 	if (!strncmp(l, "+ESIMS:", 7)) {
 		sim_esims = (int)strtol(l + 7, NULL, 10);
 	} else if (!strncmp(l, "+ICCID:", 7)) {
@@ -1672,6 +1740,14 @@ at_note(const char *l, uint32_t rel)
 		}
 		at_safe(v, eiareg_s, sizeof(eiareg_s));
 		eps_mark("EIAREG", rel);
+		if (data_on) {      /* the APN name the modem attached with: "reseller.mnc410.mcc310.gprs",IP,0 */
+			const char *q1 = strchr(v, '"'), *q2 = q1 ? strchr(q1 + 1, '"') : NULL;
+
+			if (q2 && q2 - q1 - 1 < (long)sizeof(d_apn)) {
+				memcpy(d_apn, q1 + 1, (size_t)(q2 - q1 - 1));
+				d_apn[q2 - q1 - 1] = 0;
+			}
+		}
 	} else if (!strncmp(l, "+CEER:", 6)) {
 		const char *v = l + 6;
 
@@ -1679,6 +1755,8 @@ at_note(const char *l, uint32_t rel)
 			v++;
 		}
 		at_safe(v, ceer_s, sizeof(ceer_s));
+	} else if (data_on && dp == DP_ACT && strnstr(l, "ME PDN ACT", strlen(l))) {
+		d_cgev = true;
 	} else if (strnstr(l, "ME DETACH", strlen(l))) {
 		detach_seen = true;
 		eps_reg = false;
@@ -1782,6 +1860,9 @@ at_finish(const char *final, uint32_t rel)
 				}
 			} else if (radio_go && !strncmp(line, "+CSQ:", 5)) {
 				rp_csqv = (int)strtol(line + 5, NULL, 10);
+			}
+			if (data_on && !strncmp(line, "+CGCONTRDP:", 11)) {
+				contrdp_parse(line);
 			}
 			at_safe(line, one, sizeof(one));
 			if (md_level >= 7) {
@@ -2159,7 +2240,7 @@ drain_one(int q, uint32_t rel)
 					rpc_bad = true;
 				}
 			}
-			if (op != 0x4005 && op != 0x400e) {
+			if (op != 0x4005 && op != 0x400e && !(data_on && op == 0x400d)) {
 				rpc_bad = true;
 			}
 		}
@@ -2551,13 +2632,14 @@ result_2e1(bool exc)
 
 /* ---- sub-stage 2e-2: registration only. Reached only with radio_go, which needs r1_md=7, r1_md_radio=1 and all ten gates. ---- */
 
-enum { RP_PRE, RP_WAIT, RP_POST, RP_HOLD, RP_OFF, RP_END };
+enum { RP_PRE, RP_WAIT, RP_POST, RP_DATA, RP_HOLD, RP_OFF, RP_END };
 static int rp = RP_PRE;
 static bool rp_new = true, rp_failed;
 static uint32_t rp_t, rp_ereg, rp_csq, rp_reg_ms;
 static char rp_why[40];
 
 static void result_2fa(const char *tag, uint32_t rel);
+static void result_3a(uint32_t rel);
 
 static void
 radio_load(const char *const *seq, uint32_t n)
@@ -2619,6 +2701,9 @@ result_2e2(uint32_t rel)
 	    eiareg_s, diag_rounds, ereg_stat, held_started ? "reached" : "not reached");
 	SAYM("r1md: RESULT 2e-2d: ceer \"%s\"", ceer_s);
 	result_2fa(res_tag, rel);
+	if (data_on) {
+		result_3a(rel);
+	}
 }
 
 /* the off sequence: one command at a time (at_step is the only sender and sends nothing while at_wait). Plain AT+EFUN=0 (30 s), a quiet wait,
@@ -2681,6 +2766,517 @@ off_drive(uint32_t rel)
 	}
 }
 
+/* ---- Stage 3a: bearer binding, one kernel-built DNS query over CLDMA (r1_md_data=1; docs/cellular-stage3.md C) ---- */
+
+static uint32_t dp_t0, dp_t;
+static uint16_t d_id, d_sport;
+
+static bool
+v4_parse(const char *s, uint8_t o[4])
+{
+	const char *p = s;
+
+	for (int n = 0; n < 4; n++) {
+		uint32_t v = 0, digs = 0;
+
+		while (*p >= '0' && *p <= '9' && digs < 4) {
+			v = v * 10 + (uint32_t)(*p - '0');
+			p++;
+			digs++;
+		}
+		if (!digs || v > 255) {
+			return false;
+		}
+		o[n] = (uint8_t)v;
+		if (n < 3) {
+			if (*p != '.') {
+				return false;
+			}
+			p++;
+		}
+	}
+	return *p == 0 || *p == '.';    /* "a.b.c.d" or "a.b.c.d.m.m.m.m" (address and mask): the first four numbers */
+}
+
+/* Stage 3a: a "+EIF: ..." / "+EPDN: ..." / "+CGPADDR: ..." / "+EAPNINFO: ..." line. Format NOT known (the stock transcript masks them; ccci_dump shows only "+EIF: 100, "),
+ * so it is split generically at , space " / ( ) and every field is logged as its shape: keywords and short numbers in full, a dotted IPv4 as a.b.x.x, 8 hex digits as <hex8>,
+ * IPv6 as <v6>, anything else as <N chars>. accept: the first dotted IPv4 that is not 0.x / 127.x / 255.x becomes the bearer address (never from an "ipdel" line). */
+static void
+data_scan(const char *src, const char *l, bool accept)
+{
+	char t[200], out[150], *p = t;
+	uint32_t o = 0, nt = 0;
+	bool del;
+
+	strlcpy(t, l, sizeof(t));
+	del = strnstr(t, "ipdel", strlen(t)) != NULL;
+	out[0] = 0;
+	while (*p) {
+		char *tok;
+		uint32_t n = 0, colons = 0, hex = 0, dig = 0, alnum = 0;
+		uint8_t a[4];
+
+		while (*p == ',' || *p == ' ' || *p == '"' || *p == '/' || *p == '(' || *p == ')') {
+			p++;
+		}
+		if (!*p) {
+			break;
+		}
+		tok = p;
+		while (*p && *p != ',' && *p != ' ' && *p != '"' && *p != '/' && *p != '(' && *p != ')') {
+			char c = *p++;
+
+			n++;
+			colons += c == ':';
+			dig += c >= '0' && c <= '9';
+			hex += (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+			alnum += (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+		}
+		if (*p) {
+			*p++ = 0;
+		}
+		nt++;
+		if (o + 24 >= sizeof(out)) {
+			continue;
+		}
+		if (strchr(tok, '.') && v4_parse(tok, a)) {
+			o += (uint32_t)snprintf(out + o, sizeof(out) - o, "%s%u.%u.x.x", o ? "|" : "", a[0], a[1]);
+			if (accept && !del && !d_have_ip && a[0] && a[0] != 127 && a[0] < 224) {
+				memcpy(d_ip, a, 4);
+				d_have_ip = true;
+				d_src = src;
+				SAYM("r1cell: bearer address %u.%u.x.x taken from +%s", a[0], a[1], src);
+			}
+		} else if (colons >= 2) {
+			d_v6seen = true;
+			o += (uint32_t)snprintf(out + o, sizeof(out) - o, "%s<v6>", o ? "|" : "");
+		} else if (n == 8 && hex == 8) {
+			if (accept && !del && !d_hexok && (tok[0] != '0' || tok[1] != '0')) {     /* GUESS: an IPv4 as 8 hex digits; used only if nothing dotted turns up */
+				for (int i = 0; i < 4; i++) {
+					char b[3] = { tok[2 * i], tok[2 * i + 1], 0 };
+
+					d_hex[i] = (uint8_t)strtoul(b, NULL, 16);
+				}
+				d_hexok = true;
+			}
+			o += (uint32_t)snprintf(out + o, sizeof(out) - o, "%s<hex8>", o ? "|" : "");
+		} else if (n <= 10 && alnum == n && (dig == n ? n <= 5 : ((tok[0] | 0x20) >= 'a' && (tok[0] | 0x20) <= 'z'))) {
+			o += (uint32_t)snprintf(out + o, sizeof(out) - o, "%s%s", o ? "|" : "", tok);       /* keyword / short number: in full */
+		} else {
+			o += (uint32_t)snprintf(out + o, sizeof(out) - o, "%s<%u chars>", o ? "|" : "", n);
+		}
+	}
+	if (d_scan_logged++ < 30) {
+		SAYM("r1cell: data line +%s: %u fields [%s]", src, nt, out);
+	}
+}
+
+/* "+CGCONTRDP: <cid>,<bearer>,<apn>,<addr[.mask]>,<gw>,<dns1>,<dns2>,<pcscf1>,<pcscf2>,<imcn>,<lipa>,<mtu>,..." (27.007 layout: GUESS for this modem;
+ * the field shapes are logged so a different layout shows). The IPv4 address is logged as its first two octets only; the DNS servers in full. */
+static void
+contrdp_parse(const char *line)
+{
+	char t[220], *f[16], *p = t, shape[40];
+	uint32_t nf = 0, sn = 0;
+	uint8_t gw[4];
+	bool first = !d_ncontrdp++;
+
+	strlcpy(t, line + 11, sizeof(t));
+	while (nf < 16) {
+		char *fs;
+
+		while (*p == ' ') {
+			p++;
+		}
+		if (*p == '"') {
+			fs = ++p;
+			while (*p && *p != '"') {
+				p++;
+			}
+			if (*p) {
+				*p++ = 0;
+			}
+			while (*p && *p != ',') {
+				p++;
+			}
+		} else {
+			fs = p;
+			while (*p && *p != ',') {
+				p++;
+			}
+		}
+		f[nf++] = fs;
+		if (*p != ',') {
+			break;
+		}
+		*p++ = 0;
+	}
+	for (uint32_t i = 0; i < nf && sn + 3 < sizeof(shape); i++) {
+		uint8_t tmp[4];
+		char c = !f[i][0] ? 'e' : (strchr(f[i], ':') ? '6' : (v4_parse(f[i], tmp) ? '4' : ((f[i][0] >= '0' && f[i][0] <= '9') ? 'n' : 's')));
+
+		shape[sn++] = c;
+	}
+	shape[sn] = 0;
+	if (!first) {
+		SAY("r1cell: CGCONTRDP line #%u: %u fields [%s] (ignored, the first one was taken)", d_ncontrdp, nf, shape);
+		return;
+	}
+	memset(d_dns, 0, sizeof(d_dns));
+	if (nf > 3 && !d_have_ip && v4_parse(f[3], d_ip)) {     /* 27.007: local address and subnet mask (empty on this modem; GUESS for others) */
+		d_have_ip = true;
+		d_src = "CGCONTRDP field 3";
+	}
+	for (uint32_t i = 0; i < nf; i++) {
+		d_v6seen |= strchr(f[i], ':') != NULL;
+	}
+	d_ndns = 0;
+	for (uint32_t i = 5; i < 7 && i < nf; i++) {
+		if (v4_parse(f[i], d_dns[d_ndns])) {
+			d_ndns++;
+		} else {
+			memset(d_dns[d_ndns], 0, 4);
+		}
+	}
+	d_mtu = (nf > 11 && f[11][0] >= '0' && f[11][0] <= '9') ? (int)strtol(f[11], NULL, 10) : -1;
+	if (!d_apn[0] && nf > 2 && strlen(f[2]) < sizeof(d_apn)) {
+		strlcpy(d_apn, f[2], sizeof(d_apn));
+	}
+	SAYM("r1cell: CGCONTRDP: %u fields [%s] cid %s apn \"%.30s\" ip(now) %u.%u.x.x gw %s dns %u.%u.%u.%u %u.%u.%u.%u (%u found) mtu %d", nf, shape, nf ? f[0] : "-", nf > 2 ? f[2] : "-",
+	    d_ip[0], d_ip[1], (nf > 4 && v4_parse(f[4], gw)) ? "yes" : "no", d_dns[0][0], d_dns[0][1], d_dns[0][2], d_dns[0][3], d_dns[1][0], d_dns[1][1], d_dns[1][2], d_dns[1][3],
+	    d_ndns, d_mtu);
+}
+
+static uint16_t
+inet_csum(const uint8_t *b, uint32_t n, uint32_t sum)
+{
+	for (uint32_t i = 0; i + 1 < n; i += 2) {
+		sum += (uint32_t)(b[i] << 8 | b[i + 1]);
+	}
+	if (n & 1) {
+		sum += (uint32_t)b[n - 1] << 8;
+	}
+	while (sum >> 16) {
+		sum = (sum & 0xffff) + (sum >> 16);
+	}
+	return (uint16_t)(~sum & 0xffff);
+}
+
+/* IPv4/UDP, bearer address -> d_dns[which]:53, standard query example.com A (57 bytes); IP and UDP checksums set; sent raw on CLDMA q0 netif 0 */
+static bool
+dns_send(uint32_t which, uint32_t rel)
+{
+	static const uint8_t qname[13] = { 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
+	uint8_t p[57];
+	const uint8_t *dst = d_dns[which];
+	uint32_t ps, c;
+
+	if (!d_id) {
+		uint32_t r = 0;
+
+		read_random(&r, sizeof(r));
+		d_id = (uint16_t)(r & 0xffff) | 1;
+		d_sport = (uint16_t)(40000 + ((r >> 16) % 20000));
+	}
+	memset(p, 0, sizeof(p));
+	p[0] = 0x45;
+	p[2] = 0;
+	p[3] = 57;
+	p[4] = 0x52;
+	p[5] = 0x31;
+	p[6] = 0x40;            /* DF */
+	p[8] = 64;
+	p[9] = 17;
+	memcpy(p + 12, d_ip, 4);
+	memcpy(p + 16, dst, 4);
+	c = inet_csum(p, 20, 0);
+	p[10] = (uint8_t)(c >> 8);
+	p[11] = (uint8_t)c;
+	p[20] = (uint8_t)(d_sport >> 8);
+	p[21] = (uint8_t)d_sport;
+	p[23] = 53;
+	p[25] = 37;             /* UDP length 8 + 29 */
+	p[28] = (uint8_t)(d_id >> 8);
+	p[29] = (uint8_t)d_id;
+	p[30] = 0x01;           /* RD */
+	p[33] = 1;              /* QDCOUNT */
+	memcpy(p + 40, qname, sizeof(qname));
+	p[54] = 1;              /* A */
+	p[56] = 1;              /* IN */
+	ps = (uint32_t)(d_ip[0] << 8 | d_ip[1]) + (uint32_t)(d_ip[2] << 8 | d_ip[3]) + (uint32_t)(dst[0] << 8 | dst[1]) + (uint32_t)(dst[2] << 8 | dst[3]) + 17 + 37;
+	c = inet_csum(p + 20, 37, ps);
+	if (!c) {
+		c = 0xffff;
+	}
+	p[26] = (uint8_t)(c >> 8);
+	p[27] = (uint8_t)c;
+	d_sendms[which] = rel;
+	d_tries++;
+	SAYM("r1cell: [%u ms] dns query #%u: example.com A to %u.%u.%u.%u:53 from %u.%u.x.x port %u id %#x, 57 bytes", rel, d_tries, dst[0], dst[1], dst[2], dst[3], d_ip[0], d_ip[1],
+	    d_sport, d_id);
+	return cldma_tx(p, sizeof(p), rel);
+}
+
+static bool
+dns_skip(const uint8_t *m, uint32_t ml, uint32_t *pos)
+{
+	uint32_t q = *pos;
+
+	for (int guard = 0; guard < 64; guard++) {
+		uint8_t c;
+
+		if (q >= ml) {
+			return false;
+		}
+		c = m[q];
+		if (c == 0) {
+			*pos = q + 1;
+			return true;
+		}
+		if ((c & 0xc0) == 0xc0) {
+			*pos = q + 2;
+			return *pos <= ml;
+		}
+		if (c & 0xc0) {
+			return false;
+		}
+		q += 1 + c;
+	}
+	return false;
+}
+
+/* every downlink packet from redwood_cldma.c, still in its ring buffer: 4-byte lhif_header {u16 pdcp_count; u8 flow:4,f:3,rsv:1; u8 netif:5,nw_type:3}, then the raw IP packet */
+void
+cell_rx(const uint8_t *b, uint32_t len, uint32_t ms)
+{
+	const uint8_t *ip = b + 4, *u, *m;
+	uint32_t il, ihl, tl, ml, pos, qd, an, k;
+	uint32_t from = 9;
+	uint16_t fl;
+	bool have_a = false;
+	uint8_t a[4] = { 0, 0, 0, 0 };
+
+	d_rxp++;
+	if (len < 5) {
+		SAY("r1cell: rx #%u len %u (too short for the lhif header)", d_rxp, len);
+		return;
+	}
+	il = len - 4;
+	d_rxb += il;
+	for (k = 0; k < d_ndns; k++) {
+		if (il >= 20 && (ip[0] >> 4) == 4 && !memcmp(ip + 12, d_dns[k], 4)) {
+			from = k;
+		}
+	}
+	if (d_rx_logged++ < 20) {
+		if (il >= 20 && (ip[0] >> 4) == 4) {
+			if (from < 2) {
+				SAY("r1cell: rx #%u len %u netif %u IPv4 proto %u from %u.%u.%u.%u (a DNS server)", d_rxp, il, b[3] & 0x1f, ip[9], ip[12], ip[13], ip[14], ip[15]);
+			} else {
+				SAY("r1cell: rx #%u len %u netif %u IPv4 proto %u from %u.%u.x.x", d_rxp, il, b[3] & 0x1f, ip[9], ip[12], ip[13]);
+			}
+		} else {
+			SAY("r1cell: rx #%u len %u netif %u version %u first byte %02x", d_rxp, il, b[3] & 0x1f, ip[0] >> 4, ip[0]);
+		}
+	}
+	if (d_tries == 0 || d_reply || from > 1 || il < 20 + 8 + 12) {
+		return;
+	}
+	ihl = (uint32_t)(ip[0] & 15) * 4;
+	tl = (uint32_t)(ip[2] << 8 | ip[3]);
+	if (ihl < 20 || ip[9] != 17 || tl > il || tl < ihl + 8 + 12) {
+		return;
+	}
+	u = ip + ihl;
+	m = u + 8;
+	ml = tl - ihl - 8;
+	if ((u[0] << 8 | u[1]) != 53 || (u[2] << 8 | u[3]) != d_sport || (m[0] << 8 | m[1]) != d_id) {
+		return;
+	}
+	fl = (uint16_t)(m[2] << 8 | m[3]);
+	qd = (uint32_t)(m[4] << 8 | m[5]);
+	an = (uint32_t)(m[6] << 8 | m[7]);
+	pos = 12;
+	for (k = 0; k < qd && k < 4; k++) {
+		if (!dns_skip(m, ml, &pos)) {
+			break;
+		}
+		pos += 4;
+	}
+	for (k = 0; k < an && k < 16 && pos < ml && !have_a; k++) {
+		uint32_t type, cls, rdl;
+
+		if (!dns_skip(m, ml, &pos) || pos + 10 > ml) {
+			break;
+		}
+		type = (uint32_t)(m[pos] << 8 | m[pos + 1]);
+		cls = (uint32_t)(m[pos + 2] << 8 | m[pos + 3]);
+		rdl = (uint32_t)(m[pos + 8] << 8 | m[pos + 9]);
+		if (pos + 10 + rdl > ml) {
+			break;
+		}
+		if (type == 1 && cls == 1 && rdl == 4) {
+			memcpy(a, m + pos + 10, 4);
+			have_a = true;
+		}
+		pos += 10 + rdl;
+	}
+	d_reply = true;
+	snprintf(d_res, sizeof(d_res), "ok rcode %u/answers %u/rtt %u ms", fl & 15, an, ms - d_sendms[from]);
+	SAYM("r1cell: dns reply %u bytes from %u.%u.%u.%u, rcode %u, answers %u, first A %u.%u.%u.%u, rtt %u ms", tl, ip[12], ip[13], ip[14], ip[15], fl & 15, an, a[0], a[1], a[2], a[3],
+	    ms - d_sendms[from]);
+}
+
+/* the must-line, at the time and again at the end (from result_2e2) */
+static void
+result_3a(uint32_t rel)
+{
+	char res[64], apn[24], ip[16];
+	uint32_t n = 0;
+
+	(void)rel;
+	while (d_apn[n] && d_apn[n] != '.' && n < sizeof(apn) - 1) {
+		apn[n] = d_apn[n];
+		n++;
+	}
+	apn[n] = 0;
+	snprintf(ip, sizeof(ip), "%u.%u.x.x", d_ip[0], d_ip[1]);
+	if (d_res[0]) {
+		strlcpy(res, d_res, sizeof(res));
+	} else if (d_tries) {
+		snprintf(res, sizeof(res), "no reply%s", d_fin ? "" : " (stopped)");
+	} else {
+		snprintf(res, sizeof(res), "not sent: %s", rp_failed ? rp_why : "data phase not reached");
+	}
+	SAYM("r1md: RESULT 3a: addr-src %s; bearer %s ip %s dns %u.%u.%u.%u %u.%u.%u.%u; tx %u pkts %u bytes, rx %u pkts %u bytes; dns %s", d_have_ip ? d_src : "none", apn[0] ? apn : "-", d_have_ip ? ip : "-",
+	    d_dns[0][0], d_dns[0][1], d_dns[0][2], d_dns[0][3], d_dns[1][0], d_dns[1][1], d_dns[1][2], d_dns[1][3], cldma_tx_pkts(), cldma_tx_bytes(), d_rxp, d_rxb, res);
+}
+
+/* data finished (reply, no reply, deadline): hold 20 s, then the normal off sequence */
+static void
+data_finish(uint32_t rel, const char *why)
+{
+	d_fin = true;
+	SAYM("r1cell: [%u ms] data phase done (%s): hold 20 s", rel, why);
+	result_3a(rel);
+	held_started = true;
+	rp_t = rel;
+	rp = RP_HOLD;
+}
+
+/* data could not start / was refused: no hold, straight to the off sequence */
+static void
+data_fail(uint32_t rel, const char *why)
+{
+	d_fin = true;
+	if (!d_tries && !d_res[0]) {
+		snprintf(d_res, sizeof(d_res), "not sent: %.40s", why);
+	}
+	SAYM("r1cell: [%u ms] data stopped (%s): off sequence", rel, why);
+	result_3a(rel);
+	rp = RP_OFF;
+	rp_new = true;
+}
+
+/* called from radio_drive in state RP_DATA when no AT command is in flight */
+static void
+data_drive(uint32_t rel)
+{
+	if (rel - dp_t0 >= 30000) {
+		data_finish(rel, "30 s deadline");
+		return;
+	}
+	switch (dp) {
+	case DP_START: {
+		static const char want[] = "reseller";
+		bool ok = d_apn[0] != 0;
+
+		for (uint32_t i = 0; ok && i < 8; i++) {
+			ok = (d_apn[i] | 0x20) == want[i];
+		}
+		ok = ok && (d_apn[8] == 0 || d_apn[8] == '.');
+		if (!ok) {
+			data_fail(rel, d_apn[0] ? "attach APN is not RESELLER" : "no APN from +EIAREG");
+			return;
+		}
+		SAYM("r1cell: [%u ms] bearer binding: AT+EAPNACT for APN RESELLER (EAPNSET/EIAAPN not sent)", rel);
+		radio_load(at_seqAPN, 1);
+		dp = DP_ACT;
+		break;
+	}
+	case DP_ACT:
+		if (!at_last_ok) {
+			data_fail(rel, at_to ? "EAPNACT timeout" : "EAPNACT failed");
+			return;
+		}
+		SAYM("r1cell: [%u ms] EAPNACT OK, +CGEV: ME PDN ACT %s; address so far: %s", rel, d_cgev ? "seen" : "NOT seen", d_have_ip ? d_src : "none");
+		radio_load(at_seqEPDN, 1);      /* stock order: EPDN ifst, EIF ifst up, CGCONTRDP; then CGPADDR (extra) */
+		dp = DP_EPDN;
+		break;
+	case DP_EPDN:
+		SAYM("r1cell: [%u ms] AT+EPDN ifst: %s; address so far: %s", rel, at_last_ok ? "OK" : (at_to ? "timeout" : "error (continuing)"), d_have_ip ? d_src : "none");
+		radio_load(at_seqEIF, 1);
+		dp = DP_EIF;
+		break;
+	case DP_EIF:
+		SAYM("r1cell: [%u ms] AT+EIF ifst up: %s", rel, at_last_ok ? "OK" : (at_to ? "timeout" : "error (continuing)"));
+		radio_load(at_seqRD, 1);
+		dp = DP_RD;
+		break;
+	case DP_RD:
+		SAYM("r1cell: [%u ms] AT+CGCONTRDP: %s; address so far: %s, %u DNS", rel, at_last_ok ? "OK" : (at_to ? "timeout" : "error (continuing)"), d_have_ip ? d_src : "none", d_ndns);
+		radio_load(at_seqPA, 1);
+		dp = DP_PA;
+		break;
+	case DP_PA:
+		SAYM("r1cell: [%u ms] AT+CGPADDR: %s; address so far: %s", rel, at_last_ok ? "OK" : (at_to ? "timeout" : "error (continuing)"), d_have_ip ? d_src : "none");
+		if (!d_have_ip && eif_on) {
+			radio_load(at_seqEPA, 1);       /* GUESS (r1_md_eif=1): AT+EPDN=0,"addr" */
+			dp = DP_EPA;
+			break;
+		}
+		__attribute__((fallthrough));
+	case DP_EPA:
+		if (dp == DP_EPA) {
+			SAYM("r1cell: [%u ms] AT+EPDN addr (GUESS): %s; address so far: %s", rel, at_last_ok ? "OK" : (at_to ? "timeout" : "error"), d_have_ip ? d_src : "none");
+		}
+		if (!d_have_ip && d_hexok) {
+			memcpy(d_ip, d_hex, 4);
+			d_have_ip = true;
+			d_src = "8-hex-digit token (GUESS)";
+			SAYM("r1cell: no dotted IPv4 anywhere: using the 8-hex-digit token %u.%u.x.x (GUESS)", d_ip[0], d_ip[1]);
+		}
+		if (!d_have_ip) {
+			data_fail(rel, d_v6seen ? "bearer is IPv6-only (no IPv4 address in any response; IPv6 not attempted)" : "no IPv4 address from any source");
+		} else if (!d_ndns) {
+			data_fail(rel, "no DNS server");
+		} else if (!dns_send(0, rel)) {
+			data_fail(rel, "tx refused");
+		} else {
+			d_cur = 0;
+			dp_t = rel;
+			dp = DP_WAIT;
+		}
+		break;
+	case DP_WAIT:
+		if (d_reply) {
+			data_finish(rel, "dns answered");
+		} else if (rel - dp_t >= 5000) {
+			if (d_cur == 0 && d_ndns > 1) {
+				if (!dns_send(1, rel)) {
+					data_fail(rel, "tx refused (retry)");
+					return;
+				}
+				d_cur = 1;
+				dp_t = rel;
+			} else {
+				data_finish(rel, "no reply in 5 s");
+			}
+		}
+		break;
+	}
+}
+
 /* called every poll while rd_active */
 static void
 radio_drive(uint32_t rel)
@@ -2721,7 +3317,7 @@ radio_drive(uint32_t rel)
 			radio_stop("hard cap of 4 minutes");
 		} else if (efun1_to) {
 			radio_stop("EFUN=1 timeout");
-		} else if (st2a.unanswered || rpc_bad || st2a.sys_late || st2a.ctl_odd || (rd_t_on ? (oth_new_ch > 3 || oth_new > 50) : st2a.oth_bad != 0)) {
+		} else if (st2a.unanswered || rpc_bad || st2a.sys_late || st2a.ctl_odd || (rd_t_on ? (oth_new_ch > (data_on ? 6 : 3) || oth_new > (data_on ? 120 : 50)) : st2a.oth_bad != 0)) {
 			radio_stop("unexpected traffic");
 		}
 	}
@@ -2792,15 +3388,26 @@ radio_drive(uint32_t rel)
 		}
 		break;
 	case RP_POST:
+		if (data_on) {
+			rp = RP_DATA;
+			dp = DP_START;
+			dp_t0 = rel;
+			md_budget += 6000;
+			SAYM("r1cell: [%u ms] registered: Stage 3a data phase begins (deadline 30 s, then hold 20 s)", rel);
+			break;
+		}
 		rp = RP_HOLD;
 		held_started = true;
 		rp_t = rel;
 		break;
+	case RP_DATA:
+		data_drive(rel);
+		break;
 	case RP_HOLD:
-		if (rel - rp_t >= 60000) {
+		if (rel - rp_t >= (data_on ? 20000u : 60000u)) {
 			rp = RP_OFF;
 			rp_new = true;
-			SAYM("r1md: radio: hold of 60 s done: off sequence");
+			SAYM("r1md: radio: hold of %u s done: off sequence", data_on ? 20u : 60u);
 		} else if (rel - rp_csq >= 10000) {
 			rp_csq = rel;
 			radio_load(at_seqS, 1);
@@ -3268,6 +3875,10 @@ md_thread(__unused void *parameter, __unused wait_result_t result)
 		goto out;
 	}
 	ccif_reset();
+	if (data_on) {
+		cldma_data_enable();
+		SAYM("r1md: Stage 3a armed (r1_md_data=1%s): TX ring, 0x400d answer, bearer binding after registration", eif_on ? ", r1_md_eif=1" : "");
+	}
 	if (cldma_on && !cldma_rx_start(md_ms())) {
 		md_power_off("cldma rx not started");
 		goto out;
@@ -3320,6 +3931,9 @@ redwood_md_init(void)
 		radio_req = PE_parse_boot_argn("r1_md_radio", &v, sizeof(v)) && v == 1;
 		/* the CLDMA receive ring is started ONLY with r1_md_cldma=1; without it not one CLDMA register is written (snapshots are reads) */
 		cldma_on = PE_parse_boot_argn("r1_md_cldma", &v, sizeof(v)) && v == 1;
+		/* Stage 3a: r1_md_data=1 only counts together with r1_md_radio=1 and r1_md_cldma=1 (the ten gates and registration are checked at run time) */
+		data_on = radio_req && cldma_on && PE_parse_boot_argn("r1_md_data", &v, sizeof(v)) && v == 1;
+		eif_on = data_on && PE_parse_boot_argn("r1_md_eif", &v, sizeof(v)) && v == 1;
 		imei_h_set = PE_parse_boot_argn("r1_md_imei_h", &imei_h, sizeof(imei_h));
 		had_wifi = PE_parse_boot_argn("wifi", &v, sizeof(v)) && v != 0;
 		(void)PE_parse_boot_argn("connsys_step", &g_connsys, sizeof(g_connsys));

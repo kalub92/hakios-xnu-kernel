@@ -4,6 +4,9 @@
  *  - the receive ring (SO queue 0): only with boot-arg r1_md_cldma=1 (redwood_md.c calls cldma_rx_start only then). With the arg absent
  *    not one CLDMA register is written. Polled, no interrupts. Received packets are only counted and their first bytes logged; nothing is
  *    forwarded and nothing is transmitted.
+ *  - Stage 3a (boot-arg r1_md_data=1, redwood_md.c calls cldma_data_enable() before cldma_rx_start): ALSO a 32-entry TGPD ring for TX queue 0
+ *    (a few packets, never reuses a slot, so no buffer is ever rewritten while the hardware may read it), received packets handed to
+ *    cell_rx() in redwood_md.c, caps 20 packets / 4096 bytes sent, 200 packets received. Polled, no interrupts.
  */
 #include <kern/kalloc.h>
 #include <libkern/libkern.h>
@@ -30,6 +33,15 @@ extern void redwood_md_say(bool must, const char *format, ...) __printflike(2, 3
 #define CANARY          0xc1d3a5a5u
 #define MAX_RX          2000u           /* own stop rule: a flood is not what this step is for */
 #define MAX_LOG         10u
+/* Stage 3a TX (docs/cellular-stage3.md C.2; ccci_hif_cldma.c cldma_gpd_handle_tx_request, cldma_reg.h) */
+#define TX_N            32              /* tgpds in the ring; only TX_MAX_PKTS are ever used, so no slot is reused */
+#define TX_BUF          512u            /* bytes per slot (the one kernel-built query is 57) */
+#define TX_MAX_PKTS     20u
+#define TX_MAX_BYTES    4096u
+#define RX_MAX_DATA     200u
+#define TX_STUCK_MS     2000u           /* HWO still set this long after the start command: stop rule */
+
+extern void cell_rx(const uint8_t *b, uint32_t len, uint32_t ms);
 
 static vm_offset_t ao, pd, infra_b;
 
@@ -109,7 +121,21 @@ static struct {
 	uint8_t *bufs;
 	uint32_t *lo, *hi;              /* canary pages */
 	uint64_t lo_pa, g_pa, bufs_pa, hi_pa;
+	struct tgpd *tg;                /* TX ring (data only), then 512-byte buffers, then a canary page */
+	uint8_t *tbufs;
+	uint32_t *thi;
+	uint64_t tg_pa, tbufs_pa, thi_pa;
 } cl;
+struct tgpd {
+	uint8_t flags, non_used, msb, netif;
+	uint32_t next;
+	uint32_t buf;
+	uint16_t len, psn;
+};
+
+static bool tx_on;                      /* cldma_data_enable() was called: TX ring, hook, 200-packet cap */
+static uint32_t rx_cap = MAX_RX;
+static uint32_t tx_n, tx_done, tx_bytes, tx_started, tx_t0[TX_N], tx_l2_logged, dma_err0;
 static volatile bool cl_started;
 static uint32_t cl_cur, cl_rx, cl_resume, cl_err, cl_logged, cl_l2_last;
 static uint64_t cl_bytes;
@@ -124,6 +150,31 @@ uint32_t
 cldma_rx_err(void)
 {
 	return cl_err;
+}
+
+void
+cldma_data_enable(void)
+{
+	tx_on = true;
+	rx_cap = RX_MAX_DATA - 1;       /* the 200th packet trips the rule */
+}
+
+uint32_t
+cldma_tx_pkts(void)
+{
+	return tx_n;
+}
+
+uint32_t
+cldma_tx_bytes(void)
+{
+	return tx_bytes;
+}
+
+uint32_t
+cldma_tx_completed(void)
+{
+	return tx_done;
 }
 
 /* cldma_plat_hw_reset (ccci_cldma_plat.c 50-98): RST0 set, a (useless) read of RST1 = the reference's only "delay", RST1 clear; the same for PD;
@@ -148,7 +199,8 @@ bool
 cldma_rx_start(uint32_t ms)
 {
 	vm_offset_t va = 0;
-	uint64_t size = (uint64_t)PAGE_SIZE * 3 + (uint64_t)RING_N * BUF_BYTES;
+	uint64_t rxsize = (uint64_t)PAGE_SIZE * 3 + (uint64_t)RING_N * BUF_BYTES;
+	uint64_t size = rxsize + (tx_on ? (uint64_t)PAGE_SIZE * 3 : 0);     /* + TX ring page, TX buffer page, TX canary page */
 	uint32_t maxpn = (uint32_t)((0x100000000ULL >> PAGE_SHIFT) - 1);
 
 	if (!ao || !pd || (rd(infra_b, CG2_STA) & (1u << 3))) {
@@ -188,6 +240,34 @@ cldma_rx_start(uint32_t ms)
 	for (uint32_t i = 0; i < PAGE_SIZE / 4; i++) {
 		cl.lo[i] = cl.hi[i] = CANARY;
 	}
+	if (tx_on) {
+		cl.tg = (struct tgpd *)(cl.va + rxsize);
+		cl.tbufs = (uint8_t *)(cl.va + rxsize + PAGE_SIZE);
+		cl.thi = (uint32_t *)(cl.va + rxsize + 2 * (uint64_t)PAGE_SIZE);
+		cl.tg_pa = cl.pa + rxsize;
+		cl.tbufs_pa = cl.tg_pa + PAGE_SIZE;
+		cl.thi_pa = cl.tg_pa + 2 * (uint64_t)PAGE_SIZE;
+		_Static_assert(TX_N * TX_BUF <= 16384, "TX buffers must fit the one page");
+		if (TX_N * TX_BUF > PAGE_SIZE) {
+			redwood_md_say(true, "r1md: cldma: NOT started (page too small for the TX buffers)");
+			return false;
+		}
+		for (uint32_t i = 0; i < PAGE_SIZE / 4; i++) {
+			cl.thi[i] = CANARY;
+		}
+		for (int i = 0; i < TX_N; i++) {
+			struct tgpd *t = &cl.tg[i];
+
+			t->flags = 0x80;        /* IOC, HWO clear (cldma_tx_ring_init) */
+			t->non_used = 0;
+			t->msb = 0;
+			t->netif = 0;
+			t->next = (uint32_t)(cl.tg_pa + (uint64_t)((i + 1) % TX_N) * sizeof(struct tgpd));
+			t->buf = (uint32_t)(cl.tbufs_pa + (uint64_t)i * TX_BUF);
+			t->len = 0;
+			t->psn = 0;
+		}
+	}
 	for (int i = 0; i < RING_N; i++) {
 		struct rgpd *g = &cl.g[i];
 
@@ -208,6 +288,16 @@ cldma_rx_start(uint32_t ms)
 	wr(ao, 0x400, rd(ao, 0x400) | 1);
 	wr(ao, 0x404, (uint32_t)cl.g_pa);       /* RQSAR(0) */
 	wr(ao, 0x40c, rd(ao, 0x40c) & ~0xfu);   /* 4 MSB of queue 0 (reference: read-modify-write; the memory is below 4 GB) */
+	if (tx_on) {
+		/* cldma_start: TQSAR(0) + its 4 MSB nibble, and the power-on-domain backup copy; the queue itself is started on the first send */
+		wr(pd, 0x00, (uint32_t)cl.tg_pa);
+		wr(pd, 0x10, rd(pd, 0x10) & ~0xfu);
+		wr(ao, 0x04, (uint32_t)cl.tg_pa);
+		wr(ao, 0x14, rd(ao, 0x14) & ~0xfu);
+		dma_err0 = rd(pd, 0x870);
+		redwood_md_say(true, "r1md: cldma: TX q0 ring %#llx x%d (%u-byte buffers %#llx, canary %#llx), TQSAR0 %#x BK %#x, DMA_ERR %#x", cl.tg_pa, TX_N, TX_BUF, cl.tbufs_pa, cl.thi_pa,
+		    rd(pd, 0x00), rd(ao, 0x04), dma_err0);
+	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 	wr(pd, 0x404, 0xff);            /* SO_START_CMD = CLDMA_BM_ALL_QUEUE, as cldma_start (ccci_hif_cldma.c 2192); gen93 has the one RX queue */
 	(void)rd(pd, 0x404);
@@ -231,6 +321,9 @@ canary_ok(bool full)
 		if (full && (cl.lo[i] != CANARY || cl.hi[PAGE_SIZE / 4 - 1 - i] != CANARY)) {
 			return false;
 		}
+		if (tx_on && cl.thi && cl.thi[i] != CANARY) {
+			return false;
+		}
 	}
 	return true;
 }
@@ -244,7 +337,7 @@ cldma_rx_poll(uint32_t ms)
 	if (!cl_started || cl_err) {
 		return cl_err != 0;
 	}
-	while (!(((volatile struct rgpd *)&cl.g[cl_cur])->flags & 1) && cl_rx < MAX_RX + 1) {
+	while (!(((volatile struct rgpd *)&cl.g[cl_cur])->flags & 1) && cl_rx < rx_cap + 1) {
 		struct rgpd *g = &cl.g[cl_cur];
 		uint32_t len;
 
@@ -256,6 +349,9 @@ cldma_rx_poll(uint32_t ms)
 		cl_bytes += len;
 		if (cl_logged++ < MAX_LOG) {
 			redwood_md_say(true, "r1md: [%u ms] cldma rx #%u len %u: %02x %02x %02x %02x %02x %02x %02x %02x", ms, cl_rx, len, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+		}
+		if (tx_on) {
+			cell_rx(b, len < BUF_BYTES ? len : BUF_BYTES, ms);      /* the buffer is still ours: it is re-armed below */
 		}
 		g->len = 0;
 		g->allow = DL_MTU;
@@ -281,16 +377,90 @@ cldma_rx_poll(uint32_t ms)
 	if ((l2 & 4) || l3a || l3b) {
 		cl_err |= (l2 & 4) | (l3a ? 0x100 : 0) | (l3b ? 0x200 : 0);
 	}
+	if (tx_on && tx_n) {
+		uint32_t l2t = rd(pd, 0x800), ule = rd(pd, 0x3c), de = rd(pd, 0x870);
+
+		/* reclaim: a tgpd whose HWO the hardware cleared is done (its buffer is never reused anyway) */
+		while (tx_done < tx_n && !(((volatile struct tgpd *)&cl.tg[tx_done])->flags & 1)) {
+			redwood_md_say(true, "r1md: [%u ms] cldma tx #%u done (HWO clear) %u ms after the start", ms, tx_done + 1, ms - tx_t0[tx_done]);
+			tx_done++;
+		}
+		if (tx_done < tx_n && ms - tx_t0[tx_done] > TX_STUCK_MS) {
+			cl_err |= 0x1000;
+		}
+		if (l2t || ule) {
+			if (tx_l2_logged++ < 6) {
+				redwood_md_say(true, "r1md: [%u ms] cldma tx L2TISAR0 %#x UL_ERROR %#x L3TISAR %#x %#x UL_STATUS %#x", ms, l2t, ule, rd(pd, 0x810), rd(pd, 0x814), rd(pd, 0x28));
+			}
+			if (l2t) {
+				wr(pd, 0x800, l2t);     /* write 1 to clear */
+			}
+		}
+		if ((l2t & 0xf00) || ule) {
+			cl_err |= 0x2000;
+		}
+		if (de != dma_err0) {
+			cl_err |= 0x4000;
+		}
+	}
 	if (!canary_ok(false)) {
 		cl_err |= 0x400;
 	}
-	if (cl_rx > MAX_RX) {
+	if (cl_rx > rx_cap) {
 		cl_err |= 0x800;
 	}
 	if (cl_err) {
 		redwood_md_say(true, "r1md: [%u ms] cldma STOP RULE: err %#x (rx %u)", ms, cl_err, cl_rx);
 	}
 	return cl_err != 0;
+}
+
+/*
+ * Send one raw IP packet on TX queue 0, netif 0 (ccmni0; ccci_h->data[0] = ccmni index becomes tgpd.netif, the ccci header itself is stripped on
+ * gen93: ccci_hif_cldma.c cldma_gpd_handle_tx_request, MD_GENERATION >= 6293). Ownership: the slot's buffer and tgpd are written first, HWO is set LAST
+ * (after a barrier), from then on the hardware owns them and nothing writes them again (slots are never reused: at most TX_MAX_PKTS < TX_N sends).
+ * The memory is never freed. Returns false (nothing sent) on a cap, an error, a missing ring or a bad length.
+ */
+bool
+cldma_tx(const uint8_t *ip, uint32_t len, uint32_t ms)
+{
+	struct tgpd *t;
+	uint8_t *buf;
+
+	if (!tx_on || !cl_started || !cl.tg || cl_err) {
+		return false;
+	}
+	if (len < 20 || len > TX_BUF || tx_n >= TX_MAX_PKTS || tx_bytes + len > TX_MAX_BYTES) {
+		redwood_md_say(true, "r1md: cldma tx REFUSED: len %u, %u pkts %u B sent so far (caps %u pkts %u B)", len, tx_n, tx_bytes, TX_MAX_PKTS, TX_MAX_BYTES);
+		return false;
+	}
+	t = &cl.tg[tx_n];
+	buf = cl.tbufs + (uint64_t)tx_n * TX_BUF;
+	if ((((volatile struct tgpd *)t)->flags & 1) || ((volatile struct tgpd *)t)->len != 0) {
+		redwood_md_say(true, "r1md: cldma tx REFUSED: slot %u not free", tx_n);
+		return false;
+	}
+	memcpy(buf, ip, len);
+	t->len = (uint16_t)len;
+	t->msb = 0;
+	t->netif = 0;
+	t->non_used = 1;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	t->flags = 0x81;                /* IOC | HWO: the hardware owns the slot from here */
+	__asm__ volatile ("dsb sy" ::: "memory");
+	tx_t0[tx_n] = ms;
+	tx_n++;
+	tx_bytes += len;
+	if (!tx_started) {
+		wr(pd, 0x30, 1);        /* UL_START_CMD, queue 0 only (the reference writes all four; only q0 has a ring here) */
+		(void)rd(pd, 0x30);
+		tx_started = 1;
+	} else if (!(rd(pd, 0x28) & 1)) {
+		wr(pd, 0x34, 1);        /* UL_RESUME_CMD: the queue went idle on an empty tgpd */
+		(void)rd(pd, 0x34);
+	}
+	redwood_md_say(true, "r1md: [%u ms] cldma tx #%u len %u netif 0 queued (HWO set), UL_STATUS %#x CUR %#x", ms, tx_n, len, rd(pd, 0x28), rd(pd, 0x14));
+	return true;
 }
 
 /* counters line: first stat 3 / registration / end */
@@ -302,6 +472,9 @@ cldma_report(const char *tag, uint32_t ms)
 	}
 	redwood_md_say(true, "r1md: [%u ms] cldma counters (%s): rx %u pkts %llu B, resumes %u, cur %u, err %#x, L2RISAR %#x, STATUS %#x, started %d", ms, tag, cl_rx, cl_bytes, cl_resume, cl_cur,
 	    cl_err, cl_l2_last, cl_started ? rd(ao, 0x414) : 0, cl_started);
+	if (tx_on) {
+		redwood_md_say(true, "r1md: [%u ms] cldma tx (%s): %u pkts %u B queued, %u completed (HWO cleared), UL_STATUS %#x", ms, tag, tx_n, tx_bytes, tx_done, cl_started ? rd(pd, 0x28) : 0);
+	}
 }
 
 /* in md_power_off (every exit path): stop the queue, wait up to 10 ms, hardware reset; the memory is left allocated (nothing may be freed here) */
@@ -312,6 +485,13 @@ cldma_teardown(void)
 		return;
 	}
 	cl_started = false;
+	if (tx_on && tx_started) {
+		wr(pd, 0x38, 1);        /* UL_STOP_CMD: q0 stops before the reset; the TX memory is never freed */
+		for (int i = 0; i < 100 && (rd(pd, 0x28) & 1); i++) {
+			delay(100);
+		}
+		redwood_md_say(true, "r1md: cldma: tx stopped: %u queued %u completed, UL_STATUS %#x", tx_n, tx_done, rd(pd, 0x28));
+	}
 	wr(pd, 0x40c, 1);               /* SO_STOP_CMD */
 	for (int i = 0; i < 100 && (rd(ao, 0x414) & 1); i++) {
 		delay(100);
