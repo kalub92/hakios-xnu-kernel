@@ -58,6 +58,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <sys/ioctl.h>
+#include <sys/sysctl.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -257,6 +258,17 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+	/* L2: whether I/O ever reaches the speaker (after a Bluetooth pairing, say): a few lines into the kernel's kept log, 40 at most */
+	if (n > 0 && (strstr(line, "is with the HAL") != NULL || strstr(line, "audio: playing") != NULL || strstr(line, "stopped after") != NULL)) {
+		static unsigned kept_said;
+		char kept[270];
+
+		if (kept_said++ < 40) {
+			int k = snprintf(kept, sizeof(kept), "!%.*s", line[n - 1] == '\n' ? n - 1 : n, line);
+
+			sysctlbyname("kern.redwood.say", NULL, NULL, kept, (size_t)k);
+		}
+	}
 }
 
 /* The volume control's scale: a straight line of decibels over VOLUME_RANGE_DB. */

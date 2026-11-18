@@ -22,6 +22,8 @@
  *                                      them, through CoreHaptics: a tap, then a vibration of SECONDS (default
  *                                      0.3, at most 3: the kernel cuts a vibration at 1 s) at half strength, then
  *                                      three taps of falling strength
+ *   ifarg WORD                         stop quietly unless WORD is one of the kernel's boot-args
+ *   routes N SECONDS                   N times: wait SECONDS, then `route` (the route on record before and after a pairing)
  *   restart                            kill the audio server (launchd starts it again when it is next asked for):
  *                                      what every program then sees as "media services were reset"
  *
@@ -43,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/sysctl.h>
 
 #define RATE            48000
 #define BUFFER_FRAMES   4096
@@ -382,6 +385,22 @@ main(int argc, char **argv)
 			usleep((useconds_t)(atof(argv[++i]) * 1e6));
 		} else if (strcmp(argv[i], "springboard") == 0) {
 			wait_for_ringer();
+		} else if (strcmp(argv[i], "ifarg") == 0 && i + 1 < argc) {
+			char args[1024] = " ", word[100];
+			size_t size = sizeof(args) - 2;
+
+			sysctlbyname("kern.bootargs", args + 1, &size, NULL, 0);
+			strlcat(args, " ", sizeof(args));
+			snprintf(word, sizeof(word), " %s ", argv[++i]);
+			if (strstr(args, word) == NULL) {
+				return 0;
+			}
+		} else if (strcmp(argv[i], "routes") == 0 && i + 2 < argc) {
+			for (int n = atoi(argv[i + 1]); n > 0; n--) {
+				sleep((unsigned)atoi(argv[i + 2]));
+				route();
+			}
+			i += 2;
 		} else if (strcmp(argv[i], "route") == 0) {
 			route();
 		} else if (strcmp(argv[i], "restart") == 0) {

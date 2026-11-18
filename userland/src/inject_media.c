@@ -1178,6 +1178,60 @@ camera_app_probe(void)
 	});
 }
 
+/*
+ * L4 (docs/bluetooth-audio.md): what mediaserverd's own logging says of Bluetooth routes, for a hands-on look at why audio went quiet
+ * after a pairing: formats naming "luetooth", "route change", "BTAudioHALPlugin" or "port with name", with their string arguments, 40 lines.
+ * (Only for libraries outside the dyld cache; those of the cache may not be interposable.)
+ */
+extern void _os_log_impl(void *dso, void *log, int type, const char *format, uint8_t *buf, uint32_t size);
+static bool in_mediaserverd;
+
+static void
+os_log_media(void *dso, void *log, int type, const char *format, uint8_t *buf, uint32_t size)
+{
+	static unsigned said;
+
+	if (in_mediaserverd && format != NULL && said < 40 && (strstr(format, "luetooth") != NULL || strstr(format, "route change") != NULL ||
+	    strstr(format, "BTAudioHALPlugin") != NULL || strstr(format, "port with name") != NULL)) {
+		char text[300] = "";
+		const uint8_t *at = buf != NULL && size >= 2 ? buf + 2 : NULL, *end = buf + size;
+		unsigned arg = 0, count = buf != NULL && size >= 2 ? buf[1] : 0;
+
+		said++;
+		for (const char *f = format; at != NULL && *f != 0 && arg < count && at + 2 <= end; f++) {
+			if (*f != '%' || f[1] == '%') {
+				f += *f == '%';
+				continue;
+			}
+			while (*f != 0 && strchr("diouxXcsSpf@P", *f) == NULL) {
+				f++;
+			}
+			if (*f == 0 || at + 2 + at[1] > end) {
+				break;
+			}
+			if (*f == 's' && at[1] == 8) {
+				const char *string;
+
+				memcpy(&string, at + 2, 8);
+				if ((uintptr_t)string > 0x100000000UL) {
+					snprintf(text + strlen(text), sizeof(text) - strlen(text), " \"%.100s\"", string);
+				}
+			}
+			at += 2 + at[1];
+			arg++;
+		}
+		host_line("mediaserverd log: %.150s%s", format, text);
+	}
+	_os_log_impl(dso, log, type, format, buf, size);
+}
+
+__attribute__((used)) static const struct {
+	const void *replacement;
+	const void *replacee;
+} os_log_media_interpose[] __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *)os_log_media, (const void *)_os_log_impl },
+};
+
 __attribute__((constructor))
 static void
 redwood_media_init(void)
@@ -1198,6 +1252,7 @@ redwood_media_init(void)
 	if (name == NULL || strcmp(name, "mediaserverd") != 0) {
 		return;
 	}
+	in_mediaserverd = true;
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
 	torch = open("/dev/redwood-torch", O_WRONLY);
 	camera = access("/dev/redwood-camera", F_OK) == 0;

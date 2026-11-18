@@ -139,7 +139,7 @@ btsk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus,
 				if (base != NULL && length > 0) {
 					static unsigned slots;
 
-					if (++slots > 90 && slots < 200) {
+					if (false && ++slots > 90 && slots < 200) {
 						redwood_host_keep_add("connsys: bt channel: TX slot %u, %u bytes at offset %u: %02x %02x %02x %02x %02x %02x %02x %02x", slots, length,
 						    offset, base[offset], length > 1 ? base[offset + 1] : 0, length > 2 ? base[offset + 2] : 0,
 						    length > 3 ? base[offset + 3] : 0, length > 4 ? base[offset + 4] : 0, length > 5 ? base[offset + 5] : 0,

@@ -500,6 +500,9 @@ with open(path, 'w') as f:
 	# (first: the lines before it may run for minutes)
 	{ echo '/redwood/bin/logto &'; cat root/etc/rc.jobs; } > root/etc/rc.jobs.new && mv root/etc/rc.jobs.new root/etc/rc.jobs
 	[ -n "$BT" ] && echo '/redwood/bin/tolog /redwood/bin/bt_test 120 &' >> root/etc/rc.jobs
+	# bt_diag=1 (docs/bluetooth-audio.md L-lines): the audio route on record every 30 s, 10 times; bt_tone=1 also plays a tone and a system sound first (U1).
+	# Early in rc.jobs, not last: the scenario lines before the end block for minutes (rc.jobs runs a line at a time)
+	[ -n "$BT" ] && { echo '/redwood/bin/tolog /redwood/bin/sound_test ifarg bt_diag=1 wait 100 routes 10 30 &'; echo '/redwood/bin/tolog /redwood/bin/sound_test ifarg bt_tone=1 springboard route tone 3 system 1100 route &'; cat root/etc/rc.jobs; } > root/etc/rc.jobs.new && mv root/etc/rc.jobs.new root/etc/rc.jobs
 	# QUIET=1: launchd's own standard error goes nowhere (src/init.c). It says a few thousand
 	# lines about its own business in the first minutes and pushes everything else out of the
 	# kernel's log; the daemons keep their own standard error on the console all the same.

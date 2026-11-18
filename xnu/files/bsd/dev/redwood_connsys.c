@@ -1409,24 +1409,65 @@ static unsigned bt_txq_count;                   /* what has been written, not ye
 static struct selinfo bt_sel;
 static unsigned bt_opens;
 static uint32_t bt_said_packets_in, bt_said_packets_out;
+static unsigned bt_txq_max, bt_drops;           /* L6: the queue's high-water mark, and what it had no room for */
+
+/* L6: ACL traffic per 10 s, and each L2CAP Connection Request (PSM 0x0019 is AVDTP/A2DP) with its response */
+static void
+bt_acl_stats(const char *direction, const uint8_t *bytes, unsigned length)
+{
+	static unsigned out_pkts, out_bytes, in_pkts, in_bytes, nocp, psm_said;
+	static uint32_t next_ms;
+	const bool out = direction[0] == 'o';
+
+	if (length >= 5 && bytes[0] == 4 && bytes[1] == 0x13) {
+		nocp++;
+	}
+	if (length >= 5 && bytes[0] == 2) {
+		/* H4 02, handle+flags (2), ACL length (2), then L2CAP: length (2), channel (2), code, id, ... */
+		if (out) {
+			out_pkts++;
+			out_bytes += length;
+		} else {
+			in_pkts++;
+			in_bytes += length;
+		}
+		if (length >= 14 && bytes[7] == 1 && bytes[8] == 0 && psm_said < 20 && (bytes[9] == 2 || bytes[9] == 3)) {
+			psm_said++;
+			if (bytes[9] == 2) {
+				redwood_host_keep_add("bt: L2CAP %s ConnReq id %u PSM %04x", out ? "out" : "in ", bytes[10], bytes[13] | (bytes[14] << 8));
+			} else if (length >= 19) {
+				redwood_host_keep_add("bt: L2CAP %s ConnRsp id %u result %04x", out ? "out" : "in ", bytes[10], bytes[17] | (bytes[18] << 8));
+			}
+		}
+	}
+	if (out_pkts + in_pkts != 0 && (int32_t)(connsys_ms() - next_ms) >= 0) {
+		if (next_ms != 0) {
+			redwood_host_keep_add("bt: acl out %u pkts/%u B in %u pkts/%u B, txq max %u B, drops %u, nocp %u", out_pkts, out_bytes, in_pkts, in_bytes,
+			    bt_txq_max, bt_drops, nocp);
+		}
+		out_pkts = out_bytes = in_pkts = in_bytes = nocp = 0;
+		next_ms = connsys_ms() + 10000;
+	}
+}
 
 static void
 bt_dump(const char *direction, const uint8_t *bytes, unsigned length, uint32_t *counter)
 {
 	char text[3 * 32 + 1];
 
+	bt_acl_stats(direction, bytes, length);
 	if (direction[0] == 'i' && length == 7 && bytes[1] == 0x0e && bytes[2] == 4 && bytes[6] == 0 && (bytes[5] >> 2) != 0x3f && false) {
 		return;                 /* a plain Command Complete, status 0: the command above it says enough (the vendor ones are said) */
 	}
 	{
-		/* everything, for 30 s after a classic connection is asked for (Create_Connection 0x0405), up to 500 lines: what comes of it */
+		/* everything, for 30 s after a classic connection is asked for (Create_Connection 0x0405), up to 60 lines: what comes of it */
 		static uint32_t until_ms;
 		static unsigned connection_said;
 
 		if (direction[0] == 'o' && length >= 4 && bytes[0] == 1 && bytes[1] == 0x05 && bytes[2] == 0x04) {
 			until_ms = connsys_ms() + 30000;
 		}
-		if (until_ms != 0 && (int32_t)(until_ms - connsys_ms()) > 0 && connection_said < 500 && *counter >= 130 && length < 400) {
+		if (until_ms != 0 && (int32_t)(until_ms - connsys_ms()) > 0 && connection_said < 60 && *counter >= 130 && length < 400) {
 			connection_said++;
 			(*counter)--;
 		}
@@ -1441,7 +1482,7 @@ bt_dump(const char *direction, const uint8_t *bytes, unsigned length, uint32_t *
 		    (length >= 4 && bytes[0] == 4 && (bytes[1] == 0x3e || bytes[1] == 0x03 || bytes[1] == 0x04 || bytes[1] == 0x05 || bytes[1] == 0x06 || bytes[1] == 0x07 || bytes[1] == 0x0b || bytes[1] == 0x0c ||
 		    bytes[1] == 0x17 || bytes[1] == 0x18 || bytes[1] == 0x1d || bytes[1] == 0x22 || bytes[1] == 0x31 || bytes[1] == 0x32 || bytes[1] == 0x33 || bytes[1] == 0x36 || bytes[1] == 0x3d)) ||
 		    (length >= 4 && bytes[0] == 4 && bytes[1] == 0x0f && !(bytes[4] == 0 && bytes[5] == 0x01 && bytes[6] == 0x04 && length == 7)) ||
-		    (length >= 6 && bytes[0] == 2);          /* ACL data, both ways */
+		    false;          /* (ACL data is counted by bt_acl_stats, L6, not dumped) */
 
 		const bool le = (length >= 4 && bytes[0] == 1 && bytes[2] == 0x20) || (length >= 4 && bytes[0] == 4 && bytes[1] == 0x3e);
 		static unsigned le_said;
@@ -1875,6 +1916,11 @@ redwood_connsys_bt_send(const uint8_t *bytes, unsigned length)
 	if (bt_txq_count + length <= BT_TXQ) {
 		memcpy(bt_txq + bt_txq_count, bytes, length);
 		bt_txq_count += length;
+		if (bt_txq_count > bt_txq_max) {
+			bt_txq_max = bt_txq_count;
+		}
+	} else {
+		bt_drops++;
 	}
 	lck_mtx_unlock(&bt_lock);
 }

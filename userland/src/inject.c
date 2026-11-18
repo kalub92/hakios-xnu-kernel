@@ -2990,9 +2990,17 @@ os_log_watched(const char *how, const char *format, uint8_t *buf, uint32_t size)
 	unsigned arg = 0, count = buf[1];
 	bool restart = strstr(format, "Bluetooth error") != NULL;
 	bool plain = strcmp(format, "%{public}s") == 0 || strcmp(format, "%s") == 0;
-	bool wanted = restart || plain || strstr(format, "ower") != NULL || strstr(format, "tate") != NULL ||
-	    strstr(format, "ession") != NULL || strstr(format, "VSC") != NULL || strstr(format, "stall") != NULL ||
-	    strstr(format, "ompleted") != NULL || strstr(format, "nable") != NULL || strstr(format, "eady") != NULL ||
+	static uint64_t first_ns;
+	static unsigned audio_said;             /* L5: the audio profiles' lines, 60 at most, whatever else the caps say */
+	if (first_ns == 0) {
+		first_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	}
+	const bool early = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < first_ns + 60 * NSEC_PER_SEC;   /* the broad words ("tate", "ession" ...) only for the first minute */
+	const bool audio = audio_said < 60 && (strstr(format, "A2DP") != NULL || strstr(format, "AVDTP") != NULL || strstr(format, "HFP") != NULL ||
+	    strstr(format, "audio-device") != NULL || strstr(format, "HAL plugin") != NULL || strstr(format, "treaming") != NULL);
+	bool wanted = restart || plain || audio || (early && (strstr(format, "ower") != NULL || strstr(format, "tate") != NULL ||
+	    strstr(format, "ession") != NULL || strstr(format, "nable") != NULL)) || strstr(format, "VSC") != NULL || strstr(format, "stall") != NULL ||
+	    strstr(format, "ompleted") != NULL || strstr(format, "eady") != NULL ||
 	    strstr(format, "ransport") != NULL || strstr(format, "tack") != NULL || strstr(format, "hipset") != NULL ||
 	    strstr(format, "Sending") != NULL || strstr(format, "XPC message") != NULL || strstr(format, "uthoriz") != NULL ||
 	    strstr(format, "Found device") != NULL || strstr(format, "ADVBUFF") != NULL;
@@ -3003,7 +3011,7 @@ os_log_watched(const char *how, const char *format, uint8_t *buf, uint32_t size)
 	if (strstr(format, "Sending 'power state changed' event") != NULL) {
 		bluetoothd_on = true;           /* powered on: from here only what concerns a scan (and a restart), the rest is a few thousand XPC lines */
 	}
-	if (bluetoothd_on && bluetoothd_may_say <= 100 && !restart && strstr(format, "can") == NULL && strstr(format, "iscover") == NULL && strstr(format, "dvertisement") == NULL && strstr(format, "rop") == NULL && !plain &&
+	if (bluetoothd_on && bluetoothd_may_say <= 100 && !restart && strstr(format, "can") == NULL && strstr(format, "iscover") == NULL && strstr(format, "dvertisement") == NULL && strstr(format, "rop") == NULL && !plain && !audio &&
 	    strstr(format, "Found device") == NULL && strstr(format, "ADVBUFF") == NULL) {
 		return;
 	}
@@ -3015,7 +3023,7 @@ os_log_watched(const char *how, const char *format, uint8_t *buf, uint32_t size)
 	    strstr(format, "Unable to locate device") != NULL || strstr(format, "ADVBUFF") != NULL || strstr(format, "TryReadMatch") != NULL)) {
 		return;                 /* what scans repeat all the time, when the rest of the log is wanted */
 	}
-	if (!wanted || bluetoothd_said > bluetoothd_may_say || (!bluetoothd_after_start && !restart && strstr(format, "Bluetooth error") == NULL && !plain)) {
+	if (!wanted || (bluetoothd_said > bluetoothd_may_say && !audio) || (!bluetoothd_after_start && !restart && strstr(format, "Bluetooth error") == NULL && !plain)) {
 		return;                 /* before the stack started it is the same every time and fills the host buffer, which keeps the first 64 KB and drops the rest */
 	}
 	/* the arguments, in the order of the format's conversions: s a string, d/u/x... a number, @ and p skipped */
@@ -3076,7 +3084,11 @@ os_log_watched(const char *how, const char *format, uint8_t *buf, uint32_t size)
 	    strstr(format, "classic scan") != NULL || strstr(text, "scan stopped") != NULL || strstr(text, "scan started") != NULL || strstr(text, "discovery ") != NULL)) {
 		return;                 /* what a classic scan repeats every five seconds */
 	}
-	bluetoothd_said++;
+	if (audio) {
+		audio_said++;
+	} else {
+		bluetoothd_said++;
+	}
 	snprintf(line, sizeof(line), "bt[%d] %s%s", getpid(), format, text);
 	(void)sysctlbyname("kern.redwood.host_keep", NULL, NULL, line, strnlen(line, sizeof(line)));
 }
@@ -3144,12 +3156,16 @@ typedef xpc_object_t xpc_connection_t;
 extern const struct _xpc_type_s _xpc_type_connection, _xpc_type_dictionary;
 extern xpc_connection_t xpc_connection_create_mach_service(const char *name, dispatch_queue_t targetq, uint64_t flags);
 
+static xpc_connection_t hal_listener;      /* L5: bluetoothd's listener for the BTAudioHALPlugin: whose pid connects to it */
 /* which Mach services bluetoothd listens on (and clients of): said once each, as the host buffer allows */
 static xpc_connection_t
 watched_xpc_connection_create_mach_service(const char *name, dispatch_queue_t targetq, uint64_t flags)
 {
 	xpc_connection_t connection = xpc_connection_create_mach_service(name, targetq, flags);
 
+	if (in_bluetoothd && name != NULL && (flags & 1) && strcmp(name, "com.apple.BTAudioHALPlugin.xpc") == 0) {
+		hal_listener = connection;
+	}
 	if ((in_bluetoothd || in_preferences) && name != NULL) {
 		char line[200];
 
@@ -3177,10 +3193,32 @@ watched_xpc_connection_get_pid(xpc_connection_t connection)
 	return pid;
 }
 
+extern const struct _xpc_type_s *xpc_get_type(xpc_object_t object);
+extern void xpc_connection_set_event_handler(xpc_connection_t connection, void (^handler)(xpc_object_t object));
+static void
+watched_xpc_connection_set_event_handler(xpc_connection_t connection, void (^handler)(xpc_object_t object))
+{
+	if (in_bluetoothd && connection != NULL && connection == hal_listener) {
+		xpc_connection_set_event_handler(connection, ^(xpc_object_t peer) {
+			static unsigned said;
+			char line[120];
+
+			if (said++ < 5 && xpc_get_type(peer) == (const struct _xpc_type_s *)&_xpc_type_connection) {
+				snprintf(line, sizeof(line), "redwood: bluetoothd BTAudioHALPlugin.xpc peer pid %d", xpc_connection_get_pid(peer));
+				(void)sysctlbyname("kern.redwood.host_keep", NULL, NULL, line, strnlen(line, sizeof(line)));
+			}
+			handler(peer);
+		});
+		return;
+	}
+	xpc_connection_set_event_handler(connection, handler);
+}
+
 __attribute__((used)) static const struct {
 	const void *replacement;
 	const void *replacee;
 } xpc_service_interpose[] __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *)watched_xpc_connection_set_event_handler, (const void *)xpc_connection_set_event_handler },
 	{ (const void *)watched_xpc_connection_create_mach_service, (const void *)xpc_connection_create_mach_service },
 	{ (const void *)watched_xpc_connection_get_pid, (const void *)xpc_connection_get_pid },
 };
