@@ -589,18 +589,23 @@ done
 # next to ours; init.c binds this directory over the audio server's plug-in directory on a boot from the system image
 if [ -n "$BT" ] && [ -d ../../ios-extra/BTAudioHALPlugin.driver ]; then
 	cp -R ../../ios-extra/BTAudioHALPlugin.driver root/lib/
-	# the boot partition is full: leave out some test tools nothing in rc.jobs runs
-	rm -f root/bin/camera_avtest root/bin/apfs_mmap_test root/bin/metal_test root/bin/pvr_vk_test root/bin/pvr_gl_test
 	find root/lib/BTAudioHALPlugin.driver -name "*.lproj" -empty -exec rmdir {} +   # 50 empty language directories: the boot partition is full
 	ln -s /redwood/lib/BTAudioHALPlugin.driver root/hal/BTAudioHALPlugin.driver
 fi
 # ringtones (docs/audio-gaps.md): /Library/Ringtones is not in the system image; init binds root/ringtones there.
-# NOT for BT=1 builds: that payload has only ~32 KB headroom. A missing source file is skipped silently.
-if [ -z "$BT" ]; then
-	RT=/System/Library/PrivateFrameworks/ToneLibrary.framework/Versions/A/Resources/Ringtones
-	for t in ${RINGTONES-}; do  # opt-in: the 32 MB boot partition has no room by default (Opening alone needs test tools cut)
-		[ -f "$RT/$t.m4r" ] || continue
-		mkdir -p root/ringtones && cp "$RT/$t.m4r" root/ringtones/ && chmod 644 "root/ringtones/$t.m4r"
+# RINGTONES= (empty) leaves them out. A missing source file is skipped silently.
+RT=/System/Library/PrivateFrameworks/ToneLibrary.framework/Versions/A/Resources/Ringtones
+for t in ${RINGTONES-Opening Radar Hillside Illuminate Stargaze Beacon}; do
+	[ -f "$RT/$t.m4r" ] || continue
+	mkdir -p root/ringtones && cp "$RT/$t.m4r" root/ringtones/ && chmod 644 "root/ringtones/$t.m4r"
+done
+# the 32 MB boot partition is nearly full: ship only the programs something starts (rc.jobs, a job plist, init, the fixed
+# list), not every test tool built. TEST_TOOLS=1 keeps all; RC_JOBS=<file> keeps what that file runs.
+if [ -z "$TEST_TOOLS" ]; then
+	for f in root/bin/*; do
+		n=${f##*/}
+		case " child var_store logto tolog aks_restore psgrep " in *" $n "*) continue;; esac
+		grep -qw "$n" root/etc/rc.jobs root/LaunchDaemons/*.plist src/init.c 2>/dev/null || rm -f "$f"
 	done
 fi
 # the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/

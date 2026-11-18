@@ -13,7 +13,9 @@ Everything else - header fields, cmdline, ramdisk, dtb - is copied from the Andr
 """
 import gzip
 import hashlib
+import shutil
 import struct
+import subprocess
 import sys
 
 CHAIN_OFFSET = 0x40000
@@ -40,6 +42,15 @@ def main():
     off = page
     kernel = d[off:off + ksize]; off += pages(ksize)
     ramdisk = d[off:off + rsize]; off += pages(rsize)
+    if ramdisk[:4] == b'\x02\x21\x4c\x18' and shutil.which('lz4'):
+        # Android's ramdisk is lz4 (legacy); the kernel has gzip for it too and 1.9 MB of room is worth the same
+        # cpio, gzipped at level 9 (the boot partition is full otherwise)
+        cpio = subprocess.run(['lz4', '-d', '-c'], input=ramdisk, capture_output=True, check=True).stdout
+        assert cpio[:6] == b'070701', 'ramdisk is not a newc cpio'
+        gz = gzip.compress(cpio, 9, mtime=0)
+        if len(gz) < len(ramdisk):
+            ramdisk = gz
+            rsize = len(gz)
     second = d[off:off + ssize]; off += pages(ssize)
     rdo = d[off:off + rdo_size]; off += pages(rdo_size)
     dtb = d[off:off + dtb_size]
@@ -63,6 +74,7 @@ def main():
 
     hdr = bytearray(d[:page])
     struct.pack_into('<I', hdr, 8, len(new_kernel))
+    struct.pack_into('<I', hdr, 16, len(ramdisk))
     sha = hashlib.sha1()
     for part in (new_kernel, ramdisk, second, rdo, dtb):
         sha.update(part)
