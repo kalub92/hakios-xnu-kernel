@@ -498,6 +498,47 @@ guard_coreimage(void)
 	say("redwood: tweaks: CIContext guard on\n");
 }
 
+#include <mach/mach_time.h>
+
+/* vdiag=1 in Preferences (Settings): when it becomes active and when its main run loop first idles = its first frame is out (docs/app-launch-latency.md T-B3) */
+static uint64_t settings_start_ns;
+
+static double
+settings_since(void)
+{
+	return (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - settings_start_ns) / 1e9;
+}
+
+static void
+settings_probe(void)
+{
+	static const char *const notices[] = { "UIApplicationDidBecomeActiveNotification", "UISceneWillEnterForegroundNotification", "UISceneDidActivateNotification" };
+	id center = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSNotificationCenter"), sel_registerName("defaultCenter"));
+	char args[512] = "";
+	size_t size = sizeof(args) - 1;
+	const char *name = getprogname();
+
+	if (name == NULL || strcmp(name, "Preferences") != 0 || sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || strstr(args, "vdiag=1") == NULL) {
+		return;
+	}
+	settings_start_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	for (int i = 0; center != NULL && i < 3; i++) {
+		const char *label = notices[i];
+		CFStringRef n = CFStringCreateWithCString(NULL, label, kCFStringEncodingUTF8);
+
+		(void)((id (*)(id, SEL, id, id, id, id))objc_msgSend)(center, sel_registerName("addObserverForName:object:queue:usingBlock:"), (id)n, NULL, NULL,
+		    (id)^(id note) {
+			say("settings app: notice %s at +%.3f\n", label, settings_since());
+		});
+	}
+	CFRunLoopObserverRef idle = CFRunLoopObserverCreateWithHandler(NULL, kCFRunLoopBeforeWaiting, false, 0, ^(CFRunLoopObserverRef o, CFRunLoopActivity a) {
+		say("settings app: first idle main run loop at +%.3f\n", settings_since());
+		CFRunLoopRemoveObserver(CFRunLoopGetMain(), o, kCFRunLoopCommonModes);
+	});
+	CFRunLoopAddObserver(CFRunLoopGetMain(), idle, kCFRunLoopCommonModes);
+	say("settings app: constructor at %.3f s uptime\n", settings_start_ns / 1e9);
+}
+
 __attribute__((constructor))
 static void
 redwood_tweaks_init(void)
@@ -517,4 +558,5 @@ redwood_tweaks_init(void)
 	guard_coreimage();
 	install_fault_handler();
 	load_the_tweaks();
+	settings_probe();
 }

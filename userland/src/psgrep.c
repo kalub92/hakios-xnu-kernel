@@ -4,6 +4,9 @@
  * tolog: ps -A is longer than the kernel keeps (96 lines), and the job runner has no shell to grep.
  * psgrep -stack WORD...: and each one's threads, by the kernel (kern.redwood.ustack), with the shared cache's slide.
  * psgrep -sysctl NAME [TIMES]: a string sysctl, TIMES times a second apart (iOS has no sysctl command).
+ * psgrep -sample SECS TIMES WORD (only with the boot-arg proc_sample=1): TIMES times, SECS apart, the first process whose path has
+ *   WORD in it: its CPU time against the wall clock (kept line), the busy threads' stacks (console, kern.redwood.ustack with bit 30),
+ *   and the LaunchServices store files under /private/var (kept lines). docs/app-launch-latency.md, lsd's 60 s at every boot.
  * psgrep -cpu SECONDS: the ten processes that used the most CPU in the next SECONDS, as % of one core.
  */
 #include <stdio.h>
@@ -14,6 +17,8 @@
 #include <sys/sysctl.h>
 #include <mach/mach_time.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 /* libSystem's, without the header, which the iOS SDK leaves out */
 int proc_pidpath(int pid, void *buffer, uint32_t size);
@@ -95,11 +100,147 @@ cpu_top(int seconds)
 	return 0;
 }
 
+/* -sample: see the top. Nothing at all unless the kernel's arguments have proc_sample=1. */
+static int
+sample(int seconds, int times, const char *word)
+{
+	static const char *const dirs[] = { "/private/var/mobile/Library/Caches", "/private/var/db", "/private/var/mobile/Library/Caches/com.apple.LaunchServices" };
+	char args[1024] = "", line[200];
+	size_t size = sizeof(args) - 1;
+	mach_timebase_info_data_t base;
+	uint64_t t0 = mach_absolute_time();
+
+	sysctlbyname("kern.bootargs", args, &size, NULL, 0);
+	if (strstr(args, "proc_sample=1") == NULL) {
+		return 0;
+	}
+	mach_timebase_info(&base);
+	{
+		static const char *const apps[] = { "/Applications", "/System/Library/CoreServices", "/private/var/jb/Applications", "/private/var/containers/Bundle/Application" };
+
+		for (unsigned d = 0; d < sizeof(apps) / sizeof(apps[0]); d++) {
+			DIR *dir = opendir(apps[d]);
+			struct dirent *e;
+			int n = 0, bundles = 0;
+
+			while (dir != NULL && (e = readdir(dir)) != NULL) {
+				n++;
+				bundles += strstr(e->d_name, ".app") != NULL;
+			}
+			if (dir != NULL) {
+				closedir(dir);
+			}
+			snprintf(line, sizeof(line), "!sample: %s: %d entries, %d .app", apps[d], n, bundles);
+			sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		}
+	}
+	static pid_t prev_pid[512];
+	static uint64_t prev_cpu[512];
+	unsigned prev_n = 0;
+	uint64_t prev_t = 0;
+
+	for (int i = 0; i < times; i++) {
+		unsigned count;
+		struct kinfo_proc *procs = all_processes(&count);
+		pid_t pid = 0;
+		int arg;
+		/* the three biggest CPU users since the last tick, whoever they are (is it lsd alone, or the daemons it waits on?) */
+		{
+			uint64_t now = mach_absolute_time(), best[3] = { 0, 0, 0 };
+			char names[3][17] = { "", "", "" };
+			pid_t bp[3] = { 0, 0, 0 };
+			static pid_t cur_pid[512];
+			static uint64_t cur_cpu[512];
+			unsigned n = 0;
+
+			for (unsigned k = 0; k < count && n < 512; k++) {
+				uint64_t c = cpu_time(procs[k].kp_proc.p_pid), before = 0;
+
+				cur_pid[n] = procs[k].kp_proc.p_pid;
+				cur_cpu[n++] = c;
+				for (unsigned q = 0; q < prev_n; q++) {
+					if (prev_pid[q] == cur_pid[n - 1]) {
+						before = prev_cpu[q];
+					}
+				}
+				c = c > before && prev_t != 0 ? c - before : 0;
+				for (int b = 0; b < 3; b++) {
+					if (c > best[b]) {
+						for (int m = 2; m > b; m--) {
+							best[m] = best[m - 1];
+							bp[m] = bp[m - 1];
+							memcpy(names[m], names[m - 1], 17);
+						}
+						best[b] = c;
+						bp[b] = procs[k].kp_proc.p_pid;
+						strlcpy(names[b], procs[k].kp_proc.p_comm, 17);
+						break;
+					}
+				}
+			}
+			if (prev_t != 0) {
+				double wall = (double)(now - prev_t) * base.numer / base.denom;
+
+				snprintf(line, sizeof(line), "!sample top: %s %.0f%%, %s %.0f%%, %s %.0f%% of one core", names[0], best[0] * base.numer / base.denom * 100 / wall, names[1],
+				    best[1] * base.numer / base.denom * 100 / wall, names[2], best[2] * base.numer / base.denom * 100 / wall);
+				sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+			}
+			memcpy(prev_pid, cur_pid, n * sizeof(pid_t));
+			memcpy(prev_cpu, cur_cpu, n * sizeof(uint64_t));
+			prev_n = n;
+			prev_t = now;
+		}
+
+		for (unsigned k = 0; k < count && pid == 0; k++) {
+			char path[PROC_PIDPATHINFO_MAXSIZE] = "";
+
+			if (proc_pidpath(procs[k].kp_proc.p_pid, path, sizeof(path)) > 0 && strstr(path, word) != NULL) {
+				pid = procs[k].kp_proc.p_pid;
+			}
+		}
+		free(procs);
+		snprintf(line, sizeof(line), "!sample +%llu s: %s pid %d cpu %llu ms slide %#lx", (unsigned long long)((mach_absolute_time() - t0) * base.numer / base.denom / 1000000000ULL),
+		    word, pid, (unsigned long long)(cpu_time(pid) * base.numer / base.denom / 1000000ULL), (unsigned long)((uintptr_t)_dyld_get_shared_cache_range(&size) - 0x180000000UL));
+		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		if (pid != 0) {
+			arg = pid | 0x40000000;
+			sysctlbyname("kern.redwood.ustack", NULL, NULL, &arg, sizeof(arg));
+		}
+		for (unsigned d = 0; (i % 5 == 0 || i + 1 == times) && d < sizeof(dirs) / sizeof(dirs[0]); d++) {
+			DIR *dir = opendir(dirs[d]);
+			struct dirent *e;
+
+			while (dir != NULL && (e = readdir(dir)) != NULL) {
+				if (strstr(e->d_name, "LaunchServices") != NULL || strstr(e->d_name, "csstore") != NULL || strstr(e->d_name, "lsd") != NULL) {
+					struct stat st;
+					char path[600];
+
+					snprintf(path, sizeof(path), "%s/%s", dirs[d], e->d_name);
+					if (stat(path, &st) == 0) {
+						snprintf(line, sizeof(line), "!sample: %.150s %lld bytes", path, (long long)st.st_size);
+						sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+					}
+				}
+			}
+			if (dir != NULL) {
+				closedir(dir);
+			}
+		}
+		if (i + 1 < times) {
+			sleep((unsigned)seconds);
+		}
+	}
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
 	int stacks = argc > 1 && strcmp(argv[1], "-stack") == 0;       /* -stack: and the threads of each, by the kernel */
 
+	if (argc > 4 && strcmp(argv[1], "-sample") == 0) {
+		return sample(atoi(argv[2]), atoi(argv[3]), argv[4]);
+	}
 	if (argc > 2 && strcmp(argv[1], "-cpu") == 0) {
 		return cpu_top(atoi(argv[2]) > 0 ? atoi(argv[2]) : 10);
 	}

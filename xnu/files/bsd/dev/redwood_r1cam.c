@@ -289,21 +289,24 @@ cam_bb_line(uint32_t pin, int high)
 	}
 }
 
+/* boot-arg r1cam_i2c_us=N: the by-hand I2C bus waits N us after every SCL/SDA edge (default 5: docs/app-launch-latency.md T-C1; the 422 register writes of a power-up take 0.95 s) */
+static uint32_t cam_i2c_us = 5;
+
 static void
 cam_bb_scl(int high)
 {
 	cam_bb_line(PIN_SCL, high);
 	for (int i = 0; high && i < 200 && !cam_pin_read(PIN_SCL); i++) {        /* a slave may hold it low */
-		delay(5);
+		delay(cam_i2c_us);
 	}
-	delay(5);
+	delay(cam_i2c_us);
 }
 
 static void
 cam_bb_sda(int high)
 {
 	cam_bb_line(PIN_SDA, high);
-	delay(5);
+	delay(cam_i2c_us);
 }
 
 static void
@@ -1883,6 +1886,10 @@ r1cam_thread(__unused void *parameter, __unused wait_result_t wr)
 
 	(void)PE_parse_boot_argn("r1cam_start", &start, sizeof(start));
 	(void)PE_parse_boot_argn("r1cam_linger_ms", &cam_linger_ms, sizeof(cam_linger_ms));
+	(void)PE_parse_boot_argn("r1cam_i2c_us", &cam_i2c_us, sizeof(cam_i2c_us));
+	if (cam_i2c_us == 0 || cam_i2c_us > 50) {
+		cam_i2c_us = 5;
+	}
 	(void)PE_parse_boot_argn("r1cam_pak", &cam_variant, sizeof(cam_variant));
 	cam_variant %= CAM_NVARIANTS;
 	(void)PE_parse_boot_argn("r1cam_gain", &cam_gain_arg, sizeof(cam_gain_arg));

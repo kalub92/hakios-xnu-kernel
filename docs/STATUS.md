@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-18 21:15 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-18 22:29 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -41,8 +41,8 @@ Last updated: 2026-11-18 21:15 PST. Kept current as work lands; details are in t
 
 ## Open problems
 
-- Boot takes about 131 s to a usable home screen; about 60 s of that is the app database service (lsd) working on every boot, cause unknown (`app-launch-latency.md`)
-- Camera opened while the home screen is still starting up gets its capture session interrupted and restarted and can lose a tap; opened after the home screen has settled it shows a picture about 2 s after launch with no restart. About 0.95 s of every cold Camera open is the sensor's register tables over slow I2C. `r1cam_linger_ms=3000` (off by default) saves 1.1 s on a restart. The first photo after a boot takes about 3.5 s to save; later ones 0.3 to 0.7 s
+- Boot takes about 130 s to a usable home screen. About 63 s of that is the app database service (lsd) validating the system image's app bundles (about 173) on every boot, using about 40 s of CPU, a third of it waiting on the container service. No fix yet: why the result is not kept between boots is the open question
+- App launches once the home screen has settled (measured): cold Camera shows its first picture 2.0 s after the request with no session restart, warm Camera 1.3 s, cold Settings is active in about 1.5 s. Camera opened while the home screen is still starting up gets its session interrupted and can lose a tap. About 0.85 s of every Camera open is the sensor's register tables; a shorter bus delay (`r1cam_i2c_us`) did not shorten it. `r1cam_linger_ms=3000` (off by default) saves 1.1 s on a restart. The first photo after a boot takes about 3.5 s to save; later ones 0.3 to 0.7 s
 - Resolved: Camera launched while the device is locked is suspended, not killed, and carries on correctly after unlock (photo saved). The two earlier "Camera closed" runs were this; test scenarios now wake the screen before unlocking
 - Apple's two built-in software video encoders do not produce frames here; an app that records through AVAssetWriter needs our encoder registered in its own process (not done)
 - Cellular alongside Wi-Fi (Wi-Fi should win) is untested: unattended runs have no Wi-Fi

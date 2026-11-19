@@ -1,0 +1,5 @@
+# Boot-time sampler (RC_JOBS=rc.jobs.lat; docs/app-launch-latency.md F3): lsd's CPU time and busy-thread stacks every 3 s for 120 s (only with proc_sample=1), then D4's scenario.
+/redwood/bin/tolog /redwood/bin/psgrep -sample 3 40 /usr/libexec/lsd &
+# D4: Camera right after SpringBoard's first frame, Settings cold, Camera warm (times from `say start` ~ 21.5 s).
+/redwood/bin/rwtouch ifarg d4=1 say start wait 85 tap 0.5 0.06 wait 1 notify com.redwood.unlock wait 25 say camera notify com.redwood.camera wait 8 say shot1 tap 0.5 0.887 wait 20 say home1 button home wait 6 say settings notify com.redwood.settings wait 12
+/redwood/bin/rwtouch ifarg d4=1 say home2 button home wait 6 say camera2 notify com.redwood.camera wait 4 say shot2 tap 0.5 0.887 wait 10 say end

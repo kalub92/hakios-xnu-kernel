@@ -1303,10 +1303,11 @@ camera_app_probe(void)
 	if (vdiag_on) {
 		t3_hooks();     /* (in the constructor: the first session starts ~0.5 s after launch, before the main queue's first turn) */
 		static const char *const notices[] = { "AVCaptureSessionRuntimeErrorNotification", "AVCaptureSessionWasInterruptedNotification",
-		    "AVCaptureSessionInterruptionEndedNotification", "AVCaptureSessionDidStopRunningNotification" };
+		    "AVCaptureSessionInterruptionEndedNotification", "AVCaptureSessionDidStopRunningNotification",
+		    "UIApplicationDidBecomeActiveNotification", "UISceneWillEnterForegroundNotification", "UISceneDidActivateNotification" };
 		id center = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSNotificationCenter"), sel_registerName("defaultCenter"));
 
-		for (int i = 0; center != NULL && i < 4; i++) {
+		for (int i = 0; center != NULL && i < 7; i++) {
 			const char *label = notices[i];
 			CFStringRef name = CFStringCreateWithCString(NULL, label, kCFStringEncodingUTF8);
 
@@ -1316,6 +1317,14 @@ camera_app_probe(void)
 				    text_of_object(n ? ((id (*)(id, SEL))objc_msgSend)(n, sel_registerName("userInfo")) : NULL));
 			});
 		}
+	}
+	if (vdiag_on) {
+		/* the app's first idle main run loop = its first frame is out (docs/app-launch-latency.md T-B2) */
+		__block CFRunLoopObserverRef idle = CFRunLoopObserverCreateWithHandler(NULL, kCFRunLoopBeforeWaiting, false, 0, ^(CFRunLoopObserverRef o, CFRunLoopActivity a) {
+			host_line("camera app: first idle main run loop at +%.3f", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - app_launch_ns) / 1e9);
+			CFRunLoopRemoveObserver(CFRunLoopGetMain(), o, kCFRunLoopCommonModes);
+		});
+		CFRunLoopAddObserver(CFRunLoopGetMain(), idle, kCFRunLoopCommonModes);
 	}
 	dispatch_async(dispatch_get_main_queue(), ^{
 		if (vdiag_on) {

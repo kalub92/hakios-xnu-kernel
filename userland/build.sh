@@ -237,6 +237,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			{ ${LDID:-ldid} -Ssrc/aks_restore.entitlements obj/aks_restore 2>/dev/null ||
 			  echo "build.sh: no ldid: aks_restore is unsigned, and the kernel will not let it make the bag"; }
 		$DYN -o obj/tolog src/tolog.c
+		$DYN -o obj/psgrep src/psgrep.c
 		$DYN -o obj/logto src/logto.c
 		if [ -n "$METAL" ]; then
 			# the bundle Metal's discovery opens (step 3: <MetalPluginName>.bundle under
@@ -511,6 +512,7 @@ with open(path, 'w') as f:
 	# logto=IP:PORT in the boot-args: the kernel log over UDP (src/logto.c checks the argument itself, ends at once without it)
 	# (first: the lines before it may run for minutes)
 	{ echo '/redwood/bin/logto &'; cat root/etc/rc.jobs; } > root/etc/rc.jobs.new && mv root/etc/rc.jobs.new root/etc/rc.jobs
+	grep -qw psgrep root/etc/rc.jobs && cp obj/tolog obj/psgrep root/bin/       # (a test's rc.jobs that samples: rc.jobs.lat)
 	[ -n "$BT" ] && echo '/redwood/bin/tolog /redwood/bin/bt_test 120 &' >> root/etc/rc.jobs
 	# bt_diag=1 (docs/bluetooth-audio.md L-lines): the audio route on record every 30 s, 10 times; bt_tone=1 also plays a tone and a system sound first (U1).
 	# Early in rc.jobs, not last: the scenario lines before the end block for minutes (rc.jobs runs a line at a time)
