@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-18 18:26 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-18 18:41 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -26,6 +26,7 @@ Last updated: 2026-11-18 18:26 PST. Kept current as work lands; details are in t
 - Six ringtones shipped by default (`/Library/Ringtones` bound at boot)
 - Cellular in test images: LTE registration, data bearer, DNS and HTTP over `pdp_ip0` (8 of 10 approved radio-on attempts used)
 - Modem as a service with the radio off (`r1_md=10`): 30 minutes, no faults, clean shutdown
+- Bluetooth without the keybag (`aks_keys` off, no keybag load): the controller powers on, bluetoothd stays up and a scan finds nearby devices, on a throw-away store. This is the configuration that does not change the keychain format; pairing on it is not yet tried
 - Bluetooth audio plug-in loads in mediaserverd and connects to bluetoothd
 - Microphone (`mtkmic=2`): kernel self-test passes on both mics; an iOS recording of a speaker tone is 14 dB above the quiet floor; playback unchanged before and after. Speech not tested
 - Boot image has about 1.4 MB free (Android ramdisk repacked lz4 to gzip)
@@ -52,7 +53,7 @@ Last updated: 2026-11-18 18:26 PST. Kept current as work lands; details are in t
 ## Not yet done
 
 - Everyday cellular in a normal image: radio-on service (`r1_md=11`, never run), status bar, airplane toggle (stages 4e/4f; needs the remaining decisions in `cellular-stage4.md`)
-- Bluetooth on the saved data store: a route that is not one-way is specified (`kernel-keystore-spec.md`) and its first unattended run is in progress; a backup of the data partition comes before any session on saved data
+- Bluetooth on the saved data store: the no-keybag configuration passed unattended on a throw-away store (`kernel-keystore-spec.md`); still needed are hands-on pairing on it, then a backup of the data partition before any session on saved data
 - Phone calls and SMS (not built; current safety rules forbid dialling and SMS)
 - Bluetooth call audio (HFP)
 - USB while in iOS
