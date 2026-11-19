@@ -578,6 +578,12 @@ static struct {
 
 static void cam_power_off(void);
 
+/* boot-arg r1cam_linger_ms=N (default 0 = off; docs/camera-session-stops.md C5): after a session the sensor stays powered, tables written, for N ms;
+ * a session that starts inside it skips cam_power_on and the sensor tables (0.95 s of bit-banged I2C). The manager thread powers it off when the time is up. */
+static uint32_t cam_linger_ms;
+static uint64_t cam_linger_since;
+static bool cam_lingering, cam_tables_done;
+
 /*
  * The order: [trace] the camera's clock gates, then VCAMIO, then VCAMD 5.8 ms later, the whole power-on 48 ms; [hi846v]'s table for this
  * sensor on an MT6765 phone: reset low, DOVDD 1 ms, AVDD 1 ms, DVDD 1 ms, MCLK, reset high 1 ms. The power-down pin (high while Android
@@ -591,6 +597,7 @@ cam_power_on(void)
 	uint32_t ones = 0;
 
 	bzero(&cam_pw, sizeof(cam_pw));
+	say("power: on at %llu ms", cam_ms());
 	if (!cam_pmic_is_mt6357()) {
 		return false;
 	}
@@ -694,6 +701,7 @@ static void
 cam_power_off(void)
 {
 	say("power: off");
+	cam_tables_done = cam_lingering = false;
 	cam_pin_out(PIN_RST, 0);
 	cam_pin_out(PIN_PDN, 0);
 	cam_pin_mode(PIN_MCLK, 0);
@@ -814,6 +822,10 @@ cam_sensor_exposure(uint32_t lines, uint32_t gain, uint32_t frame)
 static bool
 cam_sensor_tables(void)
 {
+	if (cam_tables_done) {
+		say("sensor: the tables are still in (linger)");
+		return true;
+	}
 #define N(t) ((unsigned)(sizeof(t) / sizeof(struct r1cam_reg)))
 #ifdef R1CAM_HI846_FULL
 	if (cam_mode) {
@@ -1527,7 +1539,7 @@ cam_serve_loop(void)
 	}
 	cam_streaming = true;
 	lck_mtx_unlock(&cam_lock);
-	say("serving: the stream is on");
+	say("serving: the stream is on at %llu ms", cam_ms());
 	while (!stop) {
 		bool ask;
 		uint32_t exposure, gain, frame;
@@ -1557,7 +1569,7 @@ cam_serve_loop(void)
 				cam_face_first_frame((unsigned)k);
 			}
 			if (cam_seq <= 3) {
-				say("serving: frame %llu whole", cam_seq);
+				say("serving: frame %llu whole at %llu ms", cam_seq, cam_ms());
 			}
 			wakeup(&cam_seq);
 		}
@@ -1581,7 +1593,7 @@ cam_serve_loop(void)
 	lck_mtx_lock(&cam_lock);
 	cam_streaming = false;
 	lck_mtx_unlock(&cam_lock);
-	say("serving: %s: the stream stops after %llu frames (the DMA dropped %u)", stop ? "nobody reads" : "the frames stopped", cam_seq,
+	say("serving: %s at %llu ms: the stream stops after %llu frames (the DMA dropped %u)", stop ? "nobody reads" : "the frames stopped", cam_ms(), cam_seq,
 	    rd32(CAMSV + SV_FBC_IMGO_CTL2) >> 24);
 	return cam_seq != 0;
 }
@@ -1870,6 +1882,7 @@ r1cam_thread(__unused void *parameter, __unused wait_result_t wr)
 	int major;
 
 	(void)PE_parse_boot_argn("r1cam_start", &start, sizeof(start));
+	(void)PE_parse_boot_argn("r1cam_linger_ms", &cam_linger_ms, sizeof(cam_linger_ms));
 	(void)PE_parse_boot_argn("r1cam_pak", &cam_variant, sizeof(cam_variant));
 	cam_variant %= CAM_NVARIANTS;
 	(void)PE_parse_boot_argn("r1cam_gain", &cam_gain_arg, sizeof(cam_gain_arg));
@@ -1971,6 +1984,19 @@ r1cam_thread(__unused void *parameter, __unused wait_result_t wr)
 
 		lck_mtx_lock(&cam_lock);
 		while (!cam_dev_wanted) {
+			if (cam_lingering) {
+				uint64_t waited = cam_ms() - cam_linger_since;
+
+				if (waited >= cam_linger_ms) {
+					lck_mtx_unlock(&cam_lock);
+					say("linger: nobody came in %llu ms", waited);
+					cam_power_off();
+					lck_mtx_lock(&cam_lock);
+					continue;
+				}
+				ts.tv_sec = 0;
+				ts.tv_nsec = 100 * NSEC_PER_MSEC;
+			}
 			(void)msleep(&cam_dev_wanted, &cam_lock, PZERO, "redwood-r1cam-idle", &ts);
 		}
 		cam_dev_wanted = false;
@@ -1982,12 +2008,22 @@ r1cam_thread(__unused void *parameter, __unused wait_result_t wr)
 		if (cam_flip && cam_face_want != 0 && cam_face_want != cam_face_at) {
 			cam_face_move();        /* (the only mover, and never with the stream on) */
 		}
-		if (cam_power_on()) {
+		if (cam_lingering || cam_power_on()) {
+			if (cam_lingering) {
+				say("linger: reopened after %llu ms, sensor still powered", cam_ms() - cam_linger_since);
+				cam_lingering = false;
+			}
 			if (cam_sensor_id() && cam_stream_start()) {
 				ok = cam_serve_loop();
 				cam_stream_stop();
 			}
-			cam_power_off();
+			if (cam_linger_ms != 0 && ok && !cam_flip) {
+				cam_lingering = cam_tables_done = true;
+				cam_linger_since = cam_ms();
+				say("linger: the sensor stays powered for %u ms", cam_linger_ms);
+			} else {
+				cam_power_off();
+			}
 		}
 		if (cam_flip && cam_face_want != cam_face_at) {
 			ok = true;              /* (stopped to turn, not a failure) */
@@ -2000,7 +2036,9 @@ r1cam_thread(__unused void *parameter, __unused wait_result_t wr)
 			lck_mtx_unlock(&cam_lock);
 			say("the camera could not be brought up three times: given up");
 		}
-		delay_for_interval(500, NSEC_PER_MSEC);
+		if (!cam_lingering) {
+			delay_for_interval(500, NSEC_PER_MSEC);
+		}
 	}
 	thread_terminate(current_thread());
 }

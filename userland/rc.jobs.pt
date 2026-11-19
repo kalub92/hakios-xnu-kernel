@@ -1,0 +1,7 @@
+# Lost first touch (docs/camera-session-stops.md D3): taps on the preview every 0.26 s from 12 s after the Camera notify (SpringBoard needs ~14 s to launch it, first frame ~18 s), in 4 rwtouch lines (a line is cut at ~400 characters).
+/redwood/bin/rwtouch say start wait 85 tap 0.5 0.06 wait 1 notify com.redwood.unlock wait 5 say camera notify com.redwood.camera wait 12 say sweep
+/redwood/bin/rwtouch tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2
+/redwood/bin/rwtouch tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2
+/redwood/bin/rwtouch tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2
+/redwood/bin/rwtouch tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2 tap 0.5 0.45 wait 0.2
+/redwood/bin/rwtouch say end wait 10

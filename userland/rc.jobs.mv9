@@ -1,0 +1,6 @@
+# (mv9 = mv7 + Settings opened after the recording, as a second rwtouch line: rc.jobs lines are cut at ~400 characters)
+# Goal A/B: 3 photos (first shot late, 35 s after Camera), Video mode, 6 s recording, tone 3 s on/3 s off from job time 158 s (8 cycles), scan.
+/redwood/bin/sound_test wait 158 raw 3 wait 3 raw 3 wait 3 raw 3 wait 3 raw 3 wait 3 raw 3 wait 3 raw 3 wait 3 raw 3 wait 3 raw 3 wait 3 &
+/redwood/bin/rwtouch say start wait 85 tap 0.5 0.06 wait 1 notify com.redwood.unlock wait 5 say camera notify com.redwood.camera wait 35 say shot1 tap 0.5 0.887 wait 8 say shot2 tap 0.5 0.887 wait 8 say shot3 tap 0.5 0.887 wait 10 say video swipe 0.3 0.80 0.7 0.80 300 wait 5 say rec1 tap 0.5 0.887 wait 6 say rec2 tap 0.5 0.887 wait 10
+/redwood/bin/rwtouch say settings notify com.redwood.settings wait 12 say end
+/redwood/bin/video_test scan

@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-18 20:00 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-18 20:58 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -41,7 +41,7 @@ Last updated: 2026-11-18 20:00 PST. Kept current as work lands; details are in t
 
 ## Open problems
 
-- First Camera launch after a boot: about 5 s to the first picture. A touch landing within a fraction of a second of that first frame never reaches the app (lost below it). The capture session is stopped from below the app and restarted two or three times during launch (cause not found). The first photo after a boot takes about 3.5 s to save while the photo library finishes opening; later ones take 0.3 to 0.7 s
+- First Camera launch after a boot: about 5 s to the first picture. Cause found: the media server interrupts the capture session as "app not in the foreground" (twice) while the launch is still in progress, and each restart re-powers the sensor. `r1cam_linger_ms=3000` (off by default) keeps the sensor powered across a restart and brings the picture back 1.1 s sooner; the interruption itself is not fixed. Touches go to the home screen until about 0.5 s after the app's first frame, so a tap in that window is lost. The first photo after a boot takes about 3.5 s to save while the photo library finishes opening; later ones take 0.3 to 0.7 s
 - Resolved: Camera launched while the device is locked is suspended, not killed, and carries on correctly after unlock (photo saved). The two earlier "Camera closed" runs were this; test scenarios now wake the screen before unlocking
 - Apple's two built-in software video encoders do not produce frames here; an app that records through AVAssetWriter needs our encoder registered in its own process (not done)
 - Cellular alongside Wi-Fi (Wi-Fi should win) is untested: unattended runs have no Wi-Fi

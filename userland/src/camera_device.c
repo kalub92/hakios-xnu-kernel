@@ -54,6 +54,7 @@
 #include "camera_isp.h"
 
 void redwood_camera_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static void cam_keep(const char *line);
 
 void
 redwood_camera_say(const char *format, ...)
@@ -79,6 +80,16 @@ redwood_camera_say(const char *format, ...)
 	}
 }
 #define say redwood_camera_say
+
+/* the line is also kept for the host (kern.redwood.host_keep: the console's tail loses the early part of a run; cam_bt=1 lines only) */
+static void
+cam_keep(const char *line)
+{
+	char kept[400];
+
+	snprintf(kept, sizeof(kept), "camera: %s", line);
+	(void)sysctlbyname("kern.redwood.host_keep", NULL, NULL, kept, strnlen(kept, sizeof(kept)));
+}
 #if __has_include("camera_trace_local.h")
 #include "camera_trace_local.h"          /* (not in git: a diagnostic build's CAM_TRACE=1 and CAM_TRACE_STUB=0x...) */
 #endif
@@ -132,7 +143,20 @@ say_bt(const char *what)
 	uintptr_t slide = redwood_cache_slide();
 
 	/* only in a CAM_TRACE build: ~40 KB a camera start, a third of what pstore keeps of a run's end (tools/r1-auto.sh) */
-	if (!CAM_TRACE || said++ >= 120) {
+	if (!CAM_TRACE) {
+		/* cam_bt=1 (docs/camera-session-stops.md D1): only who starts/stops the stream, the first 3 of each */
+		static struct { const char *what; unsigned n; } bt[3] = { { "stream_stop", 0 }, { "device_relinquish_streams", 0 }, { "stream_start", 0 } };
+		int i;
+
+		if (bootarg_number("cam_bt", 0) != 1) {
+			return;
+		}
+		for (i = 0; i < 3 && strcmp(bt[i].what, what) != 0; i++) {
+		}
+		if (i == 3 || bt[i].n++ >= 3) {
+			return;
+		}
+	} else if (said++ >= 120) {
 		return;
 	}
 	k = backtrace(frames, 40);
@@ -140,11 +164,14 @@ say_bt(const char *what)
 	for (int i = 1; i < k; i++) {
 		if (used >= (int)sizeof(line) - 14) {
 			say("%s", line);
+	cam_keep(line);
+			cam_keep(line);
 			used = snprintf(line, sizeof(line), "BT+:");
 		}
 		used += snprintf(line + used, sizeof(line) - (size_t)used, " %lx", (unsigned long)((uintptr_t)frames[i] - slide));
 	}
 	say("%s", line);
+	cam_keep(line);
 }
 
 /*
@@ -2109,6 +2136,13 @@ device_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 {
 	(void)o;
 	trace_key("device set", key);
+	if (bootarg_number("cam_bt", 0) == 1 && CFEqual(key, CFSTR("ClientIsActive")) && value != NULL && CFGetTypeID(value) == CFBooleanGetTypeID()) {
+		char line[80];
+
+		snprintf(line, sizeof(line), "device set: ClientIsActive = %s", CFBooleanGetValue(value) ? "true" : "false");
+		say("%s", line);
+		cam_keep(line);
+	}
 	say_once("device: set (not used)", key, value);
 	return 0;
 }

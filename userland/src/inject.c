@@ -1829,6 +1829,62 @@ micros(uint64_t absolute)
 	return absolute * timebase.numer / timebase.denom / 1000;
 }
 
+static void say_kept(const char *format, ...) __printflike(1, 2);
+
+/* touch_lat=1 (docs/camera-session-stops.md 5.3): who asks backboardd to cancel/suppress touches. Every BK* class's cancel method is wrapped; the
+ * arguments are logged raw (pointers or enums, never dereferenced). */
+static void
+touch_cancel_scan(void)
+{
+	static const char *const sels[] = { "cancelAndSuppressTouchesOnDisplay:reason:", "cancelTouchesOnDisplay:", "cancelTouchesWithIdentifiers:" };
+	unsigned n = 0, found = 0;
+	Class *all = objc_copyClassList(&n);
+	char line[300] = "backboardd: cancel scan:";
+
+	for (unsigned i = 0; i < n; i++) {
+		const char *name = class_getName(all[i]);
+
+		if (name[0] != 'B' || name[1] != 'K') {
+			continue;
+		}
+		for (int k = 0; k < 3; k++) {
+			Method m = class_getInstanceMethod(all[i], sel_registerName(sels[k]));
+			__block IMP orig;
+			const char *label = sels[k];
+
+			if (m == NULL || found >= 12) {
+				continue;
+			}
+			found++;
+			if (strlen(line) < sizeof(line) - 80) {
+				snprintf(line + strlen(line), sizeof(line) - strlen(line), " %s.%s", name, label);
+			}
+			orig = method_getImplementation(m);
+			method_setImplementation(m, imp_implementationWithBlock((id)^(id me, void *a, void *b) {
+				say_kept("backboardd: %s called at %llu us (args %p %p)", label, micros(mach_absolute_time()), a, b);
+				return ((id (*)(id, SEL, void *, void *))orig)(me, sel_registerName(label), a, b);
+			}));
+		}
+	}
+	free(all);
+	say_kept("%s (%u classes)", line, n);
+}
+
+/* touch_lat=1 lines that must survive in the kept log (the console's tail loses the early part of a run) */
+static void
+say_kept(const char *format, ...)
+{
+	char line[256];
+	va_list ap;
+	int n;
+
+	va_start(ap, format);
+	n = vsnprintf(line, sizeof(line), format, ap);
+	va_end(ap);
+	say("%s\n", line);
+	(void)sysctlbyname("kern.redwood.host_keep", NULL, NULL, line, (size_t)(n > (int)sizeof(line) - 1 ? (int)sizeof(line) - 1 : n));
+}
+
 static void *
 input_thread(__unused void *arg)
 {
@@ -1836,7 +1892,7 @@ input_thread(__unused void *arg)
 	IOHIDEventSystemClientRef client = NULL;
 	IOHIDServiceClientRef screen = NULL, buttons = NULL;
 	struct redwood_touch t;
-	unsigned count = 0, waking = 0;         /* waking: the fingers whose touch went into waking the display */
+	unsigned count = 0, downs = 0, waking = 0;         /* waking: the fingers whose touch went into waking the display */
 	int device;
 
 	pthread_setname_np("redwood input");
@@ -1873,6 +1929,9 @@ input_thread(__unused void *arg)
 	}
 	say("redwood: input: touch screen service %p, buttons %p\n", (void *)screen, (void *)buttons);
 	dispatch_semaphore_signal(input_services_made); /* see wait_for_als_arrival() */
+	if (touch_latency) {
+		touch_cancel_scan();
+	}
 	if (screen == NULL) {
 		return NULL;
 	}
@@ -1882,6 +1941,9 @@ input_thread(__unused void *arg)
 
 		if (count++ < 4) {
 			say("redwood: input: sample type %u finger %u at %u %u\n", t.type, t.finger, t.x, t.y);
+		}
+		if (touch_latency && t.type == REDWOOD_TOUCH_DOWN && downs++ < 60) {
+			say_kept("input: DOWN at %llu us, mode 0x%x, %s", micros(read_at), touch_mode, (touch_mode & 0xff) == TOUCH_MODE_WAKE && buttons != NULL ? "wake" : "sent");
 		}
 		if (t.type > REDWOOD_TOUCH_UP) {
 			if (buttons != NULL) {

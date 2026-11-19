@@ -905,6 +905,47 @@ layers(void)
  */
 static void keep_line(const char *format, ...) __printflike(1, 2);
 
+/*
+ * vdiag=1 (docs/camera-session-stops.md 5.3): SpringBoard's own view of the touches after the Camera launch (does the first tap reach it?).
+ * 40 touch events from the launch notify on; the original runs after the line.
+ */
+static IMP sb_orig_send_event;
+static int sb_touch_events = -1;
+
+static void
+sb_send_event(id me, SEL sel, id event)
+{
+	if (sb_touch_events >= 0 && sb_touch_events < 80 && ((long (*)(id, SEL))objc_msgSend)(event, sel_registerName("type")) == 0) {
+		id touches = ((id (*)(id, SEL))objc_msgSend)(event, sel_registerName("allTouches")), one = ((id (*)(id, SEL))objc_msgSend)(touches, sel_registerName("anyObject"));
+
+		if (one != NULL) {
+			id key = ((id (*)(id, SEL))objc_msgSend)(me, sel_registerName("keyWindow"));
+
+			sb_touch_events++;
+			keep_line("SpringBoard: touch phase %ld at %llu us (ignoring %d, key window %s)", ((long (*)(id, SEL))objc_msgSend)(one, sel_registerName("phase")), now_us(),
+			    (int)((BOOL (*)(id, SEL))objc_msgSend)(me, sel_registerName("isIgnoringInteractionEvents")), key ? class_getName(object_getClass(key)) : "-");
+		}
+	}
+	((void (*)(id, SEL, id))sb_orig_send_event)(me, sel, event);
+}
+
+static void
+sb_touch_log_start(id app)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	Method m = app ? class_getInstanceMethod(object_getClass(app), sel_registerName("sendEvent:")) : NULL;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || strstr(args, "vdiag=1") == NULL || m == NULL) {
+		return;
+	}
+	mach_timebase_info(&timebase);
+	if (sb_orig_send_event == NULL) {
+		sb_orig_send_event = method_setImplementation(m, (IMP)sb_send_event);
+	}
+	sb_touch_events = 0;
+}
+
 static Class (*original_provider_for_screen)(id self, SEL selector, id screen, id info);
 
 static Class
@@ -2265,7 +2306,10 @@ redwood_springboard_init(void)
 		Class lock_class = objc_getClass("SBLockScreenManager");
 		id manager = lock_class ? ((id (*)(Class, SEL))objc_msgSend)(lock_class, sel_registerName("sharedInstance")) : NULL;
 		int is_locked = manager ? (int)((BOOL (*)(id, SEL))objc_msgSend)(manager, sel_registerName("isUILocked")) : -1;
-		BOOL ok = ((BOOL (*)(id, SEL, id, BOOL))objc_msgSend)(app, sel_registerName("launchApplicationWithIdentifier:suspended:"),
+		BOOL ok;
+
+		sb_touch_log_start(app);
+		ok = ((BOOL (*)(id, SEL, id, BOOL))objc_msgSend)(app, sel_registerName("launchApplicationWithIdentifier:suspended:"),
 		    (id)CFSTR("com.apple.camera"), NO);
 
 		keep_line("redwood: camera launched by bundle id: %d (UI locked %d)", ok, is_locked);

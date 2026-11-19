@@ -1027,6 +1027,9 @@ main_watch(void)
 	dispatch_resume(timer);
 }
 
+static bool vdiag_on;   /* vdiag=1: the diagnostics below (set in the constructor, before camera_app_probe) */
+static bool boot_arg_has(const char *word);
+
 /*
  * The library opened (made, the first time after a boot: /private/var is a RAM volume) as soon as the app is up, on a queue of its own, so
  * that it is there by the first tap; the line says how long assetsd took. Only where the app may read it (asking would end it, see still_to_library).
@@ -1041,7 +1044,9 @@ library_early(void)
 		long all = library && class_getClassMethod(library, status) ? ((long (*)(id, SEL, long))objc_msgSend)((id)library, status, 2) : -1;
 		id result;
 
-		host_line("camera app: early open: authorisation %ld after %llu ms", all, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - began) / 1000000);
+		if (vdiag_on) {
+			host_line("camera app: early open: authorisation %ld after %llu ms", all, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - began) / 1000000);
+		}
 		if (all != 3 || asset == NULL) {
 			host_line("camera app: the photo library is not opened early (authorisation to read and write %ld)", all);
 			return;
@@ -1053,7 +1058,9 @@ library_early(void)
 		host_line("%s", line);
 		early_open = 1;
 		(void)((id (*)(id, SEL))objc_msgSend)((id)library, sel_registerName("sharedPhotoLibrary"));
-		host_line("camera app: early open: shared library after %llu ms", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - began) / 1000000);
+		if (vdiag_on) {
+			host_line("camera app: early open: shared library after %llu ms", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - began) / 1000000);
+		}
 		if (early_open == 2) {
 			host_line("camera app: the early open stopped: an exception was thrown (assetsd may still be making the database); the tap's own retry opens it");
 			return;
@@ -1199,7 +1206,7 @@ session_stop(id me, SEL sel)
 static void
 send_event(id me, SEL sel, id event)
 {
-	if (touch_events < 40 && ((long (*)(id, SEL))objc_msgSend)(event, sel_registerName("type")) == 0) {
+	if (touch_events < 80 && ((long (*)(id, SEL))objc_msgSend)(event, sel_registerName("type")) == 0) {
 		id touches = ((id (*)(id, SEL))objc_msgSend)(event, sel_registerName("allTouches")), one = ((id (*)(id, SEL))objc_msgSend)(touches, sel_registerName("anyObject"));
 
 		if (one != NULL) {
@@ -1240,10 +1247,32 @@ t3_hooks(void)
 			}
 			orig = method_getImplementation(m);
 			method_setImplementation(m, imp_implementationWithBlock((id)^(id me, id payload) {
-				host_line("camera app: session %p %s %.3f s after launch (main %d)", me, label, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - app_launch_ns) / 1e9, pthread_main_np());
+				host_line("camera app: session %p %s %.3f s after launch (main %d) payload %.300s", me, label, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - app_launch_ns) / 1e9, pthread_main_np(),
+				    text_of_object(payload));
 				((void (*)(id, SEL, id))orig)(me, sel_registerName(label), payload);
 			}));
 		}
+	}
+	/* D1: configuration commits on the session queue (who changes the session just before the server stops the graph) */
+	for (int i = 0; session != NULL && i < 2; i++) {
+		static const char *const cfg[] = { "beginConfiguration", "commitConfiguration" };
+		Method m = class_getInstanceMethod(session, sel_registerName(cfg[i]));
+		__block IMP orig;
+		const char *label = cfg[i];
+
+		if (m == NULL) {
+			continue;
+		}
+		orig = method_getImplementation(m);
+		method_setImplementation(m, imp_implementationWithBlock((id)^(id me) {
+			static _Atomic int said;
+
+			if (said++ < 10) {
+				host_line("camera app: %s (main %d) %.3f s after launch", label, pthread_main_np(), (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - app_launch_ns) / 1e9);
+				camera_frames(label);
+			}
+			((void (*)(id, SEL))orig)(me, sel_registerName(label));
+		}));
 	}
 	if (send != NULL) {
 		orig_send_event = method_setImplementation(send, (IMP)send_event);
@@ -1271,9 +1300,27 @@ static void
 camera_app_probe(void)
 {
 	app_launch_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-	t3_hooks();     /* (in the constructor: the first session starts ~0.5 s after launch, before the main queue's first turn) */
+	if (vdiag_on) {
+		t3_hooks();     /* (in the constructor: the first session starts ~0.5 s after launch, before the main queue's first turn) */
+		static const char *const notices[] = { "AVCaptureSessionRuntimeErrorNotification", "AVCaptureSessionWasInterruptedNotification",
+		    "AVCaptureSessionInterruptionEndedNotification", "AVCaptureSessionDidStopRunningNotification" };
+		id center = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSNotificationCenter"), sel_registerName("defaultCenter"));
+
+		for (int i = 0; center != NULL && i < 4; i++) {
+			const char *label = notices[i];
+			CFStringRef name = CFStringCreateWithCString(NULL, label, kCFStringEncodingUTF8);
+
+			(void)((id (*)(id, SEL, id, id, id, id))objc_msgSend)(center, sel_registerName("addObserverForName:object:queue:usingBlock:"), (id)name, NULL, NULL,
+			    (id)^(id n) {
+				host_line("camera app: notice %s at +%.3f: userInfo %.300s", label, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - app_launch_ns) / 1e9,
+				    text_of_object(n ? ((id (*)(id, SEL))objc_msgSend)(n, sel_registerName("userInfo")) : NULL));
+			});
+		}
+	}
 	dispatch_async(dispatch_get_main_queue(), ^{
-		t3_hooks();
+		if (vdiag_on) {
+			t3_hooks();
+		}
 		capture_hook("at launch");
 	});
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
@@ -1310,7 +1357,7 @@ boot_arg_has(const char *word)
 	return false;
 }
 
-static bool vdiag_on, in_mediaserverd;
+static bool in_mediaserverd;
 
 static void
 fourcc(unsigned code, char *out)
@@ -1802,8 +1849,8 @@ redwood_media_init(void)
 	if (name != NULL && strcmp(name, "Camera") == 0) {
 		CFPreferencesSetAppValue(CFSTR("CAMUserPreferenceEnableResponsiveShutter"), kCFBooleanFalse, CFSTR("com.apple.camera"));
 		camera_app_guard();
-		camera_app_probe();
 		vdiag_on = boot_arg_has("vdiag=1");
+		camera_app_probe();
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 14 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
 			vd_stabilization();     /* always (vfix=0 turns the forcing off) */
 			if (vdiag_on) {
