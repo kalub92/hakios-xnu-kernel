@@ -2076,3 +2076,11 @@ redwood_r1cam_init(void)
 }
 
 #endif
+
+/* r1_slp a4: the camera is streaming or a client has it open: the cores are not parked */
+bool redwood_r1cam_active(void);
+bool
+redwood_r1cam_active(void)
+{
+	return cam_streaming || cam_dev_wanted;
+}

@@ -71,6 +71,7 @@ redwood_core_mhz(int *cpu)
 extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
 extern "C" void redwood_keep(const char * format, ...) __printflike(1, 2);
 extern "C" void redwood_r1_ui_activity(void);
+extern "C" uint32_t redwood_r1_vsync;
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -1837,6 +1838,7 @@ IOMobileFramebufferUserClient::vsync(void)
 		fVSyncRunning = false;
 	} else {
 		fVSyncCount++;
+		redwood_r1_vsync++;
 		setAsyncReference64(ref, fPorts[kFBNotifyVSync], fCallbacks[kFBNotifyVSync], fRefcons[kFBNotifyVSync], fTask);
 		args[0] = (uint32_t) now;
 		args[1] = now >> 32;

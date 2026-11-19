@@ -112,6 +112,12 @@ spin_us(uint32_t us)
 	}
 }
 
+/* r1_slp bit 3: while the screen is off and nothing plays, the loops look every 50 ms, not every 4 */
+extern uint32_t redwood_r1_slp;
+extern volatile uint32_t redwood_r1_screen_off;
+extern uint32_t redwood_r1_poll[8];
+#define SLP_IDLE_MS(idle) (((redwood_r1_slp & 8) && redwood_r1_screen_off && (idle)) ? 50 : 4)
+
 static void
 wait_ms(uint32_t ms)
 {
@@ -1004,7 +1010,8 @@ r1vibr_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 			on = false;
 		}
-		wait_ms(4);
+		redwood_r1_poll[4]++;
+		wait_ms(SLP_IDLE_MS(!on && !active));
 	}
 done:
 	thread_terminate(current_thread());
@@ -1120,7 +1127,8 @@ serve(void)
 				break;
 			}
 		}
-		wait_ms(4);
+		redwood_r1_poll[4]++;
+		wait_ms(SLP_IDLE_MS(state == IDLE && !active));
 	}
 	say("haptic: the motor is given up on (%u taps and %u vibrations played, %u cut at %u ms)\n", taps, loops, capped,
 	    HAPTIC_MAX_MS);

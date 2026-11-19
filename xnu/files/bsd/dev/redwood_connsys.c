@@ -56,6 +56,8 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern void redwood_host_keep_add(const char *format, ...) __printflike(1, 2);
+extern uint32_t redwood_r1_slp, redwood_r1_poll[8];
+extern volatile uint32_t redwood_r1_screen_off;
 extern void delay(int usec);
 
 #define SPM_PHYS                0x10006000u
@@ -2160,7 +2162,9 @@ bt_bridge(void)
 			bt_to_host(bt_frame, (unsigned)length);
 		} else {
 			if (length < 0 && pass == 0) {
-				delay_for_interval(idle_ms != 0 ? idle_ms : 1, NSEC_PER_MSEC);
+				/* r1_slp bit 3: 20 ms while the screen is off (a packet that arrives waits that long at most) */
+				redwood_r1_poll[5]++;
+				delay_for_interval(((redwood_r1_slp & 8) && redwood_r1_screen_off) ? 20 : idle_ms != 0 ? idle_ms : 1, NSEC_PER_MSEC);
 			}
 			break;
 		}

@@ -14,6 +14,7 @@
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include <os/atomic_private.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -28,6 +29,12 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
 extern void redwood_tl(const char *format, ...) __printflike(1, 2);
 extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
+extern bool ml_cpu_irq_counts(int cpu_id, uint64_t *irq, uint64_t *timer, uint64_t *ipi);
+extern kern_return_t ml_r1_cpu_enable(int cpu_id, bool enable);
+extern bool redwood_mtkaudio_busy(void);
+extern bool redwood_r1cam_active(void);
+extern uint32_t redwood_r1_slp, redwood_r1_poll[8], redwood_r1_vsync;       /* redwood_input.c */
+extern volatile uint32_t redwood_r1_screen_off;
 
 /*
  * The loader's log as well: this runs early, and the kernel's own log of a run keeps only its end. With
@@ -1473,11 +1480,34 @@ r1_cpufreq(const uint32_t mhz[2], bool table_ok)
  */
 static uint32_t r1_gov_ups, r1_gov_downs, r1_gov_last_us;
 
+static thread_call_t r1_slp_call;       /* r1_slp: screen-off/on work (clocks a1, parking a4), run from a thread: the caller is a sysctl */
+
+static thread_call_t r1_kick_call;      /* its own call: the park check only (r1_slp_work would redo the clocks as well, and may coalesce with a screen-on) */
+static volatile bool r1_wake_hint;      /* a4: a button or touch came in while the screen was off: not parked until the next screen-off */
+static volatile uint64_t r1_wake_hint_at;
+
+void redwood_r1_wake_kick(void);
+void
+redwood_r1_wake_kick(void)
+{
+	if (r1_kick_call != NULL && !r1_wake_hint) {
+		r1_wake_hint_at = mach_absolute_time();
+		r1_wake_hint = true;
+		thread_call_enter(r1_kick_call);
+	}
+}
+
 void redwood_r1_gov_screen(bool off);
 void
 redwood_r1_gov_screen(bool off)
 {
 	r1_gov_off = off;
+	if (off) {
+		r1_wake_hint = false;
+	}
+	if (r1_slp_call != NULL) {
+		thread_call_enter(r1_slp_call);
+	}
 }
 
 /*
@@ -1514,7 +1544,9 @@ r1_gov_thread(void *arg __unused, wait_result_t wr __unused)
 		uint32_t top = 0;
 		bool high, go_up, go_down, boost;
 
-		delay_for_interval(50, NSEC_PER_MSEC);
+		redwood_r1_poll[3]++;
+		/* r1_slp a1/a3: a sample every 500 ms while the screen is off (a wake raises the clocks at once: r1_slp_work) */
+		delay_for_interval((redwood_r1_slp & 10) && r1_gov_off ? 500 : 50, NSEC_PER_MSEC);
 		now = mach_absolute_time();
 		for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
 			uint64_t idle = 0, busy;
@@ -1585,6 +1617,157 @@ r1_gov_thread(void *arg __unused, wait_result_t wr __unused)
 	}
 }
 
+/*
+ * r1_slp (stage a of docs/sleep-spec.md; bit 0 the counters, 1 screen-off clocks, 3 slower polling (the drivers), 4 parked cores).
+ * r1_slp_work runs from a thread call whenever the backlight goes to 0 or back:
+ *   a1: off = LK's clocks (r1_restore: MP0 1499, MP1 919, Vproc 800 mV) with or without r1_gov; on = the r1_cpufreq rows again (never
+ *       once r1_latched). The governor's own rules are unchanged.
+ *   a4: off = cores 1-3 get no threads from the scheduler (ml_r1_cpu_enable, no PSCI: they idle in WFI); on = they do. Not parked
+ *       while the speaker or the microphone path is fed or the camera is open; r1_slp_thread looks again every second.
+ */
+static LCK_MTX_DECLARE(r1_slp_mtx, &r1_grp);
+static bool r1_parked;
+
+static uint32_t
+r1_slp_ms(void)
+{
+	uint64_t t, ns;
+
+	clock_get_uptime(&t);
+	absolutetime_to_nanoseconds(t, &ns);
+	return (uint32_t)(ns / 1000000);
+}
+
+static void
+r1_slp_park_eval(void)
+{
+	bool want = redwood_r1_screen_off && !r1_wake_hint && !redwood_mtkaudio_busy() && !redwood_r1cam_active();
+	uint32_t done = 0;
+
+	lck_mtx_lock(&r1_slp_mtx);
+	if (want != r1_parked) {
+		for (int i = 1; i < 4; i++) {
+			done += ml_r1_cpu_enable(i, !want) == KERN_SUCCESS;
+		}
+		r1_parked = want;
+		redwood_host_keep_add("r1slp: %s %u of cores 1-3 at %u ms", want ? "park" : "unpark", done, r1_slp_ms());
+	}
+	lck_mtx_unlock(&r1_slp_mtx);
+}
+
+static void
+r1_kick_work(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	r1_slp_park_eval();
+}
+
+static void
+r1_slp_work(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	if (redwood_r1_slp & 2) {
+		bool off = redwood_r1_screen_off;
+		uint64_t t0 = mach_absolute_time(), t1, ns;
+
+		lck_mtx_lock(&r1_mtx);
+		if (!r1_latched) {
+			r1_quiet = true;
+			if (off) {
+				r1_restore();
+			} else {
+				for (uint32_t cl = 0; cl < 2; cl++) {
+					if (r1_row[cl] != NULL && !r1_raised[cl]) {
+						r1_raised[cl] = r1_switch(cl, r1_row[cl]->mhz, r1_row[cl]->vproc, r1_row[cl]->con1);
+					}
+				}
+			}
+			r1_quiet = false;
+		}
+		lck_mtx_unlock(&r1_mtx);
+		t1 = mach_absolute_time();
+		absolutetime_to_nanoseconds(t1 - t0, &ns);
+		redwood_host_keep_add("r1slp: clocks for screen %s at %u ms: MP0 %u MP1 %u MHz Vproc %u uV (%u us, latched %d)", off ? "off" : "on",
+		    r1_slp_ms(), r1_pll_khz(r1rd(r1_apm, r1_pll[0])) / 1000, r1_pll_khz(r1rd(r1_apm, r1_pll[1])) / 1000, r1_cur_vproc,
+		    (uint32_t)(ns / 1000), r1_latched);
+	}
+	if (redwood_r1_slp & 16) {
+		r1_slp_park_eval();
+	}
+}
+
+/* a0: every second the park check (a4); every 10th the r1slp: line (the rates are over the 10 s) */
+static void
+r1_slp_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	const ml_topology_info_t *topology = ml_get_topology_info();
+	unsigned n = MIN(topology->num_cpus, 4u);
+	uint64_t idle0[4] = { 0 }, irq0[4] = { 0 }, tmr0[4] = { 0 }, ipi0[4] = { 0 }, then = mach_absolute_time();
+	uint32_t poll0[6] = { 0 }, vs0 = 0, tick = 0, off_ticks = 0;
+	uint64_t five_s;
+	vm_offset_t spm = (redwood_r1_slp & 1) ? ml_io_map(0x10006000, 0x1000) : 0;
+
+	for (unsigned i = 0; i < n; i++) {      /* the first window starts now, not at boot */
+		(void)ml_cpu_idle_time((int)i, &idle0[i]);
+		(void)ml_cpu_irq_counts((int)i, &irq0[i], &tmr0[i], &ipi0[i]);
+	}
+	for (unsigned i = 0; i < 6; i++) {
+		poll0[i] = redwood_r1_poll[i];
+	}
+	vs0 = redwood_r1_vsync;
+	nanoseconds_to_absolutetime(5 * NSEC_PER_SEC, &five_s);
+	for (;;) {
+		uint64_t now, span, idle[4] = { 0 }, irq[4] = { 0 }, tmr[4] = { 0 }, ipi[4] = { 0 }, ns, tsum = 0, isum = 0;
+		uint32_t pr[6];
+
+		delay_for_interval(1000, NSEC_PER_MSEC);
+		if ((redwood_r1_slp & 16) && r1_wake_hint && mach_absolute_time() - r1_wake_hint_at > five_s) {
+			r1_wake_hint = false;           /* nothing woke it in 5 s: a stray touch: park again */
+		}
+		if (redwood_r1_slp & 16) {
+			r1_slp_park_eval();
+		}
+		off_ticks += redwood_r1_screen_off != 0;
+		if (!(redwood_r1_slp & 1) || ++tick % 10 != 0) {
+			continue;
+		}
+		now = mach_absolute_time();
+		span = now - then;
+		then = now;
+		absolutetime_to_nanoseconds(span, &ns);
+		ns = ns ? ns : 1;
+		for (unsigned i = 0; i < n; i++) {
+			(void)ml_cpu_idle_time((int)i, &idle[i]);
+			(void)ml_cpu_irq_counts((int)i, &irq[i], &tmr[i], &ipi[i]);
+		}
+		for (unsigned i = 0; i < 6; i++) {
+			pr[i] = (uint32_t)((uint64_t)(redwood_r1_poll[i] - poll0[i]) * NSEC_PER_SEC / ns);
+			poll0[i] = redwood_r1_poll[i];
+		}
+		for (unsigned i = 0; i < n; i++) {
+			tsum += tmr[i] - tmr0[i];
+			isum += ipi[i] - ipi0[i];
+		}
+		redwood_host_keep_add("r1slp: t=%u off=%u/10 idle%% %u %u %u %u irq/s %u %u %u %u tmr/s %u ipi/s %u mp %u/%u vp %u poll/s %u %u %u %u %u %u pwr %05x/%05x vs/s %u pk %d",
+		    r1_slp_ms() / 1000, off_ticks,
+		    (uint32_t)(100 * (idle[0] - idle0[0]) / span), (uint32_t)(100 * (idle[1] - idle0[1]) / span),
+		    (uint32_t)(100 * (idle[2] - idle0[2]) / span), (uint32_t)(100 * (idle[3] - idle0[3]) / span),
+		    (uint32_t)((irq[0] - irq0[0]) * NSEC_PER_SEC / ns), (uint32_t)((irq[1] - irq0[1]) * NSEC_PER_SEC / ns),
+		    (uint32_t)((irq[2] - irq0[2]) * NSEC_PER_SEC / ns), (uint32_t)((irq[3] - irq0[3]) * NSEC_PER_SEC / ns),
+		    (uint32_t)(tsum * NSEC_PER_SEC / ns), (uint32_t)(isum * NSEC_PER_SEC / ns),
+		    r1_pll_khz(r1rd(r1_apm, r1_pll[0])) / 1000, r1_pll_khz(r1rd(r1_apm, r1_pll[1])) / 1000, r1_cur_vproc,
+		    pr[0], pr[1], pr[2], pr[3], pr[4], pr[5],
+		    spm ? *(volatile uint32_t *)(spm + 0x180) & 0xfffff : 0, spm ? *(volatile uint32_t *)(spm + 0x184) & 0xfffff : 0,
+		    (uint32_t)((uint64_t)(redwood_r1_vsync - vs0) * NSEC_PER_SEC / ns), r1_parked);
+		vs0 = redwood_r1_vsync;
+		off_ticks = 0;
+		for (unsigned i = 0; i < n; i++) {
+			idle0[i] = idle[i];
+			irq0[i] = irq[i];
+			tmr0[i] = tmr[i];
+			ipi0[i] = ipi[i];
+		}
+	}
+}
+
 /* Everything of the r1: false (and nothing touched) unless one of its boot-args is there. */
 static bool
 r1_init(void)
@@ -1647,6 +1830,16 @@ r1_init(void)
 			thread_deallocate(thread);
 		}
 		SAY("r1gov: on: low = LK's clocks, high = r1_cpufreq; UI boost %s", r1_boost_on ? "on (250 ms)" : "off");
+	}
+	if (redwood_r1_slp != 0) {
+		thread_t thread;
+
+		r1_kick_call = thread_call_allocate(r1_kick_work, NULL);
+		r1_slp_call = thread_call_allocate(r1_slp_work, NULL);
+		if (kernel_thread_start(r1_slp_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		}
+		SAY("r1slp: on, r1_slp %#x (1 counters, 2 screen-off clocks, 8 slower polling, 16 parked cores)", redwood_r1_slp);
 	}
 	if (PE_parse_boot_argn("membench", &bench, sizeof(bench)) && bench == 1) {
 		memory_bench();

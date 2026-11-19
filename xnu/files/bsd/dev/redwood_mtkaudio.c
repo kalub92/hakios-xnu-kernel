@@ -2480,6 +2480,14 @@ redwood_mtkaudio_init(void)
 	}
 }
 
+/* r1_slp a4: sound is being fed to the speaker, or the microphone path is up: the cores are not parked */
+bool redwood_mtkaudio_busy(void);
+bool
+redwood_mtkaudio_busy(void)
+{
+	return feed_wanted || mic_on;
+}
+
 /*
  * On the way back to Android (loader_return.c) and on a panic's: the microphone's bias must not stay on. No lock and no
  * waiting: the uplink source, both ADCs and both biases are written straight. Nothing if the microphone was never up.

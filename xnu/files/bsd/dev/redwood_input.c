@@ -109,11 +109,29 @@ count_fingers(uint32_t type, uint32_t finger)
 	}
 }
 
+/*
+ * r1_slp (idle power, stage a): bit 0 the r1slp: counters, 1 screen-off clocks, 3 slower polling while the screen is off,
+ * 4 cores 1-3 parked by the scheduler while it is off. 0 (absent) = nothing of it is done. Bit 2 (the loader's watcher) is not ours.
+ */
+uint32_t redwood_r1_slp;
+volatile uint32_t redwood_r1_screen_off;        /* kern.redwood.backlight is 0 (redwood_hyn.c) */
+uint32_t redwood_r1_poll[8];                    /* loops of: 0 touch, 1 keys, 2 imu, 3 governor, 4 haptic, 5 bt */
+uint32_t redwood_r1_vsync;                      /* vsync callbacks sent to the client (MiniIOMobileFramebuffer.cpp) */
+volatile uint64_t redwood_r1_btn_t0;            /* mach time of the first button press while the screen was off (the wake latency's start) */
+
+extern void redwood_r1_wake_kick(void);
+
 static void
 touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
 {
 	struct redwood_touch *t;
 
+	if ((redwood_r1_slp & 1) && redwood_r1_screen_off && type == REDWOOD_BUTTON_DOWN && redwood_r1_btn_t0 == 0) {
+		redwood_r1_btn_t0 = mach_absolute_time();
+	}
+	if ((redwood_r1_slp & 16) && redwood_r1_screen_off && (type == REDWOOD_BUTTON_DOWN || type == REDWOOD_TOUCH_DOWN)) {
+		redwood_r1_wake_kick();         /* a4: a press or a touch while locked: the parked cores come back now, not when the backlight does */
+	}
 	lck_mtx_lock(&touch_lock);
 	if (touch_tail - touch_head == TOUCH_QUEUE) {
 		touch_head++;                   /* nobody reads: drop the oldest */
@@ -218,6 +236,9 @@ redwood_input_init(void)
 		printf("redwood-touch: cannot create the device\n");
 	}
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
+	if (PE_parse_boot_argn("r1_slp", &redwood_r1_slp, sizeof(redwood_r1_slp))) {
+		redwood_r1_slp &= 0x1b;
+	}
 	redwood_cpufreq_init();
 	redwood_virtio_input_init();
 	redwood_goodix_init();

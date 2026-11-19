@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-19 07:10 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-19 08:22 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -63,7 +63,7 @@ Last updated: 2026-11-19 07:10 PST. Kept current as work lands; details are in t
 - Phone calls and SMS (not built; current safety rules forbid dialling and SMS)
 - Bluetooth call audio (HFP)
 - USB while in iOS
-- Sleep / low-power idle: specified in `sleep-spec.md` (today only the backlight goes off when locked; cores stay awake, every driver polls, the loader's watcher core spins). First stage (lower voltage, slower polling and parked cores while the screen is off) being built; no battery-drain figure exists yet because every reading so far was taken on USB power
+- Sleep / low-power idle (`sleep-spec.md`): the first stage is built behind `r1_slp` (off by default; 27 turns all of it on) and passed unattended. With the screen off the CPU drops to 1499 MHz at 0.80 V (from 2199 MHz at 1.20 V), cores 1 to 3 are parked (0 interrupts on them), touch and button polling slows (47 to 16 and 27 to 19 a second) and timer interrupts fall from about 25,000 to 6,500 a second. Side-button wake to backlight is about 430 ms against 360 ms without it. The default image is unchanged. Not done: no battery-drain figure (every run was on USB power), the wake was an injected press and not a real one, the interrupt cut is 3.6x against the 5x aimed for, and the loader watcher core, deeper CPU idle and suspend are untouched
 
 
 ## Dropped or nothing to gain

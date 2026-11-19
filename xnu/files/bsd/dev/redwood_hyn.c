@@ -245,6 +245,13 @@ report(const uint8_t *b)
 	reports++;
 }
 
+/* r1_slp (redwood_input.c): bit 3 = slower polling while the screen is off */
+extern uint32_t redwood_r1_slp;
+extern volatile uint32_t redwood_r1_screen_off;
+extern uint32_t redwood_r1_poll[8];
+extern volatile uint64_t redwood_r1_btn_t0;
+#define SLP_QUIET() ((redwood_r1_slp & 8) && redwood_r1_screen_off)
+
 static void
 hyn_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -290,7 +297,8 @@ hyn_thread(__unused void *parameter, __unused wait_result_t result)
 			    "last read %02x %02x %02x %02x %02x %02x %02x\n", reports, touches, misses, pin_get(PIN_IRQ),
 			    b[0], b[1], b[2], b[3], b[4], b[5], b[6]);
 		}
-		delay(poll_us);
+		redwood_r1_poll[0]++;
+		delay(SLP_QUIET() ? 50000 : poll_us);   /* a3: a tap of 100 ms or more is still seen twice */
 	}
 }
 
@@ -416,8 +424,10 @@ r1keys_thread(__unused void *parameter, __unused wait_result_t result)
 	wia0 = wia;
 	cntl2_0 = cntl2;
 
-	for (;; delay(wheel && fast ? 10000 : wheel ? 33000 : 20000), polls++) {
+	for (;; delay(SLP_QUIET() ? 50000 : wheel && fast ? 10000 : wheel ? 33000 : 20000), polls++) {
 		bool now;
+
+		redwood_r1_poll[1]++;
 
 		/* the side button: the same twice in a row, or it is a bounce */
 		mem = *(volatile uint32_t *)(kpd + KP_MEM1);
@@ -428,7 +438,7 @@ r1keys_thread(__unused void *parameter, __unused wait_result_t result)
 			printf("r1keys: side button %s (KP_MEM1 %#x)\n", down ? "down" : "up", mem);
 		}
 		seen = now;
-		if (!wheel) {
+		if (!wheel || SLP_QUIET()) {            /* a3: no wheel read while the screen is off */
 			continue;
 		}
 		bus_take(161, 162);
@@ -527,6 +537,7 @@ bl_regs(uint8_t r[5])
 	bus_give();
 }
 
+extern void redwood_host_keep_add(const char *format, ...) __printflike(1, 2);
 extern void redwood_r1_gov_screen(bool off);      /* redwood_cpufreq.c: the governor goes low while the screen is off */
 
 static int
@@ -558,6 +569,24 @@ bl_sysctl(struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struc
 		    writes, value, ok ? "ok" : "FAILED", was[0], was[1], was[2], was[3], was[4], now[0], now[1], now[2], now[3], now[4], bl_get());
 	}
 	writes++;
+	if (redwood_r1_slp != 0 && (value == 0) != (redwood_r1_screen_off != 0)) {
+		/* r1_slp: the flag first (the polling and the clocks read it), then the line; a wake's latency = side button pressed in the kernel -> this write */
+		uint64_t t0 = redwood_r1_btn_t0, t1 = mach_absolute_time(), ns;
+		int64_t wake_us = -1;
+
+		if (value != 0 && t0 != 0) {
+			absolutetime_to_nanoseconds(t1 - t0, &ns);
+			wake_us = (int64_t)(ns / 1000);
+		}
+		redwood_r1_screen_off = value == 0;
+		if (value != 0) {
+			redwood_r1_btn_t0 = 0;
+		}
+		if (redwood_r1_slp & 1) {
+			redwood_host_keep_add("r1slp: screen %s at %u ms (level %d), %lld us after the side button (-1 = no press seen)",
+			    value == 0 ? "OFF" : "ON", now_ms(), value, wake_us);
+		}
+	}
 	redwood_r1_gov_screen(value == 0);
 	return ok ? 0 : EIO;
 }
@@ -721,9 +750,14 @@ r1imu_thread(__unused void *parameter, __unused wait_result_t result)
 	delay(20000);
 	printf("r1imu: PWR_MGMT0 %#x ACCEL_CONFIG0 %#x (want 0x3 0x4a)\n", imu_rd(0x1F), imu_rd(0x21));
 
-	for (;; delay(40000), polls++) {
+	for (;; delay(SLP_QUIET() ? 200000 : 40000), polls++) {
 		uint8_t b[6];
 		int32_t raw[3], mm[3];
+
+		redwood_r1_poll[2]++;
+		if (SLP_QUIET()) {                      /* a3: the IMU is not read while the screen is off */
+			continue;
+		}
 
 		imu_xfer(0x0B, true, b, 6);
 		for (int i = 0; i < 3; i++) {

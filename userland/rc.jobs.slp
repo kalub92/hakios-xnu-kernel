@@ -1,0 +1,14 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# Stage 3b (r1_md_if=1 or r1_md=9): the cellular interface test, in the background from the start; ends at once without the argument. Its lines are kept ("cell_test:").
+/redwood/bin/cell_test ifarg r1_md_if=1 &
+# Stage 4c: celld publishes the cellular bearer (kern.redwood.cell_*) to configd; ends at once unless r1_md=10/11 or r1_md_iffake=1.
+/redwood/bin/celld &
+/redwood/bin/hello_dyn started by launchd
+/redwood/bin/svc_test
+/redwood/bin/surf_test
+/bin/ps -A
+/redwood/bin/mg_test
+# homechk=1 (boot-time / home-screen check, silent: no shutter tap, no sound). Put homechk=1 FIRST in the boot-args (rwtouch ifarg reads ~256 bytes of them). rwtouch starts ~41 s: unlock ~155 s, 20 s on the home screen, home button (fbshot_at=170 takes ONE picture), Settings, home, Camera opened only.
+/redwood/bin/rwtouch ifarg homechk=1 say start wait 113 tap 0.5 0.06 wait 1 notify com.redwood.unlock wait 20 say home button home wait 5 say settings notify com.redwood.settings wait 12 button home wait 4 say camera notify com.redwood.camera wait 12 say end
+# slp0=1 (idle power, docs/sleep-spec.md stage a; silent: no sound, no shutter; run WITHOUT mtkaudio so iOS's lock click has no sink; slp0=1 FIRST in the boot-args). rwtouch starts ~41 s: unlock ~131 s, 15 s awake, lock ~147 s, locked 50 s, side button wakes ~197 s, tap + unlock, Settings, end ~218 s. The kernel's r1slp: lines give the evidence.
+/redwood/bin/rwtouch ifarg slp0=1 say start wait 90 tap 0.5 0.06 wait 1 notify com.redwood.unlock say awake wait 15 button lock say locked wait 50 button lock say wake wait 3 tap 0.5 0.06 wait 1 notify com.redwood.unlock wait 5 say settings notify com.redwood.settings wait 12 say end
