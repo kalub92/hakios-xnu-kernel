@@ -179,7 +179,7 @@ Logs `logs/lc1`, `lc2`, `lc3` (and sp2/sp3 of section 2 for the old build: same 
 | cache lines | - | load-op 3 entries, 1935 hits, 0 misses; EOT 1478 of 3870 missed | load-op 3 entries, 2593 hits (miss only at first use); EOT 95 programs, 5134 hits, 52 misses |
 
 The swap rate is now probably limited by the scenario (a swipe of 250 ms and a 0.35 s wait, 0.6 s per swipe) and by CoreAnimation's own pacing, not by the render thread: 21 swaps a second is the peak of the 5 s
-window, the swipes themselves last 24 s. The render thread is idle 91%. What is left in `glFlush`: `_tc_sync` / fence waits for Zink's queue thread, `zink_draw`, `glBindFramebuffer` and
+window, the 6 swipes themselves last about 5 s (CORRECTED 2026-11-19: this said 24 s and 40 swipes; `init` cuts every rc line at 63 words, `init.c:1125`, so only 6 swipes ever ran: see docs/widget-swipe-cost.md section 0). The render thread is idle 91% over the 12 s profile window, which started after the 5 s of swipes had ended (CORRECTED: this does not show that the limit is upstream). What is left in `glFlush`: `_tc_sync` / fence waits for Zink's queue thread, `zink_draw`, `glBindFramebuffer` and
 `glGetFramebufferAttachmentParameteriv` marshalling.
 
 Pass benchmark (pb1 before, pb2 after; CPU ms per pass, rest of process, 375x500, 200 passes a case; noise about 0.2):

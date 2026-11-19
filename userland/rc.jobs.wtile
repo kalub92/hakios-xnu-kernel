@@ -1,0 +1,12 @@
+# Widget swipe cost (docs/widget-swipe-cost.md section 4; modes base stop stopx view). wtile=1 FIRST in the boot-args. Silent: one tap, page swipes, no sound.
+/redwood/bin/rwtouch ifarg wtile=1 say wstart wait 150 tap 0.5 0.06 wait 1 notify com.redwood.unlock wait 4 notify com.redwood.wtile.base wait 1
+/redwood/bin/rwtouch ifarg wtile=1 say setA swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250
+/redwood/bin/rwtouch ifarg wtile=1 wait 2.5 notify com.redwood.wtile.stop wait 0.8
+/redwood/bin/rwtouch ifarg wtile=1 say setB swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250
+/redwood/bin/rwtouch ifarg wtile=1 wait 2.5 notify com.redwood.wtile.stopx wait 0.8
+/redwood/bin/rwtouch ifarg wtile=1 say setC swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250
+/redwood/bin/rwtouch ifarg wtile=1 wait 2.5 notify com.redwood.wtile.view wait 0.8
+/redwood/bin/rwtouch ifarg wtile=1 say setD swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250
+/redwood/bin/rwtouch ifarg wtile=1 wait 2.5 notify com.redwood.wtile.base wait 0.8
+/redwood/bin/rwtouch ifarg wtile=1 say setE swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250
+/redwood/bin/rwtouch ifarg wtile=1 wait 2.5 notify com.redwood.wtile.end say end

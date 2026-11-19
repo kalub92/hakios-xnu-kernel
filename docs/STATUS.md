@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-19 05:35 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-19 06:54 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -32,7 +32,7 @@ Last updated: 2026-11-19 05:35 PST. Kept current as work lands; details are in t
 - Boot image has about 1.4 MB free (Android ramdisk repacked lz4 to gzip)
 - Video recording (`venc=4`): Camera's Video mode records a 1080p H.264 movie to the camera roll at a full 10 frames per second (about 2.1 CPU cores in mediaserverd, no dropped frames) with our own software encoder (minih264e, public domain) registered inside mediaserverd. With `mtkmic=2` the movie carries real microphone sound (a speaker tone is over 100 times louder in the track than the quiet seconds). Playback in Photos, a listen by ear and heat are not tested
 - More memory (`r1_mem=1`, off by default; `ram-holes-spec.md`): iOS gets 2793 MB instead of 2016 MB. Unattended: boots to the home screen, a test that writes and checks up to 1.8 GB of the free pages finds no bad page, Wi-Fi scan, Bluetooth, camera preview and the modem's SIM check (radio off) work, Android intact afterwards, and the default image is unchanged. The side-button exit and the modem service's ten gates (radio off) also pass with it on. Not yet tested with it on: recovery of the log after a hang (needs a person present), camera capture and audio
-- Home-screen widgets (Weather, Calendar) can be drawn with a build switch (`WIDGETS=1`: the widget service is in and only those two extensions start), but they are OFF by default because the two live tiles cut home-screen swipe speed from about 21 to 11 to 13 swaps per second (graphics time per frame 4.4 to about 7 ms). Without the switch the tiles are blank white. What in the tiles costs the speed is not found
+- Home-screen widgets (Weather, Calendar) can be drawn with a build switch (`WIDGETS=1`: the widget service is in and only those two extensions start), but they are OFF by default because the two live tiles cut home-screen swipe speed from about 21 to 11 to 13 swaps per second (graphics time per frame 4.4 to about 7 ms). Without the switch the tiles are blank white. What in the tiles costs the speed is not found Measured 2026-11-19 (wt1..wt6, HANDOFF-2026-11-17-night.md "Widget swipe cost"): 11.6-14.8 swaps/s with widgets against 20.4-21.4 without; hiding or rasterizing the tiles does not recover it, only stopping chronod and the extensions while the tiles are not drawn does (17.8-19.2). No fix yet.
 - Cellular stage 4c/4d on a simulated bearer (radio off): `celld` publishes the service, `pdp_ip0` becomes the primary interface, DNS and traffic go out on it, the data budget cuts traffic off (about 5 KB overshoot)
 
 ## In progress

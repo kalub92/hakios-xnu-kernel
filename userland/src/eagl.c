@@ -64,6 +64,8 @@
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <dispatch/dispatch.h>
+#include <notify.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
@@ -441,6 +443,75 @@ static unsigned flush_skips, flushes_skipped, flushes_done;
 static int swprof_on;
 static unsigned sw_flush_calls, sw_finish_calls, sw_draws, sw_clears, sw_fetch_draws, sw_fetch_programs, sw_frames;
 static bool sw_shader_fetch[256], sw_program_fetch[256];
+/*
+ * Boot-arg wtile=1 (docs/widget-swipe-cost.md section 4, diagnostic): on each com.redwood.wtile.<mode> notification a "redwood-gl: wset" line
+ * of what was counted since the last one. Updates = a draw into a display-sized surface other than the last one (CoreAnimation alternates its
+ * buffers: one change a swap). Passes = a draw into another framebuffer than the last draw (segments, not Vulkan's own count); offscreen =
+ * a segment whose target is not an IOSurface image, sized by the viewport at its first draw.
+ */
+static int wtile_on;
+static struct wt_counts {
+	uint64_t upd, u5, b18, b26, b35, b90, pause, longest, frames, frame_us, passes, off, draws, finish;
+} wt;
+static uint64_t wt_t0, wt_win, wt_last;           /* toggle time; start of the 5-s window (0: not opened); last update */
+static uint32_t wt_surface;
+static GLuint wt_seg_fb = (GLuint)-1;
+static GLsizei wt_vw, wt_vh;
+static struct { int w, h; unsigned n; } wt_sizes[16];
+
+struct programs_seen;
+static void programs_core(struct programs_seen *seen, const char *label, uint64_t div);
+
+/* A com.redwood.wtile.<mode> notification: say what was counted since the last one, and start again. */
+static void
+wtile_report(const char *mode)
+{
+	static char prev[16] = "start";
+	static unsigned set;
+	struct wt_counts c = wt;
+	uint64_t F = c.frames + !c.frames;
+	char tops[100] = "";
+	int used = 0;
+
+	for (int k = 0; k < 3; k++) {
+		unsigned best = 0, bn = 0;
+
+		for (unsigned i = 0; i < 16; i++) {
+			if (wt_sizes[i].n > bn) {
+				bn = wt_sizes[i].n;
+				best = i;
+			}
+		}
+		if (bn == 0) {
+			break;
+		}
+		used += snprintf(tops + used, sizeof(tops) - (size_t)used, " %dx%d:%u", wt_sizes[best].w, wt_sizes[best].h, bn);
+		wt_sizes[best].n = 0;
+	}
+	if (set++ != 0) {
+		say_kept("redwood-gl: wset %s u5 %llu (%llu.%llu a second); updates %llu, intervals <18 %llu <26 %llu <35 %llu <90 %llu, pauses %llu, longest %llu ms",
+		    prev, c.u5, c.u5 / 5, c.u5 * 10 / 5 % 10, c.upd, c.b18, c.b26, c.b35, c.b90, c.pause, c.longest);
+		say_kept("redwood-gl: wset %s gl %llu frames %llu passes (%llu.%02llu) %llu offscreen; top%s; draws %llu, glFinish %llu",
+		    prev, c.frames, c.passes, c.passes / F, c.passes * 100 / F % 100, c.off, tops, c.draws, c.finish);
+		say_kept("redwood-gl: wset %s ms: frames %llu.%llu each", prev, c.frame_us / F / 1000, c.frame_us / F % 1000 / 100);
+	}
+	{
+		static struct { int pid; uint64_t ns; } wseen[256];
+		char label[48];
+
+		snprintf(label, sizeof(label), "redwood-gl: wset %s cpu ms:", prev);
+		if (set != 1) {
+			programs_core((struct programs_seen *)wseen, label, 1000000ull);
+		} else {
+			programs_core((struct programs_seen *)wseen, "redwood-gl: wset init cpu ms:", 1000000ull);
+		}
+	}
+	memset(&wt, 0, sizeof(wt));
+	memset(wt_sizes, 0, sizeof(wt_sizes));
+	wt_t0 = now_us();
+	wt_win = wt_last = 0;
+	snprintf(prev, sizeof(prev), "%s", mode);
+}
 /*
  * boot-arg glflush_from=SECONDS: from that uptime on, the callers of the next 150 glFlushes are said in the kept log, each with its
  * number since the last flush of the end-of-update caller below and the time (mach us, as "tl:" lines have it), to tell
@@ -1319,10 +1390,14 @@ struct redwood_taskinfo {               /* sys/proc_info.h's proc_taskinfo (PROC
  * one core -- as many as this program may ask about (others' may be refused: then they are missing).
  * ponytail: 256 processes remembered, by pid.
  */
+struct programs_seen {
+	int pid;
+	uint64_t ns;
+};
+
 static void
-programs_say(void)
+programs_core(struct programs_seen *seen, const char *label, uint64_t div)
 {
-	static struct { int pid; uint64_t ns; } seen[256];
 	static mach_timebase_info_data_t tb;
 	int pids[512], n, top_pid[5] = { 0 };
 	uint64_t top[5] = { 0 };
@@ -1361,14 +1436,22 @@ programs_say(void)
 			}
 		}
 	}
-	used = snprintf(line, sizeof(line), "redwood-gl: programs (%% of a core, 10 s):");
+	used = snprintf(line, sizeof(line), "%s", label);
 	for (int k = 0; k < 5 && top[k] != 0; k++) {
 		if (proc_name(top_pid[k], name, sizeof(name)) <= 0) {
 			strcpy(name, top_pid[k] == 0 ? "kernel" : "?");
 		}
-		used += snprintf(line + used, sizeof(line) - (size_t)used, " %.16s[%d] %llu", name, top_pid[k], top[k] / 100000000ull);
+		used += snprintf(line + used, sizeof(line) - (size_t)used, " %.16s[%d] %llu", name, top_pid[k], top[k] / div);
 	}
 	say_kept("%s", line);
+}
+
+static void
+programs_say(void)
+{
+	static struct programs_seen seen[256];
+
+	programs_core(seen, "redwood-gl: programs (% of a core, 10 s):", 100000000ull);
 }
 
 static void
@@ -1503,6 +1586,11 @@ frame_end(struct eagl *e, bool finished)
 	drew_display = e->drew_display;
 	e->drew_display = false;
 	e->frames++;
+	if (wtile_on) {
+		wt.frames++;
+		wt.frame_us += after - e->began;
+		wt_seg_fb = (GLuint)-1;
+	}
 	if (latency_lines) {
 		/* "tl: g FRAME began US ended US DRAWS": microseconds of mach_absolute_time (tools/latency.py) */
 		say("tl: g %u began %llu ended %llu %u\n", e->frames, e->began, after, e->draws);
@@ -1717,6 +1805,26 @@ drawing(struct eagl *e)
 	struct image *image;
 
 	frame_begin(e);
+	if (wtile_on) {
+		wt.draws++;
+		if (e->framebuffer != wt_seg_fb) {
+			struct image *colour = e->colour != 0 ? image_of(e, e->colour) : NULL;
+
+			wt_seg_fb = e->framebuffer;
+			wt.passes++;
+			if (e->framebuffer != 0 && (colour == NULL || !colour->target)) {
+				unsigned k = 0;
+
+				wt.off++;
+				while (k < 15 && wt_sizes[k].n != 0 && (wt_sizes[k].w != wt_vw || wt_sizes[k].h != wt_vh)) {
+					k++;
+				}
+				wt_sizes[k].w = wt_vw;
+				wt_sizes[k].h = wt_vh;
+				wt_sizes[k].n++;
+			}
+		}
+	}
 	if (zink_behind && zk_said_draw < 4) {
 		GLint really = -1;
 
@@ -1745,6 +1853,25 @@ drawing(struct eagl *e)
 			if (display_sized(image)) {
 				zk.display = image->surface;
 				e->drew_display = true;
+				if (wtile_on && IOSurfaceGetID(image->surface) != wt_surface) {
+					uint64_t t = now_us(), gap = wt_last != 0 ? (t - wt_last) / 1000 : 0;
+
+					wt_surface = IOSurfaceGetID(image->surface);
+					wt_last = t;
+					wt.upd++;
+					if (wt_win == 0 && t >= wt_t0 + 400000) {
+						wt_win = t;
+					}
+					wt.u5 += wt_win != 0 && t < wt_win + 5000000;
+					wt.b18 += gap != 0 && gap < 18;
+					wt.b26 += gap >= 18 && gap < 26;
+					wt.b35 += gap >= 26 && gap < 35;
+					wt.b90 += gap >= 35 && gap < 90;
+					wt.pause += gap >= 90 && gap < 2000;
+					if (gap < 2000 && gap > wt.longest) {
+						wt.longest = gap;
+					}
+				}
 			} else {
 				zk.other_width = (unsigned)image->width;
 				zk.other_height = (unsigned)image->height;
@@ -3778,6 +3905,7 @@ my_glFinish(void *context)
 	}
 	clear_now(e);
 	sw_finish_calls++;
+	wt.finish += wtile_on;
 	glFinish();
 	frame_end(e, true);
 	EAGL_LEAVE(e, 0x2d0);
@@ -4176,6 +4304,18 @@ my_glCompressedTexImage2D(void *context, GLenum target, GLint level, GLenum inte
 		say_callers("that compressed picture");
 	}
 	EAGL_LEAVE(e, 0xbe8);
+}
+
+static void
+my_glViewport(void *context, GLint x, GLint y, GLsizei width, GLsizei height)
+{
+	struct eagl *e = context;
+
+	EAGL_ENTER(e, 0xa80);
+	wt_vw = width;
+	wt_vh = height;
+	glViewport(x, y, width, height);
+	EAGL_LEAVE(e, 0xa80);
 }
 
 static void
@@ -4847,6 +4987,22 @@ install(void)
 		}
 		fetch_offered = strstr(arguments, "glfetch=0") == NULL;
 		swprof_on = strstr(arguments, "swprof=1") != NULL;
+		if (strstr(arguments, "wtile=1") != NULL) {
+			static const char *const modes[] = { "base", "stop", "stopx", "view", "end" };
+			static int tokens[5];
+			dispatch_queue_t q = dispatch_queue_create("wtile", DISPATCH_QUEUE_SERIAL);
+
+			wtile_on = 1;
+			for (int m = 0; m < 5; m++) {
+				const char *mode = modes[m];
+				char name[48];
+
+				snprintf(name, sizeof(name), "com.redwood.wtile.%s", mode);
+				notify_register_dispatch(name, &tokens[m], q, ^(__unused int t) {
+					wtile_report(mode);
+				});
+			}
+		}
 		group_vibrant_on = strstr(arguments, "glgroup=0") == NULL;
 		if ((argument = strstr(arguments, "gltrace_place=")) != NULL) {
 			char *end = (char *)argument + 14;

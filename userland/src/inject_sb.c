@@ -1482,6 +1482,366 @@ sbw_start(void)
 	});
 }
 
+/*
+ * wtile=1 (docs/widget-swipe-cost.md section 4, diagnostic): on com.redwood.wtile.<mode> the layers of every SBHWidgetContainerView are
+ * changed (base: as saved; hide: opacity 0; raster: shouldRasterize; noclip: no corner radius or clip on the CHUIS host's layers).
+ * "sbw: wtile ..." says what was done; "sbw: tile ..." (once) dumps the layers of each container.
+ */
+typedef struct { id layer; float opacity; BOOL ras, masks, hidden; double scale, radius; } wt_saved;
+static wt_saved wt_save[64];
+static int wt_nsaved;
+
+static void
+wt_find(id view, id *out, int *n, int depth)
+{
+	id subviews;
+
+	if (view == NULL || depth > 40 || *n >= 8) {
+		return;
+	}
+	if (strcmp(object_getClassName(view), "SBHWidgetContainerView") == 0) {
+		out[(*n)++] = view;
+		return;
+	}
+	subviews = SEND(id, view, "subviews");
+	for (long i = 0; subviews != NULL && i < SEND(long, subviews, "count"); i++) {
+		wt_find(SEND1(id, subviews, "objectAtIndex:", long, i), out, n, depth + 1);
+	}
+}
+
+static void
+wt_slot(id layer)
+{
+	wt_saved *s;
+
+	for (int i = 0; i < wt_nsaved; i++) {
+		if (wt_save[i].layer == layer) {
+			return;
+		}
+	}
+	if (wt_nsaved >= 64) {
+		return;
+	}
+	s = &wt_save[wt_nsaved++];
+	s->layer = (id)CFRetain((CFTypeRef)layer);
+	s->opacity = SEND(float, layer, "opacity");
+	s->ras = SEND(BOOL, layer, "shouldRasterize");
+	s->scale = SEND(double, layer, "rasterizationScale");
+	s->masks = SEND(BOOL, layer, "masksToBounds");
+	s->radius = SEND(double, layer, "cornerRadius");
+	s->hidden = SEND(BOOL, layer, "isHidden");
+}
+
+static void
+wt_dump(id layer, int depth, int *lines)
+{
+	id subs = SEND(id, layer, "sublayers"), f = SEND(id, layer, "filters"), bf = SEND(id, layer, "backgroundFilters");
+	struct { double x, y, w, h; } b = SEND(typeof(b), layer, "bounds");
+
+	if (*lines >= 60) {
+		return;
+	}
+	(*lines)++;
+	keep_line("sbw: tile L%d %.40s %gx%g r%g clip%d mask%d sh%.2f op%.2f grp%d f%ld bf%ld ras%d sub%ld", depth, object_getClassName(layer), b.w, b.h,
+	    SEND(double, layer, "cornerRadius"), (int)SEND(BOOL, layer, "masksToBounds"), SEND(id, layer, "mask") != NULL,
+	    (double)SEND(float, layer, "shadowOpacity"), (double)SEND(float, layer, "opacity"), (int)SEND(BOOL, layer, "allowsGroupOpacity"),
+	    f ? SEND(long, f, "count") : 0L, bf ? SEND(long, bf, "count") : 0L, (int)SEND(BOOL, layer, "shouldRasterize"), subs ? SEND(long, subs, "count") : 0L);
+	for (long i = 0; subs != NULL && i < SEND(long, subs, "count") && depth < 9; i++) {
+		wt_dump(SEND1(id, subs, "objectAtIndex:", long, i), depth + 1, lines);
+	}
+}
+
+static void
+wt_noclip(id layer, int depth)
+{
+	id subs = SEND(id, layer, "sublayers");
+
+	wt_slot(layer);
+	SEND1(void, layer, "setCornerRadius:", double, 0.0);
+	SEND1(void, layer, "setMasksToBounds:", BOOL, 0);
+	for (long i = 0; subs != NULL && i < SEND(long, subs, "count") && depth < 3; i++) {
+		wt_noclip(SEND1(id, subs, "objectAtIndex:", long, i), depth + 1);
+	}
+}
+
+/* census: every layer of every window, by class; and the layers about 375x100 (the offscreen that is in every home-screen frame) */
+static int wt_census_n, wt_hosts, wt_backdrops, wt_big;
+
+static void
+wt_census(id layer, int depth, id parent, id view_owner)
+{
+	id subs;
+	struct { double x, y, w, h; } b;
+	const char *name;
+
+	if (layer == NULL || depth > 60) {
+		return;
+	}
+	name = object_getClassName(layer);
+	b = SEND(typeof(b), layer, "bounds");
+	wt_census_n++;
+	wt_hosts += strstr(name, "Host") != NULL;
+	wt_backdrops += strstr(name, "Backdrop") != NULL;
+	if (b.w >= 360 && b.w <= 390 && b.h >= 90 && b.h <= 110 && wt_big < 10) {
+		id d = SEND(id, layer, "delegate"), f = SEND(id, layer, "filters"), bf = SEND(id, layer, "backgroundFilters"), p2 = parent ? SEND(id, parent, "superlayer") : NULL;
+
+		wt_big++;
+		keep_line("sbw: big %.24s %gx%g d%.30s r%g clip%d mask%d op%.2f grp%d f%ld bf%ld ras%d par %.20s/%.20s dep%d", name, b.w, b.h,
+		    d ? object_getClassName(d) : "-", SEND(double, layer, "cornerRadius"), (int)SEND(BOOL, layer, "masksToBounds"), SEND(id, layer, "mask") != NULL,
+		    (double)SEND(float, layer, "opacity"), (int)SEND(BOOL, layer, "allowsGroupOpacity"), f ? SEND(long, f, "count") : 0L,
+		    bf ? SEND(long, bf, "count") : 0L, (int)SEND(BOOL, layer, "shouldRasterize"), parent ? object_getClassName(parent) : "-",
+		    p2 ? object_getClassName(p2) : "-", depth);
+	}
+	subs = SEND(id, layer, "sublayers");
+	for (long i = 0; subs != NULL && i < SEND(long, subs, "count"); i++) {
+		wt_census(SEND1(id, subs, "objectAtIndex:", long, i), depth + 1, layer, view_owner);
+	}
+}
+
+/* CALayerHost layers: the context id is taken away (0) and given back, so the render server does not have the remote tree to draw or follow */
+static struct { id layer; unsigned ctx; } wt_hosts_saved[8];
+static int wt_nhosts;
+
+/* the status bar's legibility gradient (375x100, the only layer of that size in the census): hidden in the mode "stop" and "view" */
+static void
+wt_gradient(id layer, int depth, BOOL hide)
+{
+	id subs, d;
+
+	if (layer == NULL || depth > 60) {
+		return;
+	}
+	d = SEND(id, layer, "delegate");
+	if (d != NULL && strcmp(object_getClassName(d), "SBStatusBarLegibilityGradientView") == 0 && strcmp(object_getClassName(layer), "CAGradientLayer") == 0) {
+		wt_slot(layer);
+		SEND1(void, layer, "setHidden:", BOOL, hide);
+	}
+	subs = SEND(id, layer, "sublayers");
+	for (long i = 0; subs != NULL && i < SEND(long, subs, "count"); i++) {
+		wt_gradient(SEND1(id, subs, "objectAtIndex:", long, i), depth + 1, hide);
+	}
+}
+
+static void
+wt_hostlayers(id layer, int depth, BOOL detach)
+{
+	id subs = SEND(id, layer, "sublayers");
+
+	if (layer == NULL || depth > 12) {
+		return;
+	}
+	if (strcmp(object_getClassName(layer), "CALayerHost") == 0 && class_getInstanceMethod(object_getClass(layer), sel_registerName("setContextId:")) != NULL) {
+		int k = 0;
+
+		while (k < wt_nhosts && wt_hosts_saved[k].layer != layer) {
+			k++;
+		}
+		if (k == wt_nhosts && k < 8) {
+			wt_hosts_saved[k].layer = (id)CFRetain((CFTypeRef)layer);
+			wt_hosts_saved[k].ctx = SEND(unsigned, layer, "contextId");
+			wt_nhosts++;
+		}
+		if (k < 8) {
+			SEND1(void, layer, "setContextId:", unsigned, detach ? 0u : wt_hosts_saved[k].ctx);
+		}
+	}
+	for (long i = 0; subs != NULL && i < SEND(long, subs, "count"); i++) {
+		wt_hostlayers(SEND1(id, subs, "objectAtIndex:", long, i), depth + 1, detach);
+	}
+}
+
+/* the main thread's turns of the run loop, from waking to waiting again, since the last mode change */
+static uint64_t wt_woke, wt_turns, wt_t16, wt_t33, wt_t90, wt_long, wt_busy;
+static uint64_t wt_calls[8], wt_us[8];
+static const char *const wt_names[8] = { "settled", "pause", "pmode", "vis", "pres", "snap", "live", "x" };
+
+static void
+wt_turn(__unused CFRunLoopObserverRef observer, CFRunLoopActivity activity, __unused void *info)
+{
+	uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
+
+	if (activity == kCFRunLoopAfterWaiting) {
+		wt_woke = t;
+	} else if (wt_woke != 0) {
+		uint64_t d = (t - wt_woke) / 1000;
+
+		wt_turns++;
+		wt_t16 += d > 16;
+		wt_t33 += d > 33;
+		wt_t90 += d > 90;
+		wt_busy += d;
+		if (d > wt_long) {
+			wt_long = d;
+		}
+		wt_woke = 0;
+	}
+}
+
+#define WT_V16(n, k) \
+	static IMP wt_o##n; \
+	static void wt_w##n(id self, SEL s) { uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); ((void (*)(id, SEL))wt_o##n)(self, s); wt_calls[k]++; wt_us[k] += (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t) / 1000; }
+WT_V16(0, 0)
+WT_V16(1, 1)
+WT_V16(2, 2)
+WT_V16(5, 5)
+
+static void
+wt_wrap(const char *cls, const char *sel, const char *want, int n, IMP wrapper, IMP *orig)
+{
+	Class c = objc_getClass(cls);
+	Method m = c ? class_getInstanceMethod(c, sel_registerName(sel)) : NULL;
+	const char *enc = m ? method_getTypeEncoding(m) : NULL;
+
+	(void)n;
+	if (m == NULL || enc == NULL || strcmp(enc, want) != 0) {
+		keep_line("sbw: chuis %.40s %.40s not wrapped (%s)", cls, sel, enc ? enc : "missing");
+		return;
+	}
+	*orig = method_setImplementation(m, wrapper);
+	keep_line("sbw: chuis %.40s %.40s wrapped as %s", cls, sel, wt_names[n]);
+}
+
+int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
+int proc_name(int pid, void *buffer, uint32_t buffersize);
+
+/* SIGSTOP (or SIGCONT) chronod, and with `all` the widget extensions too; a timer continues them whatever the main thread is doing */
+static int wt_stopped[16], wt_nstopped;
+
+static void
+wt_signal(int sig, int all)
+{
+	int pids[512], n = proc_listpids(1, 0, pids, sizeof(pids)) / (int)sizeof(int), hit = 0, failed = 0;
+
+	if (sig == SIGCONT) {
+		for (int i = 0; i < wt_nstopped; i++) {
+			hit++;
+			failed += kill(wt_stopped[i], SIGCONT) != 0;
+		}
+		wt_nstopped = 0;
+	} else {
+		for (int i = 0; i < n && wt_nstopped < 16; i++) {
+			char name[40] = "";
+
+			if (pids[i] > 1 && proc_name(pids[i], name, sizeof(name)) > 0 &&
+			    (strcmp(name, "chronod") == 0 || (all && strstr(name, "Widget") != NULL))) {
+				hit++;
+				if (kill(pids[i], SIGSTOP) == 0) {
+					wt_stopped[wt_nstopped++] = pids[i];
+				} else {
+					failed++;
+				}
+			}
+		}
+	}
+	keep_line("sbw: wtile %s %d processes, %d failed", sig == SIGCONT ? "SIGCONT" : "SIGSTOP", hit, failed);
+}
+
+static void
+wtile_apply(const char *mode)
+{
+	static int dumped;
+	static char prev[16] = "start";
+	Class window = objc_getClass("UIWindow");
+	SEL all = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
+	id windows = window && class_getClassMethod(window, all) ? ((id (*)(Class, SEL, BOOL, BOOL))objc_msgSend)(window, all, 1, 1) : NULL;
+	id found[8];
+	int n = 0;
+	char calls[160];
+	int used = 0;
+
+	if (strcmp(mode, "end") == 0) {
+		mode = "base";
+	}
+	/* what the main thread and the CHUIS methods did since the last change */
+	for (int k = 0; k < 7; k++) {
+		if (wt_calls[k] != 0) {
+			used += snprintf(calls + used, sizeof(calls) - (size_t)used, " %s %llu (%llu us)", wt_names[k], wt_calls[k], wt_us[k]);
+		}
+	}
+	calls[used] = 0;
+	keep_line("sbw: wset %s main loop: %llu turns, >16 %llu >33 %llu >90 %llu, longest %llu ms, busy %llu ms", prev, wt_turns, wt_t16, wt_t33, wt_t90, wt_long, wt_busy / 1000);
+	keep_line("sbw: wset %s chuis:%s", prev, used ? calls : " none");
+	wt_turns = wt_t16 = wt_t33 = wt_t90 = wt_long = wt_busy = 0;
+	memset(wt_calls, 0, sizeof(wt_calls));
+	memset(wt_us, 0, sizeof(wt_us));
+	snprintf(prev, sizeof(prev), "%s", mode);
+	for (long i = 0; windows != NULL && i < SEND(long, windows, "count"); i++) {
+		wt_find(SEND1(id, windows, "objectAtIndex:", long, i), found, &n, 0);
+	}
+	if (!dumped && n != 0) {
+		for (int i = 0; i < n; i++) {
+			int lines = 0;
+
+			wt_dump(SEND(id, found[i], "layer"), 0, &lines);
+		}
+		for (long i = 0; windows != NULL && i < SEND(long, windows, "count"); i++) {
+			wt_census(SEND(id, SEND1(id, windows, "objectAtIndex:", long, i), "layer"), 0, NULL, NULL);
+		}
+		keep_line("sbw: census %d layers, %d host, %d backdrop, %d about 375x100, %ld windows", wt_census_n, wt_hosts, wt_backdrops, wt_big,
+		    windows ? SEND(long, windows, "count") : 0L);
+		dumped = 1;
+	}
+	for (int i = 0; i < n; i++) {
+		wt_slot(SEND(id, found[i], "layer"));
+	}
+	wt_signal(SIGCONT, 0);
+	for (int i = 0; i < wt_nhosts; i++) {
+		SEND1(void, wt_hosts_saved[i].layer, "setContextId:", unsigned, wt_hosts_saved[i].ctx);
+	}
+	/* back to the saved values first; then the mode */
+	for (int i = 0; i < wt_nsaved; i++) {
+		wt_saved *s = &wt_save[i];
+
+		SEND1(void, s->layer, "setOpacity:", float, s->opacity);
+		SEND1(void, s->layer, "setShouldRasterize:", BOOL, s->ras);
+		SEND1(void, s->layer, "setCornerRadius:", double, s->radius);
+		SEND1(void, s->layer, "setMasksToBounds:", BOOL, s->masks);
+		SEND1(void, s->layer, "setHidden:", BOOL, s->hidden);
+	}
+	for (int i = 0; i < n; i++) {
+		id layer = SEND(id, found[i], "layer");
+
+		SEND1(void, found[i], "setHidden:", BOOL, 0);
+		(void)layer;
+	}
+	if (strcmp(mode, "stop") == 0 || strcmp(mode, "view") == 0) {
+		for (long i = 0; windows != NULL && i < SEND(long, windows, "count"); i++) {
+			wt_gradient(SEND(id, SEND1(id, windows, "objectAtIndex:", long, i), "layer"), 0, 1);
+		}
+	}
+	if (0) {
+		wt_signal(SIGSTOP, 1);
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 7500 * NSEC_PER_MSEC), dispatch_get_global_queue(0, 0), ^{
+			wt_signal(SIGCONT, 0);
+		});
+	}
+	keep_line("sbw: wtile %s on %d containers at %llu ms (saved %d, hosts %d)", mode, n, sbw_up(), wt_nsaved, wt_nhosts);
+}
+
+static void
+wtile_start(void)
+{
+	static const char *const modes[] = { "base", "stop", "stopx", "view", "end" };
+	static int tokens[5];
+
+	for (int m = 0; m < 5; m++) {
+		const char *mode = modes[m];
+		char name[48];
+
+		snprintf(name, sizeof(name), "com.redwood.wtile.%s", mode);
+		notify_register_dispatch(name, &tokens[m], dispatch_get_main_queue(), ^(__unused int t) {
+			wtile_apply(mode);
+		});
+	}
+	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopAfterWaiting, true, LONG_MIN, wt_turn, NULL), kCFRunLoopCommonModes);
+	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopBeforeWaiting, true, LONG_MAX, wt_turn, NULL), kCFRunLoopCommonModes);
+	wt_wrap("SBHWidgetStackViewController", "_updateVisiblySettledForWidgetViewControllers", "v16@0:8", 0, (IMP)wt_w0, &wt_o0);
+	wt_wrap("SBHWidgetStackViewController", "_updatePauseReasonForWidgetViewControllers", "v16@0:8", 1, (IMP)wt_w1, &wt_o1);
+	wt_wrap("SBHWidgetStackViewController", "_updatePresentationModeForWidgetViewControllers", "v16@0:8", 2, (IMP)wt_w2, &wt_o2);
+	wt_wrap("CHUISWidgetHostViewController", "_createWidgetSnapshotViews", "v16@0:8", 5, (IMP)wt_w5, &wt_o5);
+	keep_line("sbw: wtile ready at %llu ms", sbw_up());
+}
+
 static void
 put_wallpaper(int attempt)
 {
@@ -2655,6 +3015,10 @@ redwood_springboard_init(void)
 		wsize = sizeof(wargs) - 1;
 		if (sysctlbyname("kern.bootargs", wargs, &wsize, NULL, 0) == 0 && strstr(wargs, "wchk=1") != NULL) {
 			sbw_start();
+		}
+		wsize = sizeof(wargs) - 1;
+		if (sysctlbyname("kern.bootargs", wargs, &wsize, NULL, 0) == 0 && strstr(wargs, "wtile=1") != NULL) {
+			wtile_start();
 		}
 	}
 	notify_register_dispatch("com.redwood.unlock", &token, dispatch_get_main_queue(), ^(__unused int t) {
