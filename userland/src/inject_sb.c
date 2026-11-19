@@ -1114,7 +1114,9 @@ keep_line(const char *format, ...)
  * wchk=1 (docs/widgets-spec.md section 6, silent diagnostic): on com.redwood.widgets, the views whose class says Widget, CHUIS,
  * Avocado, LiveIcon or Calendar ("sbw: <tag> view ..."), and the Calendar icon's provider delegates (when each says "changed").
  */
-static int sbw_n, sbw_lines;
+static int sbw_n, sbw_lines, sbw_ilayers;
+static uint64_t sbw_up(void);
+static void sbw_icon_layers(id layer, int depth);
 static IMP sbw_orig_changed;
 
 static void
@@ -1135,6 +1137,15 @@ sbw_walk(id view, int depth)
 		sbw_lines++;
 		keep_line("sbw: w%d view %.60s %gx%g hidden %d alpha %.2f contents %d sublayers %ld", sbw_n, name, b.w, b.h, (int)SEND(BOOL, view, "isHidden"),
 		    SEND(double, view, "alpha"), layer && SEND(id, layer, "contents") != NULL, subs ? SEND(long, subs, "count") : 0L);
+	}
+	if (strcmp(name, "SBIconView") == 0 && class_getInstanceMethod(object_getClass(view), sel_registerName("icon")) != NULL) {
+		id icon = SEND(id, view, "icon"), leaf = icon && class_getInstanceMethod(object_getClass(icon), sel_registerName("leafIdentifier")) ? SEND(id, icon, "leafIdentifier") : NULL;
+
+		if (leaf != NULL && CFStringCompare((CFStringRef)leaf, CFSTR("com.apple.mobilecal"), 0) == kCFCompareEqualTo) {
+			sbw_ilayers = 0;
+			keep_line("sbw: w%d Calendar SBIconView found at %llu ms", sbw_n, sbw_up());
+			sbw_icon_layers(SEND(id, view, "layer"), 0);
+		}
 	}
 	subviews = SEND(id, view, "subviews");
 	for (long i = 0; subviews != NULL && i < SEND(long, subviews, "count"); i++) {
@@ -1170,6 +1181,178 @@ sbw_changed(id me, SEL sel, id provider)
 	}
 }
 
+/*
+ * wchk=1, Calendar icon (docs/widgets-spec.md section 7): what SBCalendarIconImageProvider gives the icon, and when. The date comes from
+ * -[SBCalendarIconImageProvider iconImageWithInfo:] (ISIcon initWithDate:calendar:format:, prepareImageForDescriptor:); it is asked again only
+ * by reloadIconImage (significant time change, locale change, bold text change, override date). "sbw: calendar image" says how many dark
+ * (the date's digits) and red (the day name) pixels the image has in a 48x48 copy on white: 0 dark = no date drawn in the image itself.
+ */
+static IMP sbw_orig_image, sbw_orig_reload;
+static int sbw_images;
+
+static uint64_t
+sbw_up(void)
+{
+	return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000;
+}
+
+static void
+sbw_inspect_cg(const char *tag, void *cg)
+{
+	typedef struct { double x, y, w, h; } rect_t;
+	void *(*space)(void) = dlsym(RTLD_DEFAULT, "CGColorSpaceCreateDeviceRGB");
+	void *(*create)(void *, size_t, size_t, size_t, size_t, void *, uint32_t) = dlsym(RTLD_DEFAULT, "CGBitmapContextCreate");
+	void (*fill)(void *, double, double, double, double) = dlsym(RTLD_DEFAULT, "CGContextSetRGBFillColor");
+	void (*rect)(void *, rect_t) = dlsym(RTLD_DEFAULT, "CGContextFillRect");
+	void (*draw)(void *, rect_t, void *) = dlsym(RTLD_DEFAULT, "CGContextDrawImage");
+	size_t (*width)(void *) = dlsym(RTLD_DEFAULT, "CGImageGetWidth"), (*height)(void *) = dlsym(RTLD_DEFAULT, "CGImageGetHeight");
+	void (*release)(void *) = dlsym(RTLD_DEFAULT, "CGContextRelease");
+	enum { N = 48 };
+	static uint8_t pixels[N * N * 4];
+	void *cs, *ctx;
+	int dark = 0, red = 0, white = 0;
+
+	if (cg == NULL || space == NULL || create == NULL || fill == NULL || rect == NULL || draw == NULL || width == NULL || height == NULL || release == NULL) {
+		keep_line("sbw: calendar image %s at %llu ms: %s", tag, sbw_up(), cg == NULL ? "no CGImage" : "no CG symbols");
+		return;
+	}
+	memset(pixels, 0, sizeof(pixels));
+	cs = space();
+	ctx = create(pixels, N, N, 8, N * 4, cs, 1 /* kCGImageAlphaPremultipliedLast */);
+	fill(ctx, 1, 1, 1, 1);
+	rect(ctx, (rect_t){ 0, 0, N, N });
+	draw(ctx, (rect_t){ 0, 0, N, N }, cg);
+	for (int i = 0; i < N * N; i++) {
+		int r = pixels[i * 4], g = pixels[i * 4 + 1], b = pixels[i * 4 + 2];
+
+		dark += r < 90 && g < 90 && b < 90;
+		red += r > 170 && g < 100 && b < 100;
+		white += r > 235 && g > 235 && b > 235;
+	}
+	release(ctx);
+	keep_line("sbw: calendar image %s at %llu ms: %zux%zu dark %d red %d white %d of %d", tag, sbw_up(), width(cg), height(cg), dark, red, white, N * N);
+}
+
+static void
+sbw_inspect(const char *tag, id image)
+{
+	sbw_inspect_cg(tag, image ? SEND(void *, image, "CGImage") : NULL);
+}
+
+/* the Calendar icon's view as it is: every layer under it that has contents, inspected (what is on the screen, not what the provider gave) */
+static void
+sbw_icon_layers(id layer, int depth)
+{
+	id subs, contents;
+
+	if (layer == NULL || depth > 8 || sbw_ilayers >= 8) {
+		return;
+	}
+	contents = SEND(id, layer, "contents");
+	CFTypeID (*image_type)(void) = dlsym(RTLD_DEFAULT, "CGImageGetTypeID");
+
+	if (contents != NULL && image_type != NULL && CFGetTypeID((CFTypeRef)contents) == image_type()) {
+		struct { double x, y, w, h; } b = SEND(typeof(b), layer, "bounds");
+		char tag[100];
+
+		snprintf(tag, sizeof(tag), "icon layer d%d %.30s %gx%g cs %.1f", depth, object_getClassName(layer), b.w, b.h, SEND(double, layer, "contentsScale"));
+		sbw_ilayers++;
+		sbw_inspect_cg(tag, (void *)contents);
+	}
+	subs = SEND(id, layer, "sublayers");
+	for (long i = 0; subs != NULL && i < SEND(long, subs, "count"); i++) {
+		sbw_icon_layers(SEND1(id, subs, "objectAtIndex:", long, i), depth + 1);
+	}
+}
+
+static int sbw_on, cal_fix = 1;     /* wchk=1: the sbw: lines; calfix=0: leave the icon's scale alone */
+
+/*
+ * The Calendar icon on the first frame (docs: HANDOFF-2026-11-17-night.md, "Calendar icon and widget CPU"): SpringBoardHome asks for the home
+ * icon image as 56x56@3 (its scale comes from MobileGestalt's iPhone X, 3) while UIScreen and the icon's layer are at scale 1, so the layer
+ * shows a 168x168 image in 56x56 pixels and the compositor shrinks it 3:1: the date's thin strokes are lost until some later composite.
+ * The date is IN the image (wc1..wc3: dark 115 pixels, red 34, at 103 s, before the first frame). So the request is answered at the screen's
+ * scale (a 56x56 image, shown 1:1). Other icons are artwork, which survives the shrinking.
+ */
+static id
+sbw_image(id me, SEL sel, double a, double b, double c, double d)
+{
+	Class screen = objc_getClass("UIScreen");
+	id main = screen ? SEND(id, (id)screen, "mainScreen") : NULL;
+	double have = main ? SEND(double, main, "scale") : 0.0, asked = c;
+	id image;
+
+	if (cal_fix && have >= 1.0 && c != have) {
+		c = have;
+	}
+	image = ((id (*)(id, SEL, double, double, double, double))sbw_orig_image)(me, sel, a, b, c, d);
+	if (sbw_on && sbw_images++ < 12) {
+		char tag[80];
+
+		snprintf(tag, sizeof(tag), "#%d %gx%g@%g (asked %g) r%g screen@%g", sbw_images, a, b, c, asked, d, have);
+		sbw_inspect(tag, image);
+	}
+	return image;
+}
+
+static void
+sbw_reload(id me, SEL sel)
+{
+	static int said;
+
+	if (said++ < 12) {
+		keep_line("sbw: provider reloadIconImage at %llu ms (%d)", sbw_up(), said);
+	}
+	((void (*)(id, SEL))sbw_orig_reload)(me, sel);
+}
+
+static void
+cal_fix_start(void)
+{
+	Class pc = objc_getClass("SBCalendarIconImageProvider");
+	Method mi = pc ? class_getInstanceMethod(pc, sel_registerName("iconImageWithInfo:")) : NULL;
+
+	if (mi != NULL && sbw_orig_image == NULL) {
+		sbw_orig_image = method_setImplementation(mi, (IMP)sbw_image);
+	}
+}
+
+/* w-notification probe: a provider of its own (no delegate, so no icon is told) is asked for the image now, off the main thread */
+static void
+sbw_probe(void)
+{
+	Class cls = objc_getClass("SBCalendarIconImageProvider");
+
+	if (cls == NULL || sbw_orig_image == NULL) {
+		keep_line("sbw: probe: no provider class or hook");
+		return;
+	}
+	dispatch_async(dispatch_get_global_queue(0, 0), ^{
+		id provider = SEND(id, SEND(id, (id)cls, "alloc"), "init");
+		id image = provider ? ((id (*)(id, SEL, double, double, double, double))sbw_orig_image)(provider, sel_registerName("iconImageWithInfo:"), 60, 60, 2, 13) : NULL;
+
+		sbw_inspect("probe 60x60@2", image);
+	});
+}
+
+/* the one swap for the picture: a 3x3 red window of its own, in a corner (touches no icon, no list, no image) */
+static void
+sbw_poke(void)
+{
+	typedef struct { double x, y, w, h; } frame_t;
+	Class window = objc_getClass("UIWindow"), color = objc_getClass("UIColor");
+	id w;
+
+	if (window == NULL || color == NULL) {
+		return;
+	}
+	w = ((id (*)(id, SEL, frame_t))objc_msgSend)(SEND(id, (id)window, "alloc"), sel_registerName("initWithFrame:"), (frame_t){ 0, 0, 3, 3 });
+	SEND1(void, w, "setBackgroundColor:", id, SEND(id, (id)color, "redColor"));
+	SEND1(void, w, "setWindowLevel:", double, 10000.0);
+	SEND1(void, w, "setHidden:", BOOL, NO);
+	keep_line("sbw: poke window at %llu ms", sbw_up());
+}
+
 static void
 sbw_start(void)
 {
@@ -1194,9 +1377,27 @@ sbw_start(void)
 		}
 	}
 	free(list);
-	keep_line("sbw: start at %llu ms (protocol %d)", now_us() / 1000, proto != NULL);
+	{
+		Class pc = objc_getClass("SBCalendarIconImageProvider");
+		Method mi = pc ? class_getInstanceMethod(pc, sel_registerName("iconImageWithInfo:")) : NULL;
+		Method mr = pc ? class_getInstanceMethod(pc, sel_registerName("reloadIconImage")) : NULL;
+		id name = pc ? ((id (*)(Class, SEL))objc_msgSend)(pc, sel_registerName("significantTimeChangeNotificationName")) : NULL;
+
+		keep_line("sbw: provider class %d image %d reload %d, time-change name %.60s", pc != NULL, mi != NULL, mr != NULL,
+		    name ? (const char *)SEND(const char *, name, "UTF8String") : "(nil)");
+		sbw_on = 1;
+		cal_fix_start();
+		if (mr != NULL) {
+			sbw_orig_reload = method_setImplementation(mr, (IMP)sbw_reload);
+		}
+	}
+	keep_line("sbw: start at %llu ms (protocol %d)", sbw_up(), proto != NULL);
+	notify_register_dispatch("com.redwood.wpoke", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		sbw_poke();
+	});
 	notify_register_dispatch("com.redwood.widgets", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		sbw_views();
+		sbw_probe();
 	});
 }
 
@@ -2360,6 +2561,13 @@ redwood_springboard_init(void)
 		char wargs[1024] = "";
 		size_t wsize = sizeof(wargs) - 1;
 
+		if (sysctlbyname("kern.bootargs", wargs, &wsize, NULL, 0) == 0 && strstr(wargs, "calfix=0") != NULL) {
+			cal_fix = 0;
+		}
+		if (cal_fix) {
+			cal_fix_start();
+		}
+		wsize = sizeof(wargs) - 1;
 		if (sysctlbyname("kern.bootargs", wargs, &wsize, NULL, 0) == 0 && strstr(wargs, "wchk=1") != NULL) {
 			sbw_start();
 		}

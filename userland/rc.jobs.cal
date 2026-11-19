@@ -1,0 +1,4 @@
+# Calendar icon + widget CPU diagnostic (HANDOFF-2026-11-17-night.md, "Calendar icon and widget CPU"). wchk=1 FIRST in the boot-args. Silent: no sound, no camera, no touch. rwtouch ~22 s: w1 ~117 s, poke (a 3x3 window, one swap) ~140 s, shot by fbshot_at=140, w2 ~162 s. CPU sampler of the Calendar widget (set proc_sample=1).
+/redwood/bin/rwtouch ifarg wchk=1 say wstart wait 95 notify com.redwood.widgets say w1
+/redwood/bin/tolog /redwood/bin/psgrep -sample 3 20 CalendarWidgetExtension &
+/redwood/bin/rwtouch ifarg wchk=1 wait 23 notify com.redwood.wpoke say wpoke wait 22 notify com.redwood.widgets say w2 wait 3 say end
