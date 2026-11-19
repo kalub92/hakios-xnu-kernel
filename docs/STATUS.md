@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-19 02:29 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-19 02:56 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -32,6 +32,7 @@ Last updated: 2026-11-19 02:29 PST. Kept current as work lands; details are in t
 - Boot image has about 1.4 MB free (Android ramdisk repacked lz4 to gzip)
 - Video recording (`venc=4`): Camera's Video mode records a 1080p H.264 movie to the camera roll at a full 10 frames per second (about 2.1 CPU cores in mediaserverd, no dropped frames) with our own software encoder (minih264e, public domain) registered inside mediaserverd. With `mtkmic=2` the movie carries real microphone sound (a speaker tone is over 100 times louder in the track than the quiet seconds). Playback in Photos, a listen by ear and heat are not tested
 - More memory (`r1_mem=1`, off by default; `ram-holes-spec.md`): iOS gets 2793 MB instead of 2016 MB. Unattended: boots to the home screen, a test that writes and checks up to 1.8 GB of the free pages finds no bad page, Wi-Fi scan, Bluetooth, camera preview and the modem's SIM check (radio off) work, Android intact afterwards, and the default image is unchanged. The side-button exit and the modem service's ten gates (radio off) also pass with it on. Not yet tested with it on: recovery of the log after a hang (needs a person present), camera capture and audio
+- Home-screen widgets: Weather and Calendar are drawn again. The widget service (chronod) is back, and only those two widget extensions may start (`lsd_widgets=0` lifts that, `WIDGETS=0` at build time removes the service); total CPU after the home screen settles is 33 to 45% of one core against about 390% with all 26 extensions; boot unchanged at about 111 s. The widget gallery offers only these two. The Calendar extension still uses 7 to 20% of a core minutes after boot (not explained)
 - Cellular stage 4c/4d on a simulated bearer (radio off): `celld` publishes the service, `pdp_ip0` becomes the primary interface, DNS and traffic go out on it, the data budget cuts traffic off (about 5 KB overshoot)
 
 ## In progress
@@ -52,7 +53,8 @@ Last updated: 2026-11-19 02:29 PST. Kept current as work lands; details are in t
 - After a home swipe the system renders 2 to 3 frames per camera picture (wasted work, not a visible fault); Open Mapple's presentation method would not fix it
 - Side-button exit and radio-on shutdown of the modem service not yet exercised
 
-- Home-screen widgets (Weather, Calendar) are blank white tiles: the widget service (chronod) was taken out of the build earlier because about 26 widget extensions starting together kept the CPU busy for minutes. Fix designed in `widgets-spec.md` (bring it back and let only the two shown widgets start); being built
+
+- The Calendar app icon shows no date until the screen is first touched (its refresh is never triggered)
 
 ## Not yet done
 

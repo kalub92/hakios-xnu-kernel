@@ -2029,8 +2029,10 @@ container_manager_fixes(void)
  */
 #define LSD_UPCALL_DEFAULT 1
 #define LSD_HIDE_DEFAULT 1
+#define LSD_WIDGETS_DEFAULT 1   /* lsd_widgets=1 (docs/widgets-spec.md F2): only the home screen's widget extensions are registered; 0 turns it off */
 
-static int lsdiag, lsd_upcall = LSD_UPCALL_DEFAULT, lsd_hide = LSD_HIDE_DEFAULT;
+static int lsdiag, lsd_upcall = LSD_UPCALL_DEFAULT, lsd_hide = LSD_HIDE_DEFAULT, lsd_widgets = LSD_WIDGETS_DEFAULT;
+static unsigned lsd_widgets_hidden;
 static char lsd_store[400];                     /* the store file's path, from the first databaseStoreFileURLWithUID: */
 
 /*
@@ -2038,6 +2040,18 @@ static char lsd_store[400];                     /* the store file's path, from t
  * does not have (CarPlay, contactless, Sidecar). Nothing a person opens from the home screen, nothing another
  * shipped app or daemon here uses (the list was checked against the image's app list, see the handoff).
  */
+/* the widgetkit appexes of the image other than Weather and Calendar (the two on the home screen), see docs/widgets-spec.md section 5 */
+static const char *const lsd_widget_hidden[] = {
+	"AppStoreWidgetsExtension.appex", "BatteriesWidgetExtension.appex", "GCWidgets.appex", "PhotosReliveWidget.appex",
+	"LockScreenPeopleWidget_iOSExtension.appex", "PeopleWidget_iOSExtension.appex", "ScreenTimeWidgetExtension.appex",
+	"SleepWidgetExtension.appex", "TVWidgetExtension.appex", "BooksWidgetExtension.appex", "FindMyWidgetItems.appex",
+	"FindMyWidgetPeople.appex", "FitnessWidget.appex", "HealthMedicationsWidgetExtension.appex", "HomeWidget.appex",
+	"GeneralMapsWidget.appex", "MailWidgetExtension.appex", "com.apple.mobilenotes.WidgetExtension.appex",
+	"WorldClockWidget.appex", "MusicWidgets.appex", "NewsTag.appex", "NewsToday2.appex", "PassbookWidgetsExtension-iPhone.appex",
+	"PodcastsWidget.appex", "RemindersWidgetExtension.appex", "StocksWidget.appex", "TipsWidget.appex",
+};
+#define LSD_WIDGET_N (sizeof(lsd_widget_hidden) / sizeof(lsd_widget_hidden[0]))
+
 static const char *const lsd_hidden[] = {
 	"DiagnosticsService.app", "Diagnostics.app", "DiagnosticsReporter.app", "Coverage Details.app", "Xcode Previews.app",
 	"Feedback Assistant iOS.app", "FieldTest.app", "FTMInternal-4.app", "DemoApp.app", "StoreDemoViewService.app",
@@ -2339,6 +2353,7 @@ lsd_set_complete(id self, SEL command, uintptr_t complete)
 
 	lsd_keep("lsd: setSeedingComplete: %d at %.2f s", (int)(complete & 1), lsd_up());
 	lsd_costs();
+	lsd_keep("lsd: widgets: %u hidden", lsd_widgets_hidden);
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ lsd_files("5 s after"); });
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ lsd_files("30 s after"); });
 	return result;
@@ -2395,12 +2410,25 @@ lsd_enumerate(id self, SEL command, id url, uintptr_t symlinks, BOOL (^block)(id
 	id path = url ? ((id (*)(id, SEL))objc_msgSend)(url, sel_registerName("path")) : NULL;
 	const char *text = path ? ((const char *(*)(id, SEL))objc_msgSend)(path, sel_registerName("UTF8String")) : "";
 	bool apps = strcmp(text, "/Applications") == 0 || strcmp(text, "/Applications/") == 0;
+	size_t tl = strlen(text);
+	bool plugins = lsd_widgets && tl > 12 && strcmp(text + tl - 12, ".app/PlugIns") == 0;
 	__block unsigned seen = 0, hidden = 0;
 	BOOL (^filter)(id, unsigned char) = ^BOOL(id item, unsigned char flag) {
 		id name = item ? ((id (*)(id, SEL))objc_msgSend)(item, sel_registerName("lastPathComponent")) : NULL;
 		const char *leaf = name ? ((const char *(*)(id, SEL))objc_msgSend)(name, sel_registerName("UTF8String")) : "";
 
 		seen++;
+		if (plugins) {
+			for (unsigned k = 0; k < LSD_WIDGET_N; k++) {
+				if (strcmp(leaf, lsd_widget_hidden[k]) == 0) {
+					if (++lsd_widgets_hidden == LSD_WIDGET_N) {
+						lsd_keep("lsd: widgets: %u of %u widget extensions hidden", lsd_widgets_hidden, (unsigned)LSD_WIDGET_N);
+					}
+					return YES;
+				}
+			}
+			return block(item, flag);
+		}
 		for (unsigned k = 0; k < sizeof(lsd_hidden) / sizeof(lsd_hidden[0]); k++) {
 			if (strcmp(leaf, lsd_hidden[k]) == 0) {
 				hidden++;
@@ -2414,6 +2442,12 @@ lsd_enumerate(id self, SEL command, id url, uintptr_t symlinks, BOOL (^block)(id
 	if (lsdiag && dirs_said < 8) {
 		dirs_said++;
 		lsd_keep("lsd: enumerate: %.120s%s", text, apps && lsd_hide ? " (filtered)" : "");
+	}
+	if (plugins) {
+		filter = Block_copy(filter);
+		result = ((uintptr_t (*)(id, SEL, id, uintptr_t, id))lsd_orig_enum)(self, command, url, symlinks, (id)filter);
+		Block_release(filter);
+		return result;
 	}
 	if (!apps || !lsd_hide) {
 		return ((uintptr_t (*)(id, SEL, id, uintptr_t, id))lsd_orig_enum)(self, command, url, symlinks, (id)block);
@@ -2467,7 +2501,7 @@ lsd_install(void)
 	LSD_TRY(lsdiag, lsd_hook("LSDatabaseBuilder", false, "setSeedingComplete:", 1, (IMP)lsd_set_complete, &lsd_orig_complete));
 	LSD_TRY(lsdiag || lsd_upcall, lsd_hook("ICLWorkspace", false, "triggerRegistrationForContainerizedContentWithOptions:completion:", 2,
 	    (IMP)lsd_upcall_hook, &lsd_orig_upcall));
-	LSD_TRY(lsd_hide || lsdiag, lsd_hook("MIFileManager", false, "enumerateURLsForItemsInDirectoryAtURL:ignoreSymlinks:withBlock:", 3,
+	LSD_TRY(lsd_hide || lsd_widgets || lsdiag, lsd_hook("MIFileManager", false, "enumerateURLsForItemsInDirectoryAtURL:ignoreSymlinks:withBlock:", 3,
 	    (IMP)lsd_enumerate, &lsd_orig_enum));
 	LSD_TRY(lsdiag, lsd_hook("MILaunchServicesDatabaseGatherer", true, "entryForBundle:inContainer:withError:", 3, (IMP)lsd_timed0, &lsd_orig[0]));
 	LSD_TRY(lsdiag, lsd_hook("MIExecutableBundle", false,
@@ -2503,8 +2537,11 @@ lsd_hooks(void)
 		if ((at = strstr(arguments, "lsd_hide=")) != NULL) {
 			lsd_hide = at[9] != '0';
 		}
+		if ((at = strstr(arguments, "lsd_widgets=")) != NULL) {
+			lsd_widgets = at[12] != '0';
+		}
 	}
-	if (!lsdiag && !lsd_upcall && !lsd_hide) {
+	if (!lsdiag && !lsd_upcall && !lsd_hide && !lsd_widgets) {
 		return;
 	}
 	lsd_install();
@@ -2516,7 +2553,7 @@ lsd_hooks(void)
 			pthread_detach(thread);
 		}
 	}
-	lsd_keep("lsd: start pid %d at %.2f s, diag %d upcall %d hide %d, hooks %#x", getpid(), lsd_up(), lsdiag, lsd_upcall, lsd_hide, lsd_hooked);
+	lsd_keep("lsd: start pid %d at %.2f s, diag %d upcall %d hide %d widgets %d, hooks %#x", getpid(), lsd_up(), lsdiag, lsd_upcall, lsd_hide, lsd_widgets, lsd_hooked);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

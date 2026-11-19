@@ -1110,6 +1110,96 @@ keep_line(const char *format, ...)
 	sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
 }
 
+/*
+ * wchk=1 (docs/widgets-spec.md section 6, silent diagnostic): on com.redwood.widgets, the views whose class says Widget, CHUIS,
+ * Avocado, LiveIcon or Calendar ("sbw: <tag> view ..."), and the Calendar icon's provider delegates (when each says "changed").
+ */
+static int sbw_n, sbw_lines;
+static IMP sbw_orig_changed;
+
+static void
+sbw_walk(id view, int depth)
+{
+	const char *name;
+	id subviews;
+
+	if (view == NULL || depth > 40) {
+		return;
+	}
+	name = object_getClassName(view);
+	if (sbw_lines < 16 && (strstr(name, "Widget") || strstr(name, "CHUIS") || strstr(name, "Avocado") || strstr(name, "LiveIcon") ||
+	    strstr(name, "Calendar"))) {
+		struct { double x, y, w, h; } b = SEND(typeof(b), view, "bounds");
+		id layer = SEND(id, view, "layer"), subs = layer ? SEND(id, layer, "sublayers") : NULL;
+
+		sbw_lines++;
+		keep_line("sbw: w%d view %.60s %gx%g hidden %d alpha %.2f contents %d sublayers %ld", sbw_n, name, b.w, b.h, (int)SEND(BOOL, view, "isHidden"),
+		    SEND(double, view, "alpha"), layer && SEND(id, layer, "contents") != NULL, subs ? SEND(long, subs, "count") : 0L);
+	}
+	subviews = SEND(id, view, "subviews");
+	for (long i = 0; subviews != NULL && i < SEND(long, subviews, "count"); i++) {
+		sbw_walk(SEND1(id, subviews, "objectAtIndex:", long, i), depth + 1);
+	}
+}
+
+static void
+sbw_views(void)
+{
+	Class window = objc_getClass("UIWindow");
+	SEL all = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
+	id windows = window && class_getClassMethod(window, all) ? ((id (*)(Class, SEL, BOOL, BOOL))objc_msgSend)(window, all, 1, 1) : NULL;
+
+	sbw_n++;
+	sbw_lines = 0;
+	for (long i = 0; windows != NULL && i < SEND(long, windows, "count"); i++) {
+		sbw_walk(SEND1(id, windows, "objectAtIndex:", long, i), 0);
+	}
+	keep_line("sbw: w%d done, %ld windows, %d lines at %llu ms", sbw_n, windows ? SEND(long, windows, "count") : 0L, sbw_lines, now_us() / 1000);
+}
+
+static void
+sbw_changed(id me, SEL sel, id provider)
+{
+	static int said;
+
+	if (said++ < 8) {
+		keep_line("sbw: calendar icon changed at %llu ms (%d)", now_us() / 1000, said);
+	}
+	if (sbw_orig_changed != NULL) {
+		((void (*)(id, SEL, id))sbw_orig_changed)(me, sel, provider);
+	}
+}
+
+static void
+sbw_start(void)
+{
+	static int token;
+	SEL changed = sel_registerName("calendarIconImageProviderHasChanged:");
+	Protocol *proto = objc_getProtocol("SBCalendarIconImageProviderDelegate");
+	unsigned count = 0;
+	Class *list = objc_copyClassList(&count);
+
+	for (unsigned i = 0; list != NULL && i < count; i++) {
+		Method m;
+
+		if (proto != NULL ? !class_conformsToProtocol(list[i], proto) : strncmp(class_getName(list[i]), "SB", 2) != 0) {
+			continue;
+		}
+		if ((m = class_getInstanceMethod(list[i], changed)) == NULL) {
+			continue;
+		}
+		keep_line("sbw: calendar delegate %.80s", class_getName(list[i]));
+		if (sbw_orig_changed == NULL) {
+			sbw_orig_changed = method_setImplementation(m, (IMP)sbw_changed);
+		}
+	}
+	free(list);
+	keep_line("sbw: start at %llu ms (protocol %d)", now_us() / 1000, proto != NULL);
+	notify_register_dispatch("com.redwood.widgets", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		sbw_views();
+	});
+}
+
 static void
 put_wallpaper(int attempt)
 {
@@ -2266,6 +2356,14 @@ redwood_springboard_init(void)
 		    sysctl_int("kern.redwood.battery_charger_present"), sysctl_int("kern.redwood.battery_charging"));
 		battery_post_notifications();
 	});
+	{
+		char wargs[1024] = "";
+		size_t wsize = sizeof(wargs) - 1;
+
+		if (sysctlbyname("kern.bootargs", wargs, &wsize, NULL, 0) == 0 && strstr(wargs, "wchk=1") != NULL) {
+			sbw_start();
+		}
+	}
 	notify_register_dispatch("com.redwood.unlock", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		unlock();
 	});

@@ -1,0 +1,9 @@
+# Widgets diagnostic (docs/widgets-spec.md section 6), wchk=1 FIRST in the boot-args. Silent: no touch, no sound. Picture by fbshot_at (the display reports only while it swaps: use 140).
+# rwtouch starts ~22 s here: w1 ~117 s, CPU 137-157 s, w3 ~158 s, CPU 185-205 s.
+/redwood/bin/rwtouch ifarg wchk=1 say wstart wait 95 notify com.redwood.widgets say w1
+/redwood/bin/tolog /redwood/bin/psgrep chronod Widget pkd
+/redwood/bin/rwtouch ifarg wchk=1 notify com.redwood.widgets say w2 wait 3
+/redwood/bin/tolog /redwood/bin/psgrep -cpu 20
+/redwood/bin/rwtouch ifarg wchk=1 notify com.redwood.widgets say w3 wait 25 say w4
+/redwood/bin/tolog /redwood/bin/psgrep -cpu 20
+/redwood/bin/rwtouch ifarg wchk=1 notify com.redwood.widgets say w5 wait 2 say end
