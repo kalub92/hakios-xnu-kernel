@@ -53,7 +53,10 @@
 #endif
 /* boot_args.virtBase, as xnuloader/loader.c has it: the kernel's text is 48 MB above it. */
 #define KERNEL_VIRT_BASE    0xfffffff004000000ULL
-#define XNU_SLIDE           (XNU_PHYS_BASE - KERNEL_VIRT_BASE)
+/* r1_mem=1 moves the base down (mem_layout() below); without it xnu_base is XNU_PHYS_BASE and nothing differs */
+static uint64_t xnu_base = XNU_PHYS_BASE;
+static uint64_t xnu_size_r1;             /* 0: XNU_MEM_SIZE / xnumem= as before; else the r1_mem=1 range */
+#define XNU_SLIDE           (xnu_base - KERNEL_VIRT_BASE)
 #define PAGE_SIZE_MAX       0x4000ULL
 
 /* Seconds XNU may run before the watchdog resets into Android; 0: run until reset by hand. */
@@ -191,6 +194,12 @@ static uint64_t xnu_mem_size(void)
 {
 	uint64_t size = (boot_arg(" xnumem=", 0) << 20) & ~0x1ffffffULL;
 	return size != 0 && size < XNU_MEM_SIZE ? size : XNU_MEM_SIZE;
+}
+
+/* what boot_args.memSize says: the r1_mem=1 range, else what the device tree's dram-size says */
+static uint64_t kernel_mem_size(void)
+{
+	return xnu_size_r1 ? xnu_size_r1 : xnu_mem_size();
 }
 
 #define CHAIN_OFFSET        0x40000u
@@ -2377,6 +2386,233 @@ static void big_cores_clock(void)
 	out(" MHz at the same 800 mV\n");
 }
 
+/*
+ * r1_mem=1 (docs/ram-holes-spec.md, stage 1): XNU's memory from 0x80000000 to 0x140000000 (4 GB's top), less the
+ * regions firmware keeps there (nine merged holes, 278 MB): LK's /reserved-memory entries (modem image, ccci,
+ * SCP, ATF logs, dramc) and four of Android's run-time pools (SCP/SSPM share, consys, wifi). The list is
+ * written for the kernel into the boot_args page (r1mem_write_list), which keeps them out of its free pages,
+ * pa_valid() and the physmap. LK's own tree is the check: a /reserved-memory entry in the range that the table
+ * does not cover (or no readable tree) -> "r1mem: FALLBACK", the 2 GB layout as without r1_mem.
+ * r1_memcap=MB: the VM gets at most that much (the top comes down; 32 MB steps). dram-base/dram-size of /chosen
+ * stay at today's values (build_device_tree): they only choose the mapping attributes of I/O windows.
+ */
+#define R1_BASE         0x80000000ULL
+#define R1_TOP          0x140000000ULL
+#define R1_HOLES_MAX    16
+static uint64_t r1_holes[R1_HOLES_MAX][2];
+static unsigned r1_nholes;
+
+static const uint64_t r1_hole_tab[][2] = {
+	{ 0x80860000ULL, 0x80880000ULL },       /* what bsd/dev/redwood_goodix.c (run with any touchscreen=) maps write-combined as a "command database" (CMD_DB_PHYS): not RAM for the VM; in the 48 MB gap below the kernel */
+	{ 0x8d000000ULL, 0x8d300000ULL },       /* Android scp_share (inferred from iomem) */
+	{ 0x8e000000ULL, 0x9e000000ULL },       /* mblock-18 md_mem_usage: the modem image */
+	{ 0x9f3f0000ULL, 0x9ff00000ULL },       /* Android sspm_share + mblock-16 SCP-reserved */
+	{ 0x9fff0000ULL, 0xa0000000ULL },       /* mblock-17 ccci_tag_mem */
+	{ 0xbe000000ULL, 0xbe400000ULL },       /* Android consys-reserve-memory */
+	{ 0xbf000000ULL, 0xbf300000ULL },       /* Android wifi-reserve-memory */
+	{ 0xbff30000ULL, 0xbfff0000ULL },       /* mblock-8 atf-log + mblock-7 atf-ramdump */
+	{ 0xbfffc000ULL, 0xc0000000ULL },       /* mblock-1 dramc-rk0 (16 KiB-rounded) */
+	{ 0x13fffc000ULL, 0x140000000ULL },     /* mblock-2 dramc-rk1 */
+};
+#define R1_TAB_N        (sizeof(r1_hole_tab) / sizeof(r1_hole_tab[0]))
+
+/* is [a, e) inside the table's holes? */
+static int r1_covered(uint64_t a, uint64_t e)
+{
+	for (unsigned i = 0; i < R1_TAB_N && a < e; i++) {
+		if (a >= r1_hole_tab[i][0] && a < r1_hole_tab[i][1]) {
+			a = r1_hole_tab[i][1];
+		}
+	}
+	return a >= e;
+}
+
+/* LK's /reserved-memory regs inside [R1_BASE, R1_TOP) that the table does not cover: how many (each said); -1: no tree */
+static int r1_check_dt(uint64_t dtb)
+{
+	const uint8_t *fdt = (const uint8_t *)(uintptr_t)dtb;
+	const uint8_t *structs, *p, *end;
+	const char *strings, *names[8];
+	uint32_t ac = 2, sc = 2;
+	int depth = -1, bad = 0, in_rm = 0;
+
+	if (dtb == 0 || dt_be32(fdt) != FDT_MAGIC) {
+		return -1;
+	}
+	structs = fdt + dt_be32(fdt + 8);
+	strings = (const char *)(fdt + dt_be32(fdt + 12));
+	end = structs + dt_be32(fdt + 36);
+	for (p = structs; p < end;) {
+		uint32_t token = dt_be32(p);
+
+		p += 4;
+		if (token == FDT_BEGIN_NODE) {
+			const char *name = (const char *)p;
+
+			p += (dt_len(name) + 1 + 3) & ~3u;
+			depth++;
+			if (depth < 8) {
+				names[depth] = name;
+			}
+			in_rm = depth == 1 && dt_streq(name, "reserved-memory");
+		} else if (token == FDT_END_NODE) {
+			depth--;
+			in_rm = 0;
+		} else if (token == FDT_PROP) {
+			uint32_t len = dt_be32(p);
+			const uint8_t *value = p + 8;
+			const char *pname = strings + dt_be32(p + 4);
+
+			p += 8 + ((len + 3) & ~3u);
+			if (in_rm && len == 4 && dt_streq(pname, "#address-cells")) {
+				ac = dt_be32(value);
+			} else if (in_rm && len == 4 && dt_streq(pname, "#size-cells")) {
+				sc = dt_be32(value);
+			} else if (depth == 2 && dt_streq(names[1], "reserved-memory") && dt_streq(pname, "reg") && ac && ac <= 2 && sc && sc <= 2) {
+				for (uint32_t i = 0; i + 4 * (ac + sc) <= len; i += 4 * (ac + sc)) {
+					uint64_t a = 0, z = 0;
+
+					for (uint32_t c = 0; c < ac; c++) {
+						a = a << 32 | dt_be32(value + i + 4 * c);
+					}
+					for (uint32_t c = 0; c < sc; c++) {
+						z = z << 32 | dt_be32(value + i + 4 * (ac + c));
+					}
+					uint64_t e = (a + z + 0x3fffULL) & ~0x3fffULL;
+					a &= ~0x3fffULL;
+					if (e > R1_BASE && a < R1_TOP && z) {
+						int ok = r1_covered(a > R1_BASE ? a : R1_BASE, e < R1_TOP ? e : R1_TOP);
+
+						out("r1mem: LK reserved ");
+						out(names[2]);
+						out(" ");
+						out_hex(a);
+						out("+");
+						out_hex(z);
+						out(ok ? " (a hole)\n" : " NOT IN THE TABLE\n");
+						bad += !ok;
+					}
+				}
+			}
+		} else if (token == FDT_END) {
+			break;
+		}
+	}
+	return bad;
+}
+
+/* decide the layout; with r1_mem absent it does nothing (and says nothing) */
+static void r1mem_layout(uint64_t dtb)
+{
+	uint64_t mode = boot_arg(" r1_mem=", 0), cap = boot_arg(" r1_memcap=", 0), top = R1_TOP, vm = 0, holes_mb = 0;
+	const char *why = NULL;
+	int bad;
+
+	if (mode == 0) {
+		return;
+	}
+	if (mode != 1) {
+		why = "only r1_mem=1 exists";
+	} else if (!XNU_ROOT_EMMC || !BOARD_R1) {
+		why = "needs the system image on the eMMC";
+	} else if ((bad = r1_check_dt(dtb)) < 0) {
+		why = "no readable device tree from LK";
+	} else if (bad > 0) {
+		why = "LK reserves memory the table does not know";
+	}
+	if (why) {
+		out("r1mem: FALLBACK (");
+		out(why);
+		out("): the 2 GB layout\n");
+		return;
+	}
+	if (cap) {
+		top = R1_BASE + (cap << 20);
+		for (unsigned i = 0; i < R1_TAB_N; i++) {
+			if (r1_hole_tab[i][0] < top) {
+				top += r1_hole_tab[i][1] - r1_hole_tab[i][0];
+			}
+		}
+		top &= ~0x1ffffffULL;
+		if (top > R1_TOP) {
+			top = R1_TOP;
+		}
+		if (top < R1_BASE + 0x10000000ULL) {
+			out("r1mem: FALLBACK (r1_memcap too small): the 2 GB layout\n");
+			return;
+		}
+	}
+	for (unsigned i = 0; i < R1_TAB_N; i++) {
+		uint64_t b = r1_hole_tab[i][0], e = r1_hole_tab[i][1];
+
+		if (b < top) {
+			r1_holes[r1_nholes][0] = b;
+			r1_holes[r1_nholes][1] = e < top ? e : top;
+			holes_mb += r1_holes[r1_nholes][1] - b;
+			r1_nholes++;
+		}
+	}
+	xnu_base = R1_BASE;
+	xnu_size_r1 = top - R1_BASE;
+	vm = xnu_size_r1 - holes_mb;
+	out("r1mem: layout 1: base ");
+	out_hex(xnu_base);
+	out(" size ");
+	out_hex(xnu_size_r1);
+	out(", ");
+	out_dec(r1_nholes);
+	out(" holes (");
+	out_dec(holes_mb >> 20);
+	out(" MB), cap ");
+	out_dec(cap);
+	out(" MB, VM ");
+	out_dec(vm >> 20);
+	out(" MB\n");
+	for (unsigned i = 0; i < r1_nholes; i++) {
+		out("r1mem: hole ");
+		out_hex(r1_holes[i][0]);
+		out("-");
+		out_hex(r1_holes[i][1]);
+		out("\n");
+	}
+}
+
+/* "R1HOLES1", count, ranges at +0x2000 of the boot_args page (the kernel reads them there); the rest of the page zero */
+static void r1mem_write_list(uint64_t ba_pa)
+{
+	volatile uint64_t *l = (volatile uint64_t *)(ba_pa + 0x2000);
+
+	for (unsigned i = 0; i < 0x2000 / 8; i++) {
+		l[i] = 0;
+	}
+	if (r1_nholes) {
+		l[0] = 0x3153454c4f483152ULL;                   /* "R1HOLES1" */
+		l[1] = r1_nholes;                               /* count, pad 0 */
+		for (unsigned i = 0; i < r1_nholes; i++) {
+			l[2 + 2 * i] = r1_holes[i][0];
+			l[3 + 2 * i] = r1_holes[i][1];
+		}
+	}
+}
+
+/* The base the run used, next to the run marker (three copies, as marker_set): the rescue after a hang must read the same memory. */
+static void xnu_base_set(void)
+{
+	for (int i = 0; i < 3; i++) {
+		wr32(MARKER_PA + 64 * i + 8, (uint32_t)xnu_base);
+	}
+}
+
+static void xnu_base_get(void)
+{
+	uint32_t a = rd32(MARKER_PA + 8), b = rd32(MARKER_PA + 72), c = rd32(MARKER_PA + 136);
+	uint32_t v = (a == b || a == c) ? a : (b == c ? b : 0);
+
+	if (v == R1_BASE) {
+		xnu_base = R1_BASE;
+	}
+}
+
 static void __attribute__((noreturn)) run_xnu(void)
 {
 	struct payload_info pi;
@@ -2545,13 +2781,22 @@ static void __attribute__((noreturn)) run_xnu(void)
 	uint64_t ba_pa = (dt_pa + dt_len + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
 	uint64_t top = ba_pa + PAGE_SIZE_MAX;
 
+	for (unsigned i = 0; i < r1_nholes; i++) {
+		/* (a hole in the gap below the kernel's text, base+0x3000000, is harmless) */
+		if (r1_holes[i][1] > xnu_base + 0x3000000ULL && r1_holes[i][0] < top + 0x1000000ULL) {
+			out("r1mem: kernel, ramdisk, device tree and boot_args reach a hole: back to Android\n");
+			dbg_delay_ms(5000);
+			chain_android();
+		}
+	}
 	struct boot_args *ba = (struct boot_args *)ba_pa;
 	memset(ba, 0, sizeof(*ba));
+	r1mem_write_list(ba_pa);
 	ba->revision = 2;
 	ba->version = 2;
-	ba->physBase = XNU_PHYS_BASE;
+	ba->physBase = xnu_base;
 	ba->virtBase = KERNEL_VIRT_BASE;
-	ba->memSize = xnu_mem_size();
+	ba->memSize = kernel_mem_size();
 	ba->memSizeActual = ba->memSize;
 	ba->topOfKernelData = top;
 	ba->deviceTreeP = dt_pa - XNU_SLIDE;
@@ -2589,7 +2834,7 @@ static void __attribute__((noreturn)) run_xnu(void)
 	out(" pitch ");
 	out_dec(fb_pitch);
 	out(", XNU memory ");
-	out_hex(XNU_PHYS_BASE);
+	out_hex(xnu_base);
 	out("+");
 	out_hex(ba->memSize);
 	out("\n");
@@ -3715,6 +3960,7 @@ void mtkloader_main(uint64_t dtb)
 		chain_android();
 	}
 	if (mark == MARK_RUNNING) {
+		xnu_base_get();
 		rescue_log();
 		out("reset status "); out_hex(wdt_status); out(" after the run\n");
 		dbg_delay_ms(5000);
@@ -3783,5 +4029,7 @@ void mtkloader_main(uint64_t dtb)
 	if (boot_arg(" r1_md=", 0)) {
 		modem_dt_report(dtb);
 	}
+	r1mem_layout(dtb);
+	xnu_base_set();
 	run_xnu();
 }

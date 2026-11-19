@@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..4ab7ca03b301 100644
+index 44274016a4cf..12949e46bdef 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,50 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,58 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -73,9 +73,17 @@ index 44274016a4cf..4ab7ca03b301 100644
 +bsd/dev/redwood_virtio_input.c	standard
 +bsd/dev/redwood_goodix.c	standard
 +bsd/dev/redwood_tcm.c	standard
++bsd/dev/redwood_hyn.c	standard
++bsd/dev/redwood_pvr.c	standard
++bsd/dev/redwood_mtkaudio.c	standard
++bsd/dev/redwood_r1cam.c	standard
 +bsd/dev/redwood_mtkkeys.c	standard
 +bsd/dev/redwood_mali.c	standard
 +bsd/dev/redwood_connsys.c	standard
++bsd/dev/redwood_md.c	standard
++bsd/dev/redwood_mdfs.c	standard
++bsd/dev/redwood_cldma.c	standard
++bsd/dev/redwood_cell.c	standard
 +bsd/dev/redwood_btsk.c	standard
 +bsd/dev/redwood_mtkwifi.c	standard
 +bsd/dev/redwood_wpa.c	standard
@@ -116,7 +124,7 @@ index 44274016a4cf..4ab7ca03b301 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +199,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +207,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -131,7 +139,7 @@ index 44274016a4cf..4ab7ca03b301 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +413,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +421,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -139,7 +147,7 @@ index 44274016a4cf..4ab7ca03b301 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +436,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +444,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -1887,10 +1895,10 @@ index 5219fb0d9ed6..b2f000b00225 100644
  //	Now check if we are trying to root on a memory device
  //
 diff --git a/iokit/conf/files b/iokit/conf/files
-index 5fb0a52062e0..274ed3282878 100644
+index 5fb0a52062e0..1ea60425c6ba 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -79,6 +79,17 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -79,6 +79,18 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
@@ -1899,6 +1907,7 @@ index 5fb0a52062e0..274ed3282878 100644
 +iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
 +iokit/Kernel/RedwoodGPU.cpp				optional iokitcpp
 +iokit/Kernel/RedwoodMali.cpp				optional iokitcpp
++iokit/Kernel/RedwoodPVR.cpp				optional iokitcpp
 +iokit/Kernel/RedwoodWLAN.cpp			optional iokitcpp
 +iokit/Kernel/RedwoodBattery.cpp			optional iokitcpp
 +iokit/Kernel/RedwoodBluetooth.cpp		optional iokitcpp
@@ -2050,7 +2059,7 @@ index 0316792a3f42..c339b8b7911b 100644
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e26a1d70f470..f91095c98d26 100644
+index e26a1d70f470..216098d1ad82 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -73,6 +73,9 @@
@@ -2111,7 +2120,18 @@ index e26a1d70f470..f91095c98d26 100644
  
  	chosen = NULL; // Force a re-lookup later on since VM addresses are not final at this point
  	dt_entry_size = 0;
-@@ -422,10 +436,13 @@ arm_init(
+@@ -395,7 +409,9 @@ arm_init(
+ 		/*
+ 		 * Select the advertised kernel page size.
+ 		 */
+-		if (args->memSize > 1ULL * 1024 * 1024 * 1024) {
++		/* r1: the kernel has 992 MB here, and iOS 16's shared cache is signed in 16 KB pages
++		 * (4 KB got "unsupported code signature page shift: 14"): 16 KB whatever the size. */
++		if (1 || args->memSize > 1ULL * 1024 * 1024 * 1024) {
+ 			/*
+ 			 * arm64 device with > 1GB of RAM:
+ 			 * kernel uses 16KB pages.
+@@ -422,10 +438,13 @@ arm_init(
  	}
  #endif
  
@@ -2125,7 +2145,7 @@ index e26a1d70f470..f91095c98d26 100644
  	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
  
  	BootCpuData.cpu_number = (unsigned short)master_cpu;
-@@ -439,11 +456,14 @@ arm_init(
+@@ -439,11 +458,14 @@ arm_init(
  	CpuDataEntries[master_cpu].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
  	    + ((uintptr_t)&BootCpuData
  	    - (uintptr_t)(args->virtBase)));
@@ -2140,7 +2160,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/*
  	 * Preemption is enabled for this thread so that it can lock mutexes without
-@@ -452,12 +472,16 @@ arm_init(
+@@ -452,12 +474,16 @@ arm_init(
  	 * preemption level is not really meaningful for the bootstrap thread.
  	 */
  	thread->machine.preemption_count = 0;
@@ -2157,23 +2177,28 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/*
  	 * Initialize the timer callout world
-@@ -465,6 +489,7 @@ arm_init(
+@@ -465,8 +491,10 @@ arm_init(
  	timer_call_init();
  
  	cpu_init();
 +	loader_checkpoint(16);
  
  	processor_bootstrap();
++	loader_checkpoint(45);   /* r1 port: between processor_bootstrap and arm_vm_init */
  
-@@ -514,6 +539,7 @@ arm_init(
+ 	if (PE_parse_boot_argn("maxmem", &maxmem, sizeof(maxmem))) {
+ 		xmaxmem = (uint64_t) maxmem * (1024 * 1024);
+@@ -513,7 +541,9 @@ arm_init(
+ 	__builtin_arm_wsr("pan", 1);
  #endif  /* __ARM_PAN_AVAILABLE__ */
  
++	loader_checkpoint(46);   /* r1 port: arm_vm_init next */
  	arm_vm_init(xmaxmem, args);
 +	loader_checkpoint(17);
  
  	if (debug_boot_arg) {
  		patch_low_glo();
-@@ -527,7 +553,9 @@ arm_init(
+@@ -527,7 +557,9 @@ arm_init(
  
  	/* Setup debugging output. */
  	const unsigned int serial_exists = serial_init();
@@ -2183,7 +2208,7 @@ index e26a1d70f470..f91095c98d26 100644
  	kprintf("kprintf initialized\n");
  
  	serialmode = 0;
-@@ -569,6 +597,7 @@ arm_init(
+@@ -569,6 +601,7 @@ arm_init(
  		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
  	}
  	PE_create_console();
@@ -2191,7 +2216,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/* setup console output */
  	PE_init_printf(FALSE);
-@@ -647,6 +676,7 @@ arm_init(
+@@ -647,6 +680,7 @@ arm_init(
  	 * against string vulnerabilities
  	 */
  	__stack_chk_guard &= ~(0xFFULL << 8);
@@ -2199,7 +2224,7 @@ index e26a1d70f470..f91095c98d26 100644
  	machine_startup(args);
  }
  
-@@ -673,6 +703,9 @@ arm_init_cpu(
+@@ -673,6 +707,9 @@ arm_init_cpu(
  
  
  	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
@@ -2238,7 +2263,7 @@ index 39daaf8db949..64ceb1a5f201 100644
  	}
  	os_atomic_clear_exclusive();
 diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
-index fc2096fa0010..5011ab612305 100644
+index fc2096fa0010..26243916d4cd 100644
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
 @@ -93,6 +93,8 @@
@@ -2250,7 +2275,42 @@ index fc2096fa0010..5011ab612305 100644
  #include <san/kasan.h>
  #include <sys/cdefs.h>
  
-@@ -4676,8 +4678,8 @@ pmap_page_protect_options_with_flush_range(
+@@ -2624,11 +2626,23 @@ pmap_free_pages_span(
+ }
+ 
+ 
++extern unsigned int r1_hole_count;
++extern pmap_paddr_t r1_hole_skip(pmap_paddr_t pa);      /* arm_vm_init.c, r1_mem=1 */
++
+ boolean_t
+ pmap_next_page_hi(
+ 	ppnum_t            * pnum,
+ 	__unused boolean_t might_free)
+ {
++	if (r1_hole_count != 0) {
++		/* pmap_steal_memory()'s pages skip the holes; pmap_next_page() does not, see pmap_startup() */
++		if (need_ram_ranges_init) {
++			initialize_ram_ranges();
++		}
++		pmap_paddr_t next = MIN(r1_hole_skip(first_avail), avail_end);
++		avail_page_count -= MIN(avail_page_count, (unsigned int)atop(next - first_avail));
++		first_avail = next;
++	}
+ 	return pmap_next_page(pnum);
+ }
+ 
+@@ -2807,8 +2821,8 @@ pmap_assert_free(ppnum_t ppnum)
+ 		const char *type = (pmap == kernel_pmap) ? "Kernel" : "User";
+ 
+ 		panic("%s: Found at least one mapping to %#llx. First PTEP (%p) is a "
+-		    "%s CPU mapping (pmap: %p)",
+-		    __func__, (uint64_t)pa, first_ptep, type, pmap);
++		    "%s CPU mapping (pmap: %p) [r1 diag: va %#llx pte %#llx]",
++		    __func__, (uint64_t)pa, first_ptep, type, pmap, (uint64_t)ptep_get_va(first_ptep), (uint64_t)*first_ptep);
+ 	}
+ }
+ #endif
+@@ -4676,8 +4690,8 @@ pmap_page_protect_options_with_flush_range(
  			}
  #endif
  			if (remove && (options & PMAP_OPTIONS_COMPRESSOR)) {
@@ -2261,7 +2321,7 @@ index fc2096fa0010..5011ab612305 100644
  			}
  			goto protect_skip_pve_pass1;
  		}
-@@ -6877,7 +6879,8 @@ void
+@@ -6877,7 +6891,8 @@ void
  pmap_sync_page_attributes_phys(
  	ppnum_t pp)
  {
@@ -2271,7 +2331,7 @@ index fc2096fa0010..5011ab612305 100644
  }
  
  #if CONFIG_COREDUMP
-@@ -11623,7 +11626,8 @@ pmap_cs_lockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
+@@ -11623,7 +11638,8 @@ pmap_cs_lockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
  #if XNU_MONITOR
  	pmap_ppl_lockdown_pages(kva, size, PVH_FLAG_LOCKDOWN_CS, ppl_writable);
  #else
@@ -2281,7 +2341,7 @@ index fc2096fa0010..5011ab612305 100644
  #endif
  }
  
-@@ -11633,7 +11637,8 @@ pmap_cs_unlockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
+@@ -11633,7 +11649,8 @@ pmap_cs_unlockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
  #if XNU_MONITOR
  	pmap_ppl_unlockdown_pages(kva, size, PVH_FLAG_LOCKDOWN_CS, ppl_writable);
  #else
@@ -2319,6 +2379,201 @@ index df672c65b144..d7e1da7c5db2 100644
  #endif /* HAS_APPLE_PAC */
  
  	bool reserved11;
+diff --git a/osfmk/arm/pmap/pmap_data.h b/osfmk/arm/pmap/pmap_data.h
+index 2883f636f560..5bcb1eff4ef0 100644
+--- a/osfmk/arm/pmap/pmap_data.h
++++ b/osfmk/arm/pmap/pmap_data.h
+@@ -71,9 +71,15 @@ extern pmap_paddr_t vm_first_phys, vm_last_phys;
+  *
+  * @param pa The physical address to check.
+  */
++extern unsigned int r1_hole_count;
++extern bool r1_pa_in_hole(pmap_paddr_t pa);   /* arm_vm_init.c, r1_mem=1 */
++
+ static inline bool
+ pa_valid(pmap_paddr_t pa)
+ {
++	if (__improbable(r1_hole_count != 0) && r1_pa_in_hole(pa)) {
++		return false;
++	}
+ 	return (pa >= vm_first_phys) && (pa < vm_last_phys);
+ }
+ 
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index d89b0f19cff7..7d0710234ac4 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1481,6 +1481,127 @@ SECURITY_READ_ONLY_LATE(static unsigned int) ptov_index = 0;
+ #define ROUND_L1(addr) (((addr) + ARM_TT_L1_OFFMASK) & ~(ARM_TT_L1_OFFMASK))
+ #define ROUND_TWIG(addr) (((addr) + ARM_TT_TWIG_OFFMASK) & ~(ARM_TT_TWIG_OFFMASK))
+ 
++/*
++ * redwood r1_mem=1 (the loader's hole list; port of Open Mapple's mem4g, APSL): the loader gives the VM DRAM from
++ * 0x80000000 and leaves in the boot_args page, at +0x2000, the ranges it must not use (LK's reservations: modem,
++ * ATF, TEE, SSPM, SCP, ...). They are kept out of the free pages, out of pa_valid() (mapped as I/O, as before)
++ * and out of the physmap (no cacheable alias for the CPU to prefetch through into memory the EMI MPU protects).
++ * With no list (r1_mem absent) r1_hole_count is 0 and every path below is the stock one.
++ */
++#define R1_HOLES_OFF 0x2000
++#define R1_HOLES_MAX 48
++
++struct r1_holes {
++	char magic[8];
++	uint32_t count, pad;
++	uint64_t range[R1_HOLES_MAX][2];
++};
++
++SECURITY_READ_ONLY_LATE(unsigned int) r1_hole_count;
++SECURITY_READ_ONLY_LATE(static pmap_paddr_t) r1_holes[R1_HOLES_MAX][2];
++SECURITY_READ_ONLY_LATE(static uint64_t) r1_hole_bytes;
++
++static void
++r1_mem_init(boot_args *args)
++{
++	const pmap_paddr_t pa = args->topOfKernelData - 0x4000 + R1_HOLES_OFF;
++	const struct r1_holes *h = (const struct r1_holes *)(pa - gPhysBase + gVirtBase);
++	pmap_paddr_t prev = gPhysBase;
++
++	if (memcmp(h->magic, "R1HOLES1", 8) != 0) {
++		return;
++	}
++	if (h->count == 0 || h->count > R1_HOLES_MAX) {
++		panic("r1_mem: %u holes", h->count);
++	}
++	for (unsigned int i = 0; i < h->count; i++) {
++		pmap_paddr_t b = h->range[i][0], e = h->range[i][1];
++		if (b < prev || e <= b || e > gPhysBase + mem_size || ((b | e) & PAGE_MASK)) {
++			panic("r1_mem: hole %u 0x%llx-0x%llx", i, b, e);
++		}
++		r1_holes[i][0] = b;
++		r1_holes[i][1] = e;
++		r1_hole_bytes += e - b;
++		prev = e;
++	}
++	r1_hole_count = h->count;
++}
++
++bool
++r1_pa_in_hole(pmap_paddr_t pa)
++{
++	unsigned int lo = 0, hi = r1_hole_count;
++
++	while (lo < hi) {
++		unsigned int mid = (lo + hi) / 2;
++		if (pa >= r1_holes[mid][1]) {
++			lo = mid + 1;
++		} else if (pa < r1_holes[mid][0]) {
++			hi = mid;
++		} else {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* PA itself, or the end of the hole it is in (the loader merges touching holes) */
++pmap_paddr_t
++r1_hole_skip(pmap_paddr_t pa)
++{
++	for (unsigned int i = 0; i < r1_hole_count; i++) {
++		if (pa >= r1_holes[i][0] && pa < r1_holes[i][1]) {
++			return r1_holes[i][1];
++		}
++	}
++	return pa;
++}
++
++static uint64_t
++r1_hole_bytes_in(pmap_paddr_t b, pmap_paddr_t e)
++{
++	uint64_t n = 0;
++
++	for (unsigned int i = 0; i < r1_hole_count; i++) {
++		pmap_paddr_t hb = MAX(b, r1_holes[i][0]), he = MIN(e, r1_holes[i][1]);
++		if (hb < he) {
++			n += he - hb;
++		}
++	}
++	return n;
++}
++
++/* the physmap's mapping of [PA, PA + LEN) at VA, all but the holes */
++static void
++r1_physmap_map(vm_offset_t va, pmap_paddr_t pa, vm_size_t len, pmap_paddr_t pa_offset, int pte_prot_APX, unsigned granule)
++{
++	pmap_paddr_t cur = pa, end = pa + len;
++
++	for (unsigned int i = 0; i <= r1_hole_count && cur < end; i++) {
++		pmap_paddr_t hb = i < r1_hole_count ? MIN(r1_holes[i][0], end) : end;
++		pmap_paddr_t he = i < r1_hole_count ? r1_holes[i][1] : end;
++		if (hb > cur) {
++			arm_vm_page_granular_prot(va + (cur - pa), hb - cur, pa_offset, 1, pte_prot_APX, 1, granule);
++		}
++		cur = MAX(cur, he);
++	}
++}
++
++/* what the kernel took from the loader's list (osfmk/arm64/loader_return.c prints it) */
++void
++r1_mem_report(void (*say)(const char *format, ...))
++{
++	for (unsigned int i = 0; i < r1_hole_count; i++) {
++		say("r1mem: hole 0x%09llx-0x%09llx %llu KiB", (unsigned long long)r1_holes[i][0], (unsigned long long)(r1_holes[i][1] - 1),
++		    (unsigned long long)((r1_holes[i][1] - r1_holes[i][0]) >> 10));
++	}
++	if (r1_hole_count) {
++		say("r1mem: RAM 0x%llx-0x%llx, %u holes of %llu MiB, %llu MiB for the VM", (unsigned long long)gPhysBase,
++		    (unsigned long long)(gPhysBase + gPhysSize), r1_hole_count, (unsigned long long)(r1_hole_bytes >> 20),
++		    (unsigned long long)(max_mem >> 20));
++	}
++}
++
+ static void
+ arm_vm_physmap_slide(ptov_table_entry *temp_ptov_table, vm_map_address_t orig_va, vm_size_t len, int pte_prot_APX, unsigned granule)
+ {
+@@ -1509,7 +1630,12 @@ arm_vm_physmap_slide(ptov_table_entry *temp_ptov_table, vm_map_address_t orig_va
+ 	assert((temp_ptov_table[ptov_index].va & ARM_PGMASK) == 0);
+ 	temp_ptov_table[ptov_index].len = round_page(len);
+ 	pa_offset = temp_ptov_table[ptov_index].va - orig_va;
+-	arm_vm_page_granular_prot(temp_ptov_table[ptov_index].va, temp_ptov_table[ptov_index].len, pa_offset, 1, pte_prot_APX, 1, granule);
++	if (r1_hole_count) {
++		r1_physmap_map(temp_ptov_table[ptov_index].va, temp_ptov_table[ptov_index].pa, temp_ptov_table[ptov_index].len,
++		    pa_offset, pte_prot_APX, granule);
++	} else {
++		arm_vm_page_granular_prot(temp_ptov_table[ptov_index].va, temp_ptov_table[ptov_index].len, pa_offset, 1, pte_prot_APX, 1, granule);
++	}
+ 	++ptov_index;
+ }
+ 
+@@ -1854,6 +1980,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	} else {
+ 		max_mem_actual = mem_actual;
+ 	}
++	r1_mem_init(args);
++	mem_actual -= r1_hole_bytes;
++	max_mem_actual -= r1_hole_bytes;
+ 	if (mem_size >= ((VM_MAX_KERNEL_ADDRESS - VM_MIN_KERNEL_ADDRESS) / 2)) {
+ 		panic("Unsupported memory configuration %lx", mem_size);
+ 	}
+@@ -2202,6 +2331,8 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ 	sane_size = mem_size - (avail_start - gPhysBase);
+ 	max_mem = mem_size;
++	sane_size -= r1_hole_bytes;
++	max_mem -= r1_hole_bytes;
+ 	vm_kernel_slid_base = segLOWESTTEXT;
+ 	// vm_kernel_slide is set by arm_init()->arm_slide_rebase_and_sign_image()
+ 	vm_kernel_stext = segTEXTB;
+@@ -2368,6 +2499,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ #if XNU_MONITOR
+ 	pmap_static_allocations_done();
+ #endif
++	if (r1_hole_bytes_in(args->topOfKernelData, avail_start) != 0) {
++		panic("r1_mem: the boot allocations 0x%llx-0x%llx ran into a hole", (unsigned long long)args->topOfKernelData, (unsigned long long)avail_start);
++	}
+ 	first_avail = avail_start;
+ 	patch_low_glo_static_region(args->topOfKernelData, avail_start - args->topOfKernelData);
+ 	enable_preemption();
 diff --git a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h b/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
 index b9549da357b4..cca31ea32502 100644
 --- a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
@@ -2351,7 +2606,7 @@ index 94e91306b143..0ec1323086b7 100644
  #endif
  
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
-index e76e7e70ab9c..4f540f8caf43 100644
+index e76e7e70ab9c..6f06768d7ac0 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
 @@ -734,6 +734,9 @@ ml_get_machine_mem(void)
@@ -2537,7 +2792,27 @@ index e76e7e70ab9c..4f540f8caf43 100644
  
  	*processor_out = processor;
  	*ipi_handler_out = cpu_signal_handler;
-@@ -2237,8 +2350,16 @@ _enable_virtual_timer(void)
+@@ -1744,6 +1857,9 @@ ml_static_protect(
+ }
+ 
+ 
++extern unsigned int r1_hole_count;
++extern bool r1_pa_in_hole(pmap_paddr_t pa);     /* arm_vm_init.c, r1_mem=1 */
++
+ /*
+  *	Routine:        ml_static_mfree
+  *	Function:
+@@ -1771,6 +1887,9 @@ ml_static_mfree(
+ 	    vaddr_cur < trunc_page_64(vaddr + size);
+ 	    vaddr_cur += PAGE_SIZE) {
+ 		ppn = pmap_find_phys(kernel_pmap, vaddr_cur);
++		if (ppn != (vm_offset_t) NULL && r1_hole_count != 0 && r1_pa_in_hole(ptoa(ppn))) {
++			continue;       /* r1_mem=1: a hole (the loader's list) is never the VM's */
++		}
+ 		if (ppn != (vm_offset_t) NULL) {
+ 			/*
+ 			 * It is not acceptable to fail to update the protections on a page
+@@ -2237,8 +2356,16 @@ _enable_virtual_timer(void)
  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
  
  	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
@@ -3354,6 +3629,33 @@ index 8b46efb05c86..e161ca426b1a 100644
  extern kern_return_t
  kern_work_interval_set_workload_id(mach_port_name_t port_name,
      struct kern_work_interval_workload_id_args *workload_id_args);
+diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
+index 0aab8cc3cfdc..d43df52165fa 100644
+--- a/osfmk/vm/vm_resident.c
++++ b/osfmk/vm/vm_resident.c
+@@ -1391,6 +1391,8 @@ uint64_t secluded_shutoff_headroom = 150 * 1024 * 1024; /* original value from N
+ #if defined(__arm64__)
+ extern void patch_low_glo_vm_page_info(void *, void *, uint32_t);
+ unsigned int vm_first_phys_ppnum = 0;
++extern unsigned int r1_hole_count;
++extern bool r1_pa_in_hole(uint64_t pa);     /* arm_vm_init.c, r1_mem=1 */
+ #endif
+ 
+ void vm_page_release_startup(vm_page_t mem);
+@@ -1567,6 +1569,13 @@ pmap_startup(
+ #endif
+ 		++vm_pages_count;
+ 		vm_page_init(&vm_pages[i], phys_page, FALSE);
++#if defined(__arm64__)
++		/* r1_mem=1: a hole's page keeps its place in vm_pages[] (VM_PAGE_GET_PHYS_PAGE counts on it), never freed */
++		if (__improbable(r1_hole_count != 0) && r1_pa_in_hole(ptoa(phys_page))) {
++			vm_pages[i].vmp_error = TRUE;
++			continue;
++		}
++#endif
+ 		if (fill) {
+ 			fillPage(phys_page, fillval);
+ 		}
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 index 3ad743fc3efb..ce036c5a2c26 100644
 --- a/pexpert/arm/pe_fiq.c
@@ -3400,10 +3702,10 @@ index 65144c74239c..33771efff6fa 100644
  
  void
 diff --git a/pexpert/pexpert/arm64/BCM2837.h b/pexpert/pexpert/arm64/BCM2837.h
-index d9f0723244e5..cc7163d70917 100644
+index d9f0723244e5..2a4130b86115 100644
 --- a/pexpert/pexpert/arm64/BCM2837.h
 +++ b/pexpert/pexpert/arm64/BCM2837.h
-@@ -11,6 +11,15 @@
+@@ -11,6 +11,20 @@
  #define BCM2837
  #define BCM2837_BRINGUP
  #define ARM_ARCH_TIMER
@@ -3415,11 +3717,16 @@ index d9f0723244e5..cc7163d70917 100644
 + * ARMv8.2: they set PSTATE.PAN on every exception entry, so the kernel must
 + * know to lift it around user memory accesses.
 + */
-+#define __ARM_PAN_AVAILABLE__     1
++/*
++ * rabbit r1 (MT6765): eight Cortex-A53s, ARMv8.0 -- no PAN. Writing PSTATE.PAN there is an
++ * undefined instruction: the kernel stopped in arm_init right after processor_bootstrap (r1
++ * checkpoint 45 reached, 46 not). Without PAN nothing sets it, so there is nothing to lift.
++ */
++#define __ARM_PAN_AVAILABLE__     0
  
  #define __ARM_ARCH__              8
  #define __ARM_VMSA__              8
-@@ -22,6 +31,12 @@
+@@ -22,6 +36,12 @@
  #ifndef ASSEMBLER
  
  #define PI3_UART
@@ -3432,7 +3739,7 @@ index d9f0723244e5..cc7163d70917 100644
  
  #define PI3_BREAK                               asm volatile("brk #0");
  
-@@ -60,8 +75,11 @@
+@@ -60,8 +80,11 @@
  #define BCM2837_PUT32(addr, value) do { *((volatile uint32_t *) addr) = value; } while(0)
  #define BCM2837_GET32(addr) *((volatile uint32_t *) addr)
  

@@ -26,6 +26,8 @@
 #include <pexpert/arm64/board_config.h>
 #include <vm/vm_page.h>
 #include <vm/vm_compressor.h>
+#include <vm/vm_kern.h>
+#include <vm/pmap.h>
 
 /*
  * The console log handed back to the loader. A long session writes more than fits, and both
@@ -639,3 +641,107 @@ hv_wdt_pet_init(void)
 	hv_wdt_pet(NULL, NULL);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, hv_wdt_pet_init);
+
+/*
+ * r1_mem=1 (the loader's hole list, osfmk/arm64/arm_vm_init.c): the kernel's account of it, said and kept for the host
+ * a few seconds after the start. r1_memtest=1: 60 s after the start (r1_memtest=N: N s), take 16 MiB chunks until 120 MiB is free,
+ * write every 8th word of every page with its own address, read it all back, count the pages by where they are, and
+ * say whether the EMI protection unit (EMI_MPUS 0x102191f0) saw a refused access meanwhile. Off by default.
+ */
+extern unsigned int r1_hole_count;
+extern bool r1_pa_in_hole(pmap_paddr_t pa);
+extern void r1_mem_report(void (*say)(const char *format, ...));
+extern void redwood_host_keep_add(const char *format, ...) __printflike(1, 2);
+
+#define R1MEMTEST_CHUNK         (16ULL << 20)
+#define R1MEMTEST_MAX_CHUNKS    192
+#define R1MEMTEST_LEAVE         (120ULL << 20)
+
+static uint32_t r1memtest_on;
+static thread_call_t r1mem_report_call, r1memtest_call;
+
+static void
+r1mem_report_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	r1_mem_report(redwood_host_keep_add);
+}
+
+static void
+r1memtest_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	static vm_offset_t chunk[R1MEMTEST_MAX_CHUNKS];
+	uint64_t pages_low = 0, pages_mid = 0, pages_high = 0, pages_hole = 0, bad = 0;
+	uint32_t n = 0;
+	volatile uint32_t *emi = (volatile uint32_t *)ml_io_map(0x10219000ULL, 0x1000);
+	uint32_t mpus_before = emi[0x1f0 / 4], mpus_after;
+	char line[256];
+
+	redwood_memory_line(line, sizeof(line));
+	printf("r1mem: test starts; before: %s", line);
+	while (n < R1MEMTEST_MAX_CHUNKS && (uint64_t)vm_page_free_count * PAGE_SIZE > R1MEMTEST_LEAVE + R1MEMTEST_CHUNK) {
+		if (kmem_alloc(kernel_map, &chunk[n], R1MEMTEST_CHUNK, KMA_KOBJECT | KMA_NOPAGEWAIT | KMA_DATA, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS) {
+			break;
+		}
+		for (vm_offset_t off = 0; off < R1MEMTEST_CHUNK; off += PAGE_SIZE) {
+			uint64_t pa = kvtophys(chunk[n] + off);
+			uint64_t *w = (uint64_t *)(chunk[n] + off);
+
+			if (r1_hole_count && r1_pa_in_hole(pa)) {
+				pages_hole++;
+			}
+			if (pa < 0xc0000000ULL) {
+				pages_low++;
+			} else if (pa < 0x100000000ULL) {
+				pages_mid++;
+			} else {
+				pages_high++;
+			}
+			for (uint32_t j = 0; j < PAGE_SIZE / 8; j += 8) {
+				w[j] = pa ^ ((uint64_t)j * 8) ^ 0x5a5a5a5a5a5a5a5aULL;
+			}
+		}
+		n++;
+	}
+	for (uint32_t k = 0; k < n; k++) {
+		for (vm_offset_t off = 0; off < R1MEMTEST_CHUNK; off += PAGE_SIZE) {
+			uint64_t pa = kvtophys(chunk[k] + off);
+			uint64_t *w = (uint64_t *)(chunk[k] + off);
+
+			for (uint32_t j = 0; j < PAGE_SIZE / 8; j += 8) {
+				if (w[j] != (pa ^ ((uint64_t)j * 8) ^ 0x5a5a5a5a5a5a5a5aULL)) {
+					bad++;
+				}
+			}
+		}
+	}
+	mpus_after = emi[0x1f0 / 4];
+	for (uint32_t k = 0; k < n; k++) {
+		kmem_free(kernel_map, chunk[k], R1MEMTEST_CHUNK);
+	}
+	redwood_host_keep_add("r1mem: test: %llu MiB touched (%llu MiB below 0xc0000000, %llu MiB above 4 GB, %llu MiB 0xc0000000-4 GB), "
+	    "%llu in holes, %llu bad, EMI MPUS 0x%x -> 0x%x %s",
+	    (pages_low + pages_mid + pages_high) * PAGE_SIZE >> 20, pages_low * PAGE_SIZE >> 20, pages_high * PAGE_SIZE >> 20,
+	    pages_mid * PAGE_SIZE >> 20, pages_hole, bad, mpus_before, mpus_after, mpus_before == mpus_after ? "unchanged" : "CHANGED");
+	redwood_memory_line(line, sizeof(line));
+	printf("r1mem: test done; after: %s", line);
+}
+
+__startup_func
+static void
+r1mem_init(void)
+{
+	uint64_t deadline;
+
+	PE_parse_boot_argn("r1_memtest", &r1memtest_on, sizeof(r1memtest_on));
+	if (r1_hole_count) {
+		r1mem_report_call = thread_call_allocate(r1mem_report_fire, NULL);
+		clock_interval_to_deadline(8, NSEC_PER_SEC, &deadline);
+		thread_call_enter_delayed(r1mem_report_call, deadline);
+	}
+	if (r1memtest_on) {
+		r1memtest_call = thread_call_allocate(r1memtest_fire, NULL);
+		clock_interval_to_deadline(r1memtest_on > 1 ? r1memtest_on : 60, NSEC_PER_SEC, &deadline);
+		thread_call_enter_delayed(r1memtest_call, deadline);
+	}
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, r1mem_init);

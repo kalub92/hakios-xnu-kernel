@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-18 22:59 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-18 23:59 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -31,6 +31,7 @@ Last updated: 2026-11-18 22:59 PST. Kept current as work lands; details are in t
 - Microphone (`mtkmic=2`): kernel self-test passes on both mics; an iOS recording of a speaker tone is 14 dB above the quiet floor; playback unchanged before and after. Speech not tested
 - Boot image has about 1.4 MB free (Android ramdisk repacked lz4 to gzip)
 - Video recording (`venc=4`): Camera's Video mode records a 1080p H.264 movie to the camera roll at a full 10 frames per second (about 2.1 CPU cores in mediaserverd, no dropped frames) with our own software encoder (minih264e, public domain) registered inside mediaserverd. With `mtkmic=2` the movie carries real microphone sound (a speaker tone is over 100 times louder in the track than the quiet seconds). Playback in Photos, a listen by ear and heat are not tested
+- More memory (`r1_mem=1`, off by default; `ram-holes-spec.md`): iOS gets 2793 MB instead of 2016 MB. Unattended: boots to the home screen, a test that writes and checks up to 1.8 GB of the free pages finds no bad page, Wi-Fi scan, Bluetooth, camera preview and the modem's SIM check (radio off) work, Android intact afterwards, and the default image is unchanged. Not yet tested with it on: recovery of the log after a hang, the side-button exit, camera capture and audio, the modem service's full ten gates
 - Cellular stage 4c/4d on a simulated bearer (radio off): `celld` publishes the service, `pdp_ip0` becomes the primary interface, DNS and traffic go out on it, the data budget cuts traffic off (about 5 KB overshoot)
 
 ## In progress
@@ -60,7 +61,6 @@ Last updated: 2026-11-18 22:59 PST. Kept current as work lands; details are in t
 - USB while in iOS
 - Sleep / low-power idle
 
-- More memory for iOS (about 2.0 GB today; 2.8 GB specified in `ram-holes-spec.md`, off by default): being built and tested now. Memory is not short today (worst free figure seen is about 970 MB)
 
 ## Dropped or nothing to gain
 
