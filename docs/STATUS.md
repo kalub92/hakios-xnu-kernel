@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-19 06:54 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-19 07:10 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -63,7 +63,7 @@ Last updated: 2026-11-19 06:54 PST. Kept current as work lands; details are in t
 - Phone calls and SMS (not built; current safety rules forbid dialling and SMS)
 - Bluetooth call audio (HFP)
 - USB while in iOS
-- Sleep / low-power idle
+- Sleep / low-power idle: specified in `sleep-spec.md` (today only the backlight goes off when locked; cores stay awake, every driver polls, the loader's watcher core spins). First stage (lower voltage, slower polling and parked cores while the screen is off) being built; no battery-drain figure exists yet because every reading so far was taken on USB power
 
 
 ## Dropped or nothing to gain
