@@ -1,0 +1,9 @@
+# Camera video with our encoder and the microphone (RC_JOBS=rc.jobs.mv3), 260 s run, boot-args venc=4 vdiag=1 mtkaudio=2 mtkmic=2, no Wi-Fi, no pvr_stats
+# (the kept log is 64 KB: the quiet boot lets it reach the recording and `scan`). The encoder checks come first (early lines), then a speaker tone of
+# 3 s ~2 s into the recording (the microphone's loudness test), then `scan`: codec, samples, audio level per second.
+/redwood/bin/video_test inproc 4 640 480
+/redwood/bin/video_test encode h264 640 480 4
+/redwood/bin/sound_test springboard
+/redwood/bin/tolog /redwood/bin/sound_test wait 127 raw 3 &
+/redwood/bin/rwtouch say start wait 85 notify com.redwood.unlock wait 5 say camera notify com.redwood.camera wait 30 say video swipe 0.3 0.80 0.7 0.80 300 wait 5 say rec1 tap 0.5 0.887 wait 6 say rec2 tap 0.5 0.887 wait 10 say end
+/redwood/bin/video_test scan

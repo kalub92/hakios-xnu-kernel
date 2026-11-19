@@ -1,0 +1,9 @@
+# Encoder checks without the camera (RC_JOBS=rc.jobs.venc), ~150 s run (docs/video-recording-spec-3.md C.2, E1/E2): early, so that the lines are in the kept log.
+# Boot-args venc=4 (avc1, minih264e) venc=3 (hvc1, Apple's VCPHEVC).
+/redwood/bin/rwtouch say start wait 60
+/redwood/bin/video_test inproc 4 640 480
+/redwood/bin/video_test inproc 4 1280 720
+/redwood/bin/video_test encode h264 640 480
+/redwood/bin/video_test encode h264 1280 720
+/redwood/bin/video_test encode hevc 640 480
+/redwood/bin/video_test scan

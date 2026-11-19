@@ -1,0 +1,4 @@
+# Camera video with our encoder (RC_JOBS=rc.jobs.mv4), 230 s run, boot-args venc=4 vdiag=1, no Wi-Fi, no pvr_stats (a quiet kept log), then `scan`:
+# codec, samples, audio tracks and their level per second.
+/redwood/bin/rwtouch say start wait 85 notify com.redwood.unlock wait 5 say camera notify com.redwood.camera wait 30 say video swipe 0.3 0.80 0.7 0.80 300 wait 5 say rec1 tap 0.5 0.887 wait 6 say rec2 tap 0.5 0.887 wait 10 say end
+/redwood/bin/video_test scan

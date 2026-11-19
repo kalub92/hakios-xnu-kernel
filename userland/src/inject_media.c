@@ -1184,6 +1184,7 @@ camera_app_probe(void)
  */
 #include <VideoToolbox/VideoToolbox.h>
 #include <CoreMedia/CoreMedia.h>
+#include "venc.h"
 
 static bool
 boot_arg_has(const char *word)
@@ -1328,6 +1329,7 @@ __attribute__((used)) static const struct {
  * CMTime halves, ints; none of these takes a float).
  */
 typedef uint64_t (*vd_imp)(id, SEL, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+static void vd_logger_extra(const char *selector, uint64_t *args, uint64_t unused, bool say_it);
 
 static bool
 vd_wrap(const char *class_name, const char *selector, bool class_method, void (*extra)(const char *, uint64_t *, uint64_t, bool))
@@ -1346,21 +1348,23 @@ vd_wrap(const char *class_name, const char *selector, bool class_method, void (*
 	method_setImplementation(m, imp_implementationWithBlock((id)^uint64_t(id me, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
 		uint64_t args[6] = { a, b, c, d, e, f }, result;
 		unsigned n = __sync_add_and_fetch(&calls, 1);
-		bool say_it = n <= 3 || n % 30 == 0;
+		bool logger = extra == vd_logger_extra;
+		/* (the kept log is 64 KB: frames are said every 300th, the logger's errors only as their own line, 6 of them) */
+		bool say_it = logger ? n <= 6 : (n <= 3 || n % 300 == 0);
 
 		if (say_it && extra != NULL) {
 			extra(sn, args, 0, true);
 		}
-		if (say_it) {
+		if (say_it && !logger) {
 			host_line("vdiag: -[%s %s] #%u in: %#llx %#llx %#llx %#llx", cn, sn, n, a, b, c, d);
 		}
 		result = orig(me, sel, a, b, c, d, e, f);
-		if (say_it) {
+		if (say_it && !logger) {
 			host_line("vdiag: -[%s %s] #%u out: %#llx", cn, sn, n, result);
 		}
 		return result;
 	}));
-	host_line("vdiag: -[%s %s] wrapped", class_name, selector);
+	host_line("vdiag: -[%s %s] wrapped (types %s)", class_name, selector, method_getTypeEncoding(m));
 	return true;
 }
 
@@ -1459,22 +1463,37 @@ vd_wrap_exceptions(void)
 	host_line("vdiag: +[NSException exceptionWithName:reason:userInfo:] wrapped");
 }
 
-/* retried every 5 s for 10 minutes: CMCapture's classes exist when the camera first starts. _writeBuffer:forInputIndex: has the buffer in a, the input in b. */
+/* -[BWLimitedGMErrorLogger logErrorNumber:errorString:]: every node error, with its status and text (spec 3 B.1) */
+static void
+vd_logger_extra(const char *selector, uint64_t *args, uint64_t unused, bool say_it)
+{
+	(void)selector; (void)unused; (void)say_it;
+	host_line("vdiag: node error %d: %.200s", (int)args[0], text_of_object((id)(uintptr_t)args[1]));
+}
+
+/* retried every 5 s for 10 minutes: CMCapture's classes exist when the camera first starts. The movie path of iOS 16.5 (spec 3 B.1). */
+#define VD_NSINKS 11
 static void
 vd_wrap_sinks(void)
 {
-	static bool done[5];
-	static const struct { const char *cls, *sel; void (*extra)(const char *, uint64_t *, uint64_t, bool); } w[5] = {
-		{ "BWQuickTimeMovieFileSinkNode", "_doStartRecordingAtTime:withSettings:sensorVideoPort:", NULL },
-		{ "BWQuickTimeMovieFileSinkNode", "_writeBuffer:forInputIndex:", NULL },
-		{ "BWQuickTimeMovieFileSinkNode", "_doEndRecordingAtTime:earlyTerminationErrCode:", NULL },
-		{ "BWFileCoordinatorNode", "_doStartingToRecordWithSBuf:inputIndex:sbufPTS:", NULL },
+	static bool done[VD_NSINKS];
+	static const struct { const char *cls, *sel; void (*extra)(const char *, uint64_t *, uint64_t, bool); } w[VD_NSINKS] = {
+		{ "BWVideoCompressorNode", "renderSampleBuffer:forInput:", NULL },
+		{ "BWVideoCompressorNode", "_compresessionSession", NULL },
+		{ "BWVideoCompressorNode", "handleDroppedSample:forInput:", NULL },
+		{ "BWLimitedGMErrorLogger", "logErrorNumber:errorString:", vd_logger_extra },
+		{ "BWFileCoordinatorNode", "renderSampleBuffer:forInput:", NULL },
+		{ "BWFileCoordinatorNode", "stopRecordingWithErrorCode:", NULL },
+		{ "BWFileCoordinatorNode", "recordingTerminated:", NULL },
+		{ "BWQuickTimeMovieFileSinkNode", "renderSampleBuffer:forInput:", NULL },
+		{ "BWQuickTimeMovieFileSinkNode", "handleDroppedSample:forInput:", NULL },
+		{ "BWQuickTimeMovieFileSinkNode", "lastFileSize", NULL },
 		{ "BWMultiStreamCameraSourceNode", "configure:", vd_configure_extra },
 	};
 	static unsigned tries;
 	bool all = true;
 
-	for (unsigned i = 0; i < 5; i++) {
+	for (unsigned i = 0; i < VD_NSINKS; i++) {
 		done[i] = done[i] || vd_wrap(w[i].cls, w[i].sel, false, w[i].extra);
 		all &= done[i];
 	}
@@ -1538,7 +1557,7 @@ vd_stabilization(void)
 	Class cls = objc_getClass("AVCaptureConnection");
 	SEL sel = sel_registerName("setPreferredVideoStabilizationMode:");
 	Method m = cls ? class_getInstanceMethod(cls, sel) : NULL;
-	bool force = boot_arg_has("vfix=1");
+	bool force = !boot_arg_has("vfix=0");   /* the default: Auto stabilization makes -12780 in Video mode (vd4..vd6) */
 
 	if (m == NULL) {
 		host_line("vdiag: AVCaptureConnection setPreferredVideoStabilizationMode: NOT FOUND");
@@ -1550,7 +1569,7 @@ vd_stabilization(void)
 
 	method_setImplementation(m, imp_implementationWithBlock((id)^void(id me, long mode) {
 		if (__sync_add_and_fetch(&n, 1) <= 6) {
-			host_line("vdiag: setPreferredVideoStabilizationMode: %ld%s", mode, force ? " -> 0 (vfix=1)" : "");
+			host_line("vdiag: setPreferredVideoStabilizationMode: %ld%s", mode, force ? " -> 0 (vfix)" : "");
 		}
 		orig(me, sel, force ? 0 : mode);
 	}));
@@ -1582,7 +1601,6 @@ vdiag_camera_app(void)
 		}
 	}
 	free(methods);
-	vd_stabilization();
 	Class cap = objc_getClass("CAMCaptureCapabilities");
 	host_line("vdiag: CAMCaptureCapabilities %s", cap ? "present" : "absent");
 }
@@ -1681,11 +1699,13 @@ redwood_media_init(void)
 		CFPreferencesSetAppValue(CFSTR("CAMUserPreferenceEnableResponsiveShutter"), kCFBooleanFalse, CFSTR("com.apple.camera"));
 		camera_app_guard();
 		camera_app_probe();
-		if ((vdiag_on = boot_arg_has("vdiag=1"))) {
-			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 14 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		vdiag_on = boot_arg_has("vdiag=1");
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 14 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			vd_stabilization();     /* always (vfix=0 turns the forcing off) */
+			if (vdiag_on) {
 				vdiag_camera_app();
-			});
-		}
+			}
+		});
 		return;
 	}
 	if (name != NULL && strcmp(name, "assetsd") == 0) {
@@ -1696,6 +1716,14 @@ redwood_media_init(void)
 		return;
 	}
 	in_mediaserverd = true;
+	for (int mode = 1; mode <= 4; mode++) {         /* venc=N: a software video encoder registered where compression sessions run (venc.c) */
+		char word[8];
+
+		snprintf(word, sizeof(word), "venc=%d", mode);
+		if (boot_arg_has(word)) {
+			venc_register(mode);      /* (several may be given: venc=2 venc=3 are avc1 and hvc1) */
+		}
+	}
 	if ((vdiag_on = boot_arg_has("vdiag=1"))) {
 		host_line("vdiag: on in mediaserverd");
 	}

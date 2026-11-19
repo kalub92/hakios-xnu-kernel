@@ -52,6 +52,7 @@ __pycache__/
 !/userland/libmini/
 !/userland/var/
 !/userland/share/
+!/userland/third_party/
 
 /ios165/*
 !/ios165/fetch.sh

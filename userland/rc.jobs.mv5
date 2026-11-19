@@ -1,0 +1,6 @@
+# Camera video with microphone and regression (RC_JOBS=rc.jobs.mv5), 240 s, boot-args venc=4 vdiag=1 mtkaudio=2 mtkmic=2 (NOT RUN YET): two photos (must still be
+# saved), Video mode, a 6 s recording with a speaker tone of 3 s (raw to /dev/redwood-audio) 1.5 s into it for the microphone, Settings opened, then `scan`
+# (codec, samples, audio level per second).
+/redwood/bin/tolog /redwood/bin/sound_test wait 134 raw 3 &
+/redwood/bin/rwtouch say start wait 85 notify com.redwood.unlock wait 5 say camera notify com.redwood.camera wait 20 say shot1 tap 0.5 0.887 wait 8 say shot2 tap 0.5 0.887 wait 10 say video swipe 0.3 0.80 0.7 0.80 300 wait 5 say rec1 tap 0.5 0.887 wait 6 say rec2 tap 0.5 0.887 wait 10 say settings notify com.redwood.settings wait 15 say end
+/redwood/bin/video_test scan
