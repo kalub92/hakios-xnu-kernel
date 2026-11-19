@@ -1,0 +1,2 @@
+# Photos only (RC_JOBS=rc.jobs.pa): Camera, then three shots 8 s apart, no video, no tone (second-photo investigation).
+/redwood/bin/rwtouch say start wait 85 notify com.redwood.unlock wait 5 say camera notify com.redwood.camera wait 20 say shot1 tap 0.5 0.887 wait 8 say shot2 tap 0.5 0.887 wait 8 say shot3 tap 0.5 0.887 wait 10 say end
