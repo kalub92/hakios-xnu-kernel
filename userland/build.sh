@@ -139,6 +139,9 @@ IOS_JOBS=${JOBS-"
 # MEDIAPARSERD=1: CoreMedia's file/stream parser daemon (starts on demand only; docs/audio-gaps.md C2/D2)
 [ -n "$MEDIAPARSERD" ] && IOS_JOBS="$IOS_JOBS com.apple.mediaparserd"
 # DROP_JOBS="label ...": jobs left out for a run (com.apple.chronod: no widget extensions, run 326)
+# com.apple.logd_helper is left out by default (docs/boot-time-lsd.md; it harvests coprocessor/kext log data, burned 72-88% of a core
+# at 36-45 s and delayed lsd's seed by ~11 s); KEEP_LOGD_HELPER=1 puts it back.
+[ -z "$KEEP_LOGD_HELPER" ] && DROP_JOBS="$DROP_JOBS com.apple.logd_helper"
 for j in $DROP_JOBS; do IOS_JOBS=$(echo " $IOS_JOBS " | tr '\n\t' '  ' | sed "s/ $j / /g"); done
 # (and TRIM="label:service,...;..." keeps only those Mach services of a job: see mkjobs.py)
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line

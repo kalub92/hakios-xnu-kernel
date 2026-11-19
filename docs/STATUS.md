@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-19 01:23 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-19 02:19 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -31,7 +31,7 @@ Last updated: 2026-11-19 01:23 PST. Kept current as work lands; details are in t
 - Microphone (`mtkmic=2`): kernel self-test passes on both mics; an iOS recording of a speaker tone is 14 dB above the quiet floor; playback unchanged before and after. Speech not tested
 - Boot image has about 1.4 MB free (Android ramdisk repacked lz4 to gzip)
 - Video recording (`venc=4`): Camera's Video mode records a 1080p H.264 movie to the camera roll at a full 10 frames per second (about 2.1 CPU cores in mediaserverd, no dropped frames) with our own software encoder (minih264e, public domain) registered inside mediaserverd. With `mtkmic=2` the movie carries real microphone sound (a speaker tone is over 100 times louder in the track than the quiet seconds). Playback in Photos, a listen by ear and heat are not tested
-- More memory (`r1_mem=1`, off by default; `ram-holes-spec.md`): iOS gets 2793 MB instead of 2016 MB. Unattended: boots to the home screen, a test that writes and checks up to 1.8 GB of the free pages finds no bad page, Wi-Fi scan, Bluetooth, camera preview and the modem's SIM check (radio off) work, Android intact afterwards, and the default image is unchanged. Not yet tested with it on: recovery of the log after a hang, the side-button exit, camera capture and audio, the modem service's full ten gates
+- More memory (`r1_mem=1`, off by default; `ram-holes-spec.md`): iOS gets 2793 MB instead of 2016 MB. Unattended: boots to the home screen, a test that writes and checks up to 1.8 GB of the free pages finds no bad page, Wi-Fi scan, Bluetooth, camera preview and the modem's SIM check (radio off) work, Android intact afterwards, and the default image is unchanged. The side-button exit and the modem service's ten gates (radio off) also pass with it on. Not yet tested with it on: recovery of the log after a hang (needs a person present), camera capture and audio
 - Cellular stage 4c/4d on a simulated bearer (radio off): `celld` publishes the service, `pdp_ip0` becomes the primary interface, DNS and traffic go out on it, the data budget cuts traffic off (about 5 KB overshoot)
 
 ## In progress
@@ -42,7 +42,7 @@ Last updated: 2026-11-19 01:23 PST. Kept current as work lands; details are in t
 
 ## Open problems
 
-- Boot time to the first home-screen frame: 122 s, down from 130 s (26 unused internal apps hidden from the app database scan, `lsd_hide=0` turns that off; the failing installer call is answered, `lsd_upcall=0` turns that off). Confirmed causes of the slow scan: no saved database on the RAM volume, and the installer call failing; a restarted lsd loads a just-saved database in 0.09 s, so a database kept on the saved store should skip the 60 s scan (not yet done). Dropping the `logd_helper` job gives 111 s in two runs; not default yet. Starting lsd earlier gives nothing
+- Boot time to the first home-screen frame: about 111 s, down from 130 s. Done: 26 unused internal apps hidden from the app database scan (`lsd_hide=0` turns that off), the failing installer call answered (`lsd_upcall=0`), and the `logd_helper` job dropped (`KEEP_LOGD_HELPER=1` at build time brings it back; it only decodes kernel log strings). The home screen looks the same in low-resolution shots; needs a hands-on look. Still open: a restarted lsd loads a just-saved database in 0.09 s, so a database kept on the saved store should skip the remaining 55 s scan (not yet done)
 - App launches once the home screen has settled (measured): cold Camera shows its first picture 2.0 s after the request with no session restart, warm Camera 1.3 s, cold Settings is active in about 1.5 s. Camera opened while the home screen is still starting up gets its session interrupted and can lose a tap. About 0.85 s of every Camera open is the sensor's register tables; a shorter bus delay (`r1cam_i2c_us`) did not shorten it. `r1cam_linger_ms=3000` (off by default) saves 1.1 s on a restart. The first photo after a boot takes about 3.5 s to save; later ones 0.3 to 0.7 s
 - Resolved: Camera launched while the device is locked is suspended, not killed, and carries on correctly after unlock (photo saved). The two earlier "Camera closed" runs were this; test scenarios now wake the screen before unlocking
 - Apple's two built-in software video encoders do not produce frames here; an app that records through AVAssetWriter needs our encoder registered in its own process (not done)

@@ -199,6 +199,7 @@ static TUNABLE(uint32_t, gShot, "fbshot", 0);      /* a small picture of the fra
 static TUNABLE(uint32_t, gShotWidth, "fbshot_w", 0);      /* the picture's width (60 when not given) */
 static TUNABLE(uint32_t, gShotBand, "fbshot_band", 0);    /* 1, 2 or 3: only that third of the height (0: all of it; 4: each third in turn) */
 static TUNABLE(uint32_t, gShotEvery, "fbshot_every", 60);  /* seconds between pictures (a multiple of 5) */
+static TUNABLE(uint32_t, gShotAt, "fbshot_at", 0);        /* ONE picture, at the first 5-second report at or after this many seconds of uptime (nothing else printed) */
 static TUNABLE(uint32_t, gShotPanel, "fbshot_panel", 0);    /* ... of a picture put on the panel from inside the kernel (MiniIOMobileFramebufferShow) */
 static TUNABLE(uint32_t, gRecStart, "rec_start", 0);
 static TUNABLE(uint32_t, gRecMegabytes, "rec_mb", 480);
@@ -1631,6 +1632,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 			uint32_t every = gShotEvery >= 5 ? gShotEvery / 5 : 1;
 
+			static bool shotAtDone;
+
+			if (gShotAt != 0 && !shotAtDone && micros(mach_absolute_time()) / 1000000 >= gShotAt) {
+				shotAtDone = true;
+				shot(recorded);
+			}
 			if (gShot != 0 && ++fShotStats >= gShot / 5 && (fShotStats - gShot / 5) % every == 0) {
 				shot(recorded);
 			}
