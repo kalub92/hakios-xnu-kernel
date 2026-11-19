@@ -1,6 +1,6 @@
 # Mic + video checks (RC_JOBS=rc.jobs.mv), 300 s run. The Camera scenario first; the video and microphone tools last (the log tail starts ~100 s in).
 /redwood/bin/video_test probe
-/redwood/bin/rwtouch say start wait 85 notify com.redwood.unlock wait 5 say camera notify com.redwood.camera wait 30 say video swipe 0.3 0.80 0.7 0.80 300 wait 5 say rec1 tap 0.5 0.887 wait 6 say rec2 tap 0.5 0.887 wait 10 say end
+/redwood/bin/rwtouch say start wait 85 tap 0.5 0.06 wait 1 notify com.redwood.unlock wait 5 say camera notify com.redwood.camera wait 30 say video swipe 0.3 0.80 0.7 0.80 300 wait 5 say rec1 tap 0.5 0.887 wait 6 say rec2 tap 0.5 0.887 wait 10 say end
 /redwood/bin/video_test scan
 /redwood/bin/video_test encode
 /redwood/bin/record_test 4

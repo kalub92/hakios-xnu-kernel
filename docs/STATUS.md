@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-18 18:41 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-18 19:36 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -41,8 +41,8 @@ Last updated: 2026-11-18 18:41 PST. Kept current as work lands; details are in t
 
 ## Open problems
 
-- First Camera launch after a boot: about 5 s to the first picture, and a shutter tap landing within about 0.2 s of that first frame is lost (`camera-launch-spec.md`); the capture session also starts, stops and restarts once on most launches (cause unknown, costs about 1.2 s)
-- Camera showed nothing in two test runs because it was launched while the device was locked with the screen off (a test-scenario fault, confirmed from the log for one run, inferred for the other); a run to confirm how the app behaves then is queued
+- First Camera launch after a boot: about 5 s to the first picture. A touch landing within a fraction of a second of that first frame never reaches the app (lost below it). The capture session is stopped from below the app and restarted two or three times during launch (cause not found). The first photo after a boot takes about 3.5 s to save while the photo library finishes opening; later ones take 0.3 to 0.7 s
+- Resolved: Camera launched while the device is locked is suspended, not killed, and carries on correctly after unlock (photo saved). The two earlier "Camera closed" runs were this; test scenarios now wake the screen before unlocking
 - Apple's two built-in software video encoders do not produce frames here; an app that records through AVAssetWriter needs our encoder registered in its own process (not done)
 - Cellular alongside Wi-Fi (Wi-Fi should win) is untested: unattended runs have no Wi-Fi
 - All audio went silent after a speaker was paired (likely the route moved to a Bluetooth output that could not carry sound; not confirmed)

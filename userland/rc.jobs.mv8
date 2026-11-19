@@ -1,4 +1,4 @@
 # Goal A/B: as mv7, but the tone (sound_test job clock = kernel clock - 27.3 s, found in g2) is 3 s at job time 152 (kernel 179.3-182.3) inside the recording (kernel 178.7-184.9), then again 3 s later.
 /redwood/bin/sound_test wait 152 raw 3 wait 3 raw 3 &
-/redwood/bin/rwtouch say start wait 85 notify com.redwood.unlock wait 5 say camera notify com.redwood.camera wait 35 say shot1 tap 0.5 0.887 wait 8 say shot2 tap 0.5 0.887 wait 8 say shot3 tap 0.5 0.887 wait 10 say video swipe 0.3 0.80 0.7 0.80 300 wait 5 say rec1 tap 0.5 0.887 wait 6 say rec2 tap 0.5 0.887 wait 10 say end
+/redwood/bin/rwtouch say start wait 85 tap 0.5 0.06 wait 1 notify com.redwood.unlock wait 5 say camera notify com.redwood.camera wait 35 say shot1 tap 0.5 0.887 wait 8 say shot2 tap 0.5 0.887 wait 8 say shot3 tap 0.5 0.887 wait 10 say video swipe 0.3 0.80 0.7 0.80 300 wait 5 say rec1 tap 0.5 0.887 wait 6 say rec2 tap 0.5 0.887 wait 10 say end
 /redwood/bin/video_test scan

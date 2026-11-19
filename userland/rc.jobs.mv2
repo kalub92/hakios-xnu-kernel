@@ -1,7 +1,7 @@
 # Video encoder runs (RC_JOBS=rc.jobs.mv2), 450 s run (docs/video-recording-spec-3.md C.1). The kept log (64 KB) is full of boot noise before the recording and the
 # console tail keeps only the last ~100 s of the run: the whole scenario is late (wait 312), so that the Camera recording, `scan`, the in-process test and the
 # remote AVAssetWriter encodes all land in that tail.
-/redwood/bin/rwtouch say start wait 312 notify com.redwood.unlock wait 5 say camera notify com.redwood.camera wait 30 say video swipe 0.3 0.80 0.7 0.80 300 wait 5 say rec1 tap 0.5 0.887 wait 6 say rec2 tap 0.5 0.887 wait 10 say end
+/redwood/bin/rwtouch say start wait 312 tap 0.5 0.06 wait 1 notify com.redwood.unlock wait 5 say camera notify com.redwood.camera wait 30 say video swipe 0.3 0.80 0.7 0.80 300 wait 5 say rec1 tap 0.5 0.887 wait 6 say rec2 tap 0.5 0.887 wait 10 say end
 /redwood/bin/video_test inproc 1
 /redwood/bin/video_test encode h264 640 480
 /redwood/bin/video_test encode hevc 640 480

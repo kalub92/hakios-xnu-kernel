@@ -2262,10 +2262,13 @@ redwood_springboard_init(void)
 	/* com.redwood.camera: Camera.app opened by its bundle id, wherever its icon is (rc.jobs' autotest) */
 	notify_register_dispatch("com.redwood.camera", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		id app = SEND(id, objc_getClass("UIApplication"), "sharedApplication");
+		Class lock_class = objc_getClass("SBLockScreenManager");
+		id manager = lock_class ? ((id (*)(Class, SEL))objc_msgSend)(lock_class, sel_registerName("sharedInstance")) : NULL;
+		int is_locked = manager ? (int)((BOOL (*)(id, SEL))objc_msgSend)(manager, sel_registerName("isUILocked")) : -1;
 		BOOL ok = ((BOOL (*)(id, SEL, id, BOOL))objc_msgSend)(app, sel_registerName("launchApplicationWithIdentifier:suspended:"),
 		    (id)CFSTR("com.apple.camera"), NO);
 
-		keep_line("redwood: camera launched by bundle id: %d", ok);
+		keep_line("redwood: camera launched by bundle id: %d (UI locked %d)", ok, is_locked);
 	});
 	/* com.redwood.settings: Settings opened by its bundle id (rc.jobs' settings=1) */
 	notify_register_dispatch("com.redwood.settings", &token, dispatch_get_main_queue(), ^(__unused int t) {

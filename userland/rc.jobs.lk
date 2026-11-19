@@ -1,0 +1,2 @@
+# Camera launched while the phone is locked and the display off (docs/camera-launch-spec.md T2): suspended or killed? Then wake, unlock, shot.
+/redwood/bin/rwtouch say start wait 140 say lock button lock wait 8 say camera notify com.redwood.camera wait 20 say wake tap 0.5 0.06 wait 1 say unlock notify com.redwood.unlock wait 15 say shot1 tap 0.5 0.887 wait 10 say end

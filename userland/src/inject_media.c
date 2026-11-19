@@ -1041,6 +1041,7 @@ library_early(void)
 		long all = library && class_getClassMethod(library, status) ? ((long (*)(id, SEL, long))objc_msgSend)((id)library, status, 2) : -1;
 		id result;
 
+		host_line("camera app: early open: authorisation %ld after %llu ms", all, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - began) / 1000000);
 		if (all != 3 || asset == NULL) {
 			host_line("camera app: the photo library is not opened early (authorisation to read and write %ld)", all);
 			return;
@@ -1052,6 +1053,7 @@ library_early(void)
 		host_line("%s", line);
 		early_open = 1;
 		(void)((id (*)(id, SEL))objc_msgSend)((id)library, sel_registerName("sharedPhotoLibrary"));
+		host_line("camera app: early open: shared library after %llu ms", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - began) / 1000000);
 		if (early_open == 2) {
 			host_line("camera app: the early open stopped: an exception was thrown (assetsd may still be making the database); the tap's own retry opens it");
 			return;
@@ -1166,10 +1168,112 @@ capture_hook(const char *when)
 	}
 }
 
+/*
+ * T3 diagnostics (docs/camera-launch-spec.md): who starts/stops the capture session, and which touches reach the app (first 40 events).
+ * Logs only; both hooks call the original.
+ */
+static uint64_t app_launch_ns;
+static IMP orig_start_running, orig_stop_running, orig_send_event;
+static _Atomic int session_calls, touch_events;
+
+static void
+session_start(id me, SEL sel)
+{
+	if (session_calls++ < 6) {
+		host_line("camera app: session %p startRunning (main %d) %.3f s after launch", me, pthread_main_np(), (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - app_launch_ns) / 1e9);
+		camera_frames("session start");
+	}
+	((void (*)(id, SEL))orig_start_running)(me, sel);
+}
+
+static void
+session_stop(id me, SEL sel)
+{
+	if (session_calls++ < 6) {
+		host_line("camera app: session %p stopRunning (main %d) %.3f s after launch", me, pthread_main_np(), (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - app_launch_ns) / 1e9);
+		camera_frames("session stop");
+	}
+	((void (*)(id, SEL))orig_stop_running)(me, sel);
+}
+
+static void
+send_event(id me, SEL sel, id event)
+{
+	if (touch_events < 40 && ((long (*)(id, SEL))objc_msgSend)(event, sel_registerName("type")) == 0) {
+		id touches = ((id (*)(id, SEL))objc_msgSend)(event, sel_registerName("allTouches")), one = ((id (*)(id, SEL))objc_msgSend)(touches, sel_registerName("anyObject"));
+
+		if (one != NULL) {
+			touch_events++;
+			host_line("camera app: touch phase %ld at %.3f s after launch", ((long (*)(id, SEL))objc_msgSend)(one, sel_registerName("phase")),
+			    (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - app_launch_ns) / 1e9);
+		}
+	}
+	((void (*)(id, SEL, id))orig_send_event)(me, sel, event);
+}
+
+static void
+t3_hooks(void)
+{
+	Class session = objc_getClass("AVCaptureSession"), app = objc_getClass("UIApplication");
+	Method start = session ? class_getInstanceMethod(session, sel_registerName("startRunning")) : NULL;
+	Method stop = session ? class_getInstanceMethod(session, sel_registerName("stopRunning")) : NULL;
+	Method send = app ? class_getInstanceMethod(app, sel_registerName("sendEvent:")) : NULL;
+
+	if (orig_send_event != NULL) {
+		return;
+	}
+	if (start != NULL && stop != NULL) {
+		orig_start_running = method_setImplementation(start, (IMP)session_start);
+		orig_stop_running = method_setImplementation(stop, (IMP)session_stop);
+	}
+	/* the session's own notices and its end: was the stop the server's (didStop notice), or the session going away (dealloc)? */
+	{
+		static const char *const names[] = { "_handleDidStopRunningNotificationWithPayload:", "_handleDidStartRunningNotificationWithPayload:", "dealloc" };
+
+		for (int i = 0; session != NULL && i < 3; i++) {
+			Method m = class_getInstanceMethod(session, sel_registerName(names[i]));
+			__block IMP orig;
+			const char *label = names[i];
+
+			if (m == NULL) {
+				continue;
+			}
+			orig = method_getImplementation(m);
+			method_setImplementation(m, imp_implementationWithBlock((id)^(id me, id payload) {
+				host_line("camera app: session %p %s %.3f s after launch (main %d)", me, label, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - app_launch_ns) / 1e9, pthread_main_np());
+				((void (*)(id, SEL, id))orig)(me, sel_registerName(label), payload);
+			}));
+		}
+	}
+	if (send != NULL) {
+		orig_send_event = method_setImplementation(send, (IMP)send_event);
+	}
+	host_line("camera app: t3 hooks: session %d, sendEvent %d", start != NULL && stop != NULL, send != NULL);
+	for (Class c = session; c != NULL && c != objc_getClass("NSObject"); c = class_getSuperclass(c)) {
+		unsigned n = 0;
+		Method *list = class_copyMethodList(c, &n);
+		char line[300];
+		int used = snprintf(line, sizeof(line), "camera app: t3 %s:", class_getName(c));
+
+		for (unsigned i = 0; i < n && used < (int)sizeof(line) - 40; i++) {
+			const char *name = sel_getName(method_getName(list[i]));
+
+			if (strcasestr(name, "running") != NULL) {
+				used += snprintf(line + used, sizeof(line) - (size_t)used, " %s", name);
+			}
+		}
+		free(list);
+		host_line("%s", line);
+	}
+}
+
 static void
 camera_app_probe(void)
 {
+	app_launch_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	t3_hooks();     /* (in the constructor: the first session starts ~0.5 s after launch, before the main queue's first turn) */
 	dispatch_async(dispatch_get_main_queue(), ^{
+		t3_hooks();
 		capture_hook("at launch");
 	});
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
