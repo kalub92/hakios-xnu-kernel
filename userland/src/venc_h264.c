@@ -14,6 +14,7 @@
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <stdlib.h>
+#include <sys/resource.h>
 #include <time.h>
 #include "venc.h"
 
@@ -372,10 +373,23 @@ h_encode(uint64_t self, uint64_t token_, uint64_t ib_, uint64_t pts_, uint64_t d
 	}
 	st = venc_emit(e->session, token, 0, 0, sb);
 	CFRelease(sb);
+	/* MEASUREMENT (goal 4, remove when done): wall time and this process's CPU (all threads) since the first frame */
+	static double mt_wall0, mt_cpu0;
+	struct rusage ru;
+	getrusage(RUSAGE_SELF, &ru);
+	double mt_cpu = ru.ru_utime.tv_sec * 1e3 + ru.ru_utime.tv_usec / 1e3 + ru.ru_stime.tv_sec * 1e3 + ru.ru_stime.tv_usec / 1e3;
+	if (e->frames == 0) {
+		mt_wall0 = t0;
+		mt_cpu0 = mt_cpu;
+	}
 	e->frames++;
 	e->ms_total += now_ms() - t0;
-	if (e->frames <= 3 || e->frames % 30 == 0)
+	if (e->frames <= 3 || e->frames % 10 == 0)
+	{
 		venc_log("h264: frame %u: %d bytes%s, %.1f ms (avg %.1f), emit %d", e->frames, coded_n, f.idr ? " IDR" : "", now_ms() - t0, e->ms_total / e->frames, (int)st);
+		if (e->frames > 1 && e->frames % 10 == 0)   /* MEASUREMENT: arrival rate and mediaserverd CPU load in cores */
+			venc_log("h264: load: %u frames in %.0f ms = %.2f fps in, mediaserverd cpu %.0f ms = %.2f cores", e->frames, now_ms() - mt_wall0, (e->frames - 1) * 1e3 / (t0 - mt_wall0), mt_cpu - mt_cpu0, (mt_cpu - mt_cpu0) / (now_ms() - mt_wall0));
+	}
 	return 0;
 }
 
