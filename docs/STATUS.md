@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-19 02:19 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-19 02:29 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -51,6 +51,8 @@ Last updated: 2026-11-19 02:19 PST. Kept current as work lands; details are in t
 - Safari audio spins and never plays; a Safari file download would not start (untested unattended: no Wi-Fi in those runs)
 - After a home swipe the system renders 2 to 3 frames per camera picture (wasted work, not a visible fault); Open Mapple's presentation method would not fix it
 - Side-button exit and radio-on shutdown of the modem service not yet exercised
+
+- Home-screen widgets (Weather, Calendar) are blank white tiles: the widget service (chronod) was taken out of the build earlier because about 26 widget extensions starting together kept the CPU busy for minutes. Fix designed in `widgets-spec.md` (bring it back and let only the two shown widgets start); being built
 
 ## Not yet done
 
