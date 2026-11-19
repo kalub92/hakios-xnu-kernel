@@ -87,6 +87,8 @@ for label in labels:
             wanted = set(services.split(','))
             job['MachServices'] = {k: v for k, v in job['MachServices'].items() if k in wanted}
             print(f'  job {label}: only {", ".join(sorted(job["MachServices"]))}')
+    if label in os.environ.get('EARLY', '').split():
+        job['RunAtLoad'] = True
     job['StandardErrorPath'] = '/dev/console'
     # a job that is named is wanted, whatever hardware it says it is for: wifid's asks for a node "wlan" in the
     # device tree, which the loader's tree does not have yet

@@ -17,6 +17,7 @@
 #include <sys/sysctl.h>
 #include <mach/mach_time.h>
 #include <unistd.h>
+#include <signal.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -98,6 +99,77 @@ cpu_top(int seconds)
 		used[best] = 0;
 	}
 	return 0;
+}
+
+/* the LaunchServices store in lsd's data container: InternalDaemon/<UUID>/Library/Caches/*LaunchServices* (kept lines) */
+static void
+say_ls_store(void)
+{
+	static const char root[] = "/private/var/mobile/Containers/Data/InternalDaemon";
+	DIR *top = opendir(root);
+	struct dirent *u;
+	char line[200];
+
+	while (top != NULL && (u = readdir(top)) != NULL) {
+		char dirpath[400];
+		DIR *dir;
+		struct dirent *e;
+
+		if (u->d_name[0] == '.') {
+			continue;
+		}
+		snprintf(dirpath, sizeof(dirpath), "%s/%s/Library/Caches", root, u->d_name);
+		dir = opendir(dirpath);
+		while (dir != NULL && (e = readdir(dir)) != NULL) {
+			struct stat st;
+			char path[700];
+
+			if (strstr(e->d_name, "LaunchServices") == NULL) {
+				continue;
+			}
+			snprintf(path, sizeof(path), "%s/%s", dirpath, e->d_name);
+			if (stat(path, &st) == 0) {
+				snprintf(line, sizeof(line), "!sample: %.150s %lld bytes", path + sizeof(root), (long long)st.st_size);
+				sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+			}
+		}
+		if (dir != NULL) {
+			closedir(dir);
+		}
+	}
+	if (top != NULL) {
+		closedir(top);
+	}
+}
+
+/* -kill WORD: SIGTERM to the first process whose path has WORD in it (kept line) */
+static int
+kill_word(const char *word)
+{
+	unsigned count;
+	struct kinfo_proc *procs = all_processes(&count);
+
+	for (unsigned k = 0; k < count; k++) {
+		char path[PROC_PIDPATHINFO_MAXSIZE] = "", line[200];
+
+		if (proc_pidpath(procs[k].kp_proc.p_pid, path, sizeof(path)) > 0 && strstr(path, word) != NULL) {
+			snprintf(line, sizeof(line), "!psgrep: SIGTERM to pid %d (%.120s)", procs[k].kp_proc.p_pid, path);
+			sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+			kill(procs[k].kp_proc.p_pid, SIGTERM);
+			free(procs);
+			return 0;
+		}
+	}
+	free(procs);
+	return 1;
+}
+
+/* a kept line, and the same for the host's copy of the log (the console part of the log starts too late for a boot's first minute) */
+static void
+say_kept(const char *line)
+{
+	sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+	sysctlbyname("kern.redwood.host_keep", NULL, NULL, line, strlen(line));
 }
 
 /* -sample: see the top. Nothing at all unless the kernel's arguments have proc_sample=1. */
@@ -183,7 +255,11 @@ sample(int seconds, int times, const char *word)
 
 				snprintf(line, sizeof(line), "!sample top: %s %.0f%%, %s %.0f%%, %s %.0f%% of one core", names[0], best[0] * base.numer / base.denom * 100 / wall, names[1],
 				    best[1] * base.numer / base.denom * 100 / wall, names[2], best[2] * base.numer / base.denom * 100 / wall);
-				sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+				if (i < 20) {
+					say_kept(line);
+				} else {
+					sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+				}
 			}
 			memcpy(prev_pid, cur_pid, n * sizeof(pid_t));
 			memcpy(prev_cpu, cur_cpu, n * sizeof(uint64_t));
@@ -201,7 +277,7 @@ sample(int seconds, int times, const char *word)
 		free(procs);
 		snprintf(line, sizeof(line), "!sample +%llu s: %s pid %d cpu %llu ms slide %#lx", (unsigned long long)((mach_absolute_time() - t0) * base.numer / base.denom / 1000000000ULL),
 		    word, pid, (unsigned long long)(cpu_time(pid) * base.numer / base.denom / 1000000ULL), (unsigned long)((uintptr_t)_dyld_get_shared_cache_range(&size) - 0x180000000UL));
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		say_kept(line);
 		if (pid != 0) {
 			arg = pid | 0x40000000;
 			sysctlbyname("kern.redwood.ustack", NULL, NULL, &arg, sizeof(arg));
@@ -226,6 +302,9 @@ sample(int seconds, int times, const char *word)
 				closedir(dir);
 			}
 		}
+		if (i % 5 == 0 || i + 1 == times) {
+			say_ls_store();
+		}
 		if (i + 1 < times) {
 			sleep((unsigned)seconds);
 		}
@@ -238,6 +317,9 @@ main(int argc, char **argv)
 {
 	int stacks = argc > 1 && strcmp(argv[1], "-stack") == 0;       /* -stack: and the threads of each, by the kernel */
 
+	if (argc > 2 && strcmp(argv[1], "-kill") == 0) {
+		return kill_word(argv[2]);
+	}
 	if (argc > 4 && strcmp(argv[1], "-sample") == 0) {
 		return sample(atoi(argv[2]), atoi(argv[3]), argv[4]);
 	}

@@ -1568,9 +1568,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    micros(drawn));
 	}
 	if (layers != fLayersShown) {
-		IOLog("MiniIOMobileFramebuffer: swap #%u: surfaces in layers 0x%x now (0x%x before): %u %u %u %u\n", fSwapsShown, layers,
+		IOLog("MiniIOMobileFramebuffer: swap #%u: surfaces in layers 0x%x now (0x%x before): %u %u %u %u at %llu ms\n", fSwapsShown, layers,
 		    fLayersShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)), swapWord(swap, SWAP_SURFACE(2)),
-		    swapWord(swap, SWAP_SURFACE(3)));
+		    swapWord(swap, SWAP_SURFACE(3)), micros(mach_absolute_time()) / 1000);
 		fLayersShown = layers;
 	}
 

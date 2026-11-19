@@ -152,7 +152,7 @@ SILEO_BIN="chmod cp mkdir mv rm"
 # ours -- Settings, where a tweak's own pane belongs. Add a program's name to have tweaks in it.)
 # CoreImage guard (default on in the processes of the libredwood-tweaks line, ci_guard=0 turns it off; src/inject_tweaks.c)
 # (SpringBoard opens the library through inject_sb.c only when /var/jb/usr/lib/TweakInject exists, so name it here).
-INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd containermanagerd_system com.apple.WebKit.GPU
+INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd containermanagerd_system com.apple.WebKit.GPU lsd
 /redwood/lib/libredwood-sb.dylib SpringBoard
 /redwood/lib/libredwood-media.dylib mediaserverd
 /redwood/lib/libredwood-app.dylib Sileo
@@ -524,6 +524,8 @@ with open(path, 'w') as f:
 	[ -n "$QUIET" ] && : > root/etc/quiet
 	# the jobs the iOS launchd will see (/System/Library/LaunchDaemons is a symlink to this directory)
 	cp com.redwood.demo.plist com.redwood.wifi.plist root/LaunchDaemons/
+	# EARLY="label ...": those jobs are started when launchd loads them (RunAtLoad), not at the first Mach lookup. off by default: lsd with it starts at 35 s but its first os_log_create waits for logd until ~48 s, so no gain (runs ft1a/ft1b, HANDOFF-2026-11-17-night.md "Boot time: lsd")
+	export EARLY=${EARLY-}
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $IOS/rootfs root/LaunchDaemons $IOS_JOBS
 fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu

@@ -1,0 +1,10 @@
+# D5 / FT (docs/boot-time-lsd.md): lsd's boot seed with diagnostics, then a same-boot lsd restart that must load the store it saved. Silent: Camera is only opened (no shutter tap), no lock button, no lock button, no sound_test.
+/redwood/bin/tolog /redwood/bin/psgrep -sample 3 40 /usr/libexec/lsd &
+/redwood/bin/tolog /redwood/bin/psgrep -sysctl kern.apfs_stats
+/redwood/bin/rwtouch say start wait 95 say apfs1
+/redwood/bin/tolog /redwood/bin/psgrep -sysctl kern.apfs_stats
+/redwood/bin/rwtouch wait 20 tap 0.5 0.06 wait 1 notify com.redwood.unlock wait 10 say killlsd
+/redwood/bin/tolog /redwood/bin/psgrep SpringBoard lsd
+/redwood/bin/tolog /redwood/bin/psgrep -kill /usr/libexec/lsd
+/redwood/bin/rwtouch wait 4 say settings notify com.redwood.settings wait 15 button home wait 4 say camera notify com.redwood.camera wait 12 say end
+/redwood/bin/tolog /redwood/bin/psgrep SpringBoard lsd

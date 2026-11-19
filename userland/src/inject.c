@@ -37,11 +37,14 @@
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/vm_map.h>
 #include <notify.h>
 #include <os/lock.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 static void *prof_main(void *unused);  /* bbd_prof=1 */
 #include <stdarg.h>
@@ -2011,6 +2014,511 @@ container_manager_fixes(void)
 	say("redwood: container manager: no personas\n");
 }
 
+
+/* ---- lsd ------------------------------------------------------------------------------------------ */
+
+/*
+ * lsd seeds its LaunchServices database from every app in /Applications at every boot, ~63 s of the ~130 s to the
+ * home screen (docs/boot-time-lsd.md). Boot-args (read once, in lsd):
+ *   lsdiag=1      kept "lsd:" lines about the store, the seed and what each kind of step costs (diagnostics only)
+ *   lsd_upcall=1  R1: lsd's call to installd ("register containerized content") is answered as success when
+ *                 /private/var/containers/Bundle/Application is empty, so the seed completes (0 turns it off)
+ *   lsd_hide=1    R3: the apps in lsd_hidden[] are left out of the scan of /Applications (0 turns it off)
+ * Defaults below; each is switched by its boot-arg, so a build can change a default without touching the rest.
+ * (R2, lsd started at load, is not here: launchd job EARLY, userland/mkjobs.py.)
+ */
+#define LSD_UPCALL_DEFAULT 1
+#define LSD_HIDE_DEFAULT 1
+
+static int lsdiag, lsd_upcall = LSD_UPCALL_DEFAULT, lsd_hide = LSD_HIDE_DEFAULT;
+static char lsd_store[400];                     /* the store file's path, from the first databaseStoreFileURLWithUID: */
+
+/*
+ * Apps left out of the scan with lsd_hide=1: tools and test apps of Apple's own, and what needs hardware the r1
+ * does not have (CarPlay, contactless, Sidecar). Nothing a person opens from the home screen, nothing another
+ * shipped app or daemon here uses (the list was checked against the image's app list, see the handoff).
+ */
+static const char *const lsd_hidden[] = {
+	"DiagnosticsService.app", "Diagnostics.app", "DiagnosticsReporter.app", "Coverage Details.app", "Xcode Previews.app",
+	"Feedback Assistant iOS.app", "FieldTest.app", "FTMInternal-4.app", "DemoApp.app", "StoreDemoViewService.app",
+	"MTLReplayer.app", "Jellyfish.app", "ClarityCamera.app", "ClarityPhotos.app", "DisplayCal.app", "CheckerBoard.app",
+	"CheckerBoardRemoteSetup.app", "SequoiaTranslator.app", "CarPlaySettings.app", "CarPlaySplashScreen.app",
+	"CarPlayWallpaper.app", "Sidecar.app", "ContactlessReaderUIService.app", "ProximityReaderUIService.app",
+	"MBHelperApp.app", "SLYahooAuth.app",
+};
+
+static double
+lsd_up(void)
+{
+	static mach_timebase_info_data_t base;
+
+	if (base.denom == 0) {
+		mach_timebase_info(&base);
+	}
+	return (double)mach_absolute_time() * base.numer / base.denom / 1e9;
+}
+
+/* a kept line, and the same for the host (kern.redwood.host_keep: whole, with its uptime; the console part of the log starts too late for lsd's seed) */
+static void
+lsd_keep(const char *format, ...)
+{
+	char text[200], host[260];
+	va_list arguments;
+
+	va_start(arguments, format);
+	vsnprintf(text, sizeof(text), format, arguments);
+	va_end(arguments);
+	snprintf(host, sizeof(host), "[%.2f] %s", lsd_up(), text);
+	(void)sysctlbyname("kern.redwood.host_keep", NULL, NULL, host, strlen(host));
+	keep_line("%s", text);
+}
+
+static const char *
+lsd_text(id object)
+{
+	const char *text = NULL;
+
+	if (object != NULL) {
+		id description = ((id (*)(id, SEL))objc_msgSend)(object, sel_registerName("description"));
+
+		text = description ? ((const char *(*)(id, SEL))objc_msgSend)(description, sel_registerName("UTF8String")) : NULL;
+	}
+	return text ? text : "(null)";
+}
+
+static const char *
+lsd_identifier(id bundle)
+{
+	id name;
+
+	if (bundle == NULL || !((BOOL (*)(id, SEL, SEL))objc_msgSend)(bundle, sel_registerName("respondsToSelector:"), sel_registerName("identifier"))) {
+		return "?";
+	}
+	name = ((id (*)(id, SEL))objc_msgSend)(bundle, sel_registerName("identifier"));
+	return name ? ((const char *(*)(id, SEL))objc_msgSend)(name, sel_registerName("UTF8String")) : "(none)";
+}
+
+/* L3: the store and its sibling files, -1 = absent */
+static void
+lsd_files(const char *when)
+{
+	static const char *const names[] = { "", "com.apple.LaunchServices.dirty", "com.apple.LaunchServices.error", "com.apple.LaunchServices.syncInterrupted" };
+	long long size[4];
+	long mtime = 0;
+	char dir[400], path[500], *slash;
+	struct stat st;
+
+	if (lsd_store[0] == 0) {
+		lsd_keep("lsd: files %s at %.2f s: store path not known yet", when, lsd_up());
+		return;
+	}
+	strlcpy(dir, lsd_store, sizeof(dir));
+	slash = strrchr(dir, '/');
+	if (slash != NULL) {
+		*slash = 0;
+	}
+	for (int k = 0; k < 4; k++) {
+		snprintf(path, sizeof(path), "%s", k ? "" : lsd_store);
+		if (k) {
+			snprintf(path, sizeof(path), "%s/%s", dir, names[k]);
+		}
+		size[k] = stat(path, &st) == 0 ? (long long)st.st_size : -1;
+		if (k == 0 && size[k] >= 0) {
+			mtime = (long)st.st_mtime;
+		}
+	}
+	lsd_keep("lsd: files %s at %.2f s: csstore %lld bytes mtime %ld, dirty %d error %d syncInterrupted %d", when, lsd_up(), size[0], mtime,
+	    size[1] >= 0, size[2] >= 0, size[3] >= 0);
+}
+
+/* the timed steps: 0 entryForBundle, 1 code signing, 2 data container, 3 Info.plist, 4 personas */
+enum { LSD_SLOTS = 5 };
+static IMP lsd_orig[LSD_SLOTS];
+static uint64_t lsd_count[LSD_SLOTS], lsd_total[LSD_SLOTS], lsd_max[LSD_SLOTS];
+static struct { uint64_t ns; char name[48]; } lsd_top[5];
+static os_unfair_lock lsd_lock = OS_UNFAIR_LOCK_INIT;
+static unsigned lsd_sign_failed;
+
+static void
+lsd_account(int slot, uint64_t ticks, id self, uintptr_t first, uintptr_t last, uintptr_t result)
+{
+	static mach_timebase_info_data_t base;
+	uint64_t ns;
+
+	if (base.denom == 0) {
+		mach_timebase_info(&base);
+	}
+	ns = ticks * base.numer / base.denom;
+	__atomic_fetch_add(&lsd_count[slot], 1, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&lsd_total[slot], ns, __ATOMIC_RELAXED);
+	if (ns > lsd_max[slot]) {
+		lsd_max[slot] = ns;
+	}
+	if (slot == 0 && ns > lsd_top[4].ns) {
+		const char *name = lsd_identifier((id)first);
+
+		os_unfair_lock_lock(&lsd_lock);
+		if (ns > lsd_top[4].ns) {
+			lsd_top[4].ns = ns;
+			strlcpy(lsd_top[4].name, name, sizeof(lsd_top[4].name));
+			for (int k = 4; k > 0 && lsd_top[k].ns > lsd_top[k - 1].ns; k--) {
+				typeof(lsd_top[0]) t = lsd_top[k];
+
+				lsd_top[k] = lsd_top[k - 1];
+				lsd_top[k - 1] = t;
+			}
+		}
+		os_unfair_lock_unlock(&lsd_lock);
+	}
+	if (slot == 1 && result == 0 && lsd_sign_failed < 10) {
+		id error = last ? *(id *)last : NULL;
+
+		lsd_sign_failed++;
+		lsd_keep("lsd: signing failed: %.60s: %.100s", lsd_identifier(self), lsd_text(error));
+	}
+}
+
+#define LSD_TIMED(NAME, SLOT)                                                                                              \
+	static uintptr_t NAME(id self, SEL command, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) \
+	{                                                                                                                      \
+		uint64_t t0 = mach_absolute_time();                                                                                \
+		uintptr_t r = ((uintptr_t (*)(id, SEL, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))lsd_orig[SLOT])(self, command, a, b, c, d, e, f); \
+		lsd_account(SLOT, mach_absolute_time() - t0, self, a, f, r);                                                       \
+		return r;                                                                                                          \
+	}
+LSD_TIMED(lsd_timed0, 0)
+LSD_TIMED(lsd_timed1, 1)
+LSD_TIMED(lsd_timed2, 2)
+LSD_TIMED(lsd_timed3, 3)
+LSD_TIMED(lsd_timed4, 4)
+
+/* L8, L9: what the seed's steps cost (said once, when the seed ends) */
+static void
+lsd_costs(void)
+{
+	double t[LSD_SLOTS];
+
+	for (int k = 0; k < LSD_SLOTS; k++) {
+		t[k] = lsd_total[k] / 1e9;
+	}
+	lsd_keep("lsd: bundles %llu in %.1f s; signing %llu %.1f s max %.0f ms; data container %llu %.1f s; info.plist %llu %.1f s; personas %llu %.1f s",
+	    (unsigned long long)lsd_count[0], t[0], (unsigned long long)lsd_count[1], t[1], lsd_max[1] / 1e6, (unsigned long long)lsd_count[2], t[2],
+	    (unsigned long long)lsd_count[3], t[3], (unsigned long long)lsd_count[4], t[4]);
+	lsd_keep("lsd: slowest: %s %.0f ms, %s %.0f ms, %s %.0f ms, %s %.0f ms, %s %.0f ms", lsd_top[0].name, lsd_top[0].ns / 1e6, lsd_top[1].name,
+	    lsd_top[1].ns / 1e6, lsd_top[2].name, lsd_top[2].ns / 1e6, lsd_top[3].name, lsd_top[3].ns / 1e6, lsd_top[4].name, lsd_top[4].ns / 1e6);
+}
+
+/*
+ * lsdiag=1: where lsd waits before its seed starts (35 s to 49 s in run ft1a). Every 4 s until createAndSeed is entered,
+ * each thread of the process is stopped for a moment and its pc and frame chain written down (kept lines "lsd: wait").
+ */
+static volatile int lsd_seed_entered;
+
+static void
+lsd_where(thread_t thread, unsigned number)
+{
+	arm_thread_state64_t state;
+	mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+	char line[200];
+	size_t at = 0;
+	uintptr_t pcs[16], fp;
+	int n = 0;
+
+	if (thread_suspend(thread) != KERN_SUCCESS) {
+		return;
+	}
+	if (thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&state, &count) == KERN_SUCCESS) {
+		pcs[n++] = (uintptr_t)arm_thread_state64_get_pc(state);
+		pcs[n++] = (uintptr_t)arm_thread_state64_get_lr(state);
+		fp = (uintptr_t)arm_thread_state64_get_fp(state);
+		for (; n < 16 && fp != 0 && (fp & 7) == 0; n++) {
+			uintptr_t frame[2];
+			vm_size_t got = 0;
+
+			if (vm_read_overwrite(mach_task_self(), fp, sizeof(frame), (vm_address_t)frame, &got) != KERN_SUCCESS || got != sizeof(frame) || frame[1] == 0) {
+				break;
+			}
+			pcs[n] = frame[1];
+			fp = frame[0];
+		}
+	}
+	thread_resume(thread);
+	for (int k = 0; k < n; k++) {
+		Dl_info info;
+		char frame_text[90];
+
+		if (at == 0) {
+			at = (size_t)snprintf(line, sizeof(line), "lsd: wait: t%u@%d", number, k);
+		}
+		if (dladdr((void *)pcs[k], &info) && info.dli_fname != NULL) {
+			const char *image = strrchr(info.dli_fname, '/');
+
+			snprintf(frame_text, sizeof(frame_text), " %.22s`%.38s+%lx", image ? image + 1 : info.dli_fname, info.dli_sname ? info.dli_sname : "?",
+			    (unsigned long)(info.dli_saddr ? pcs[k] - (uintptr_t)info.dli_saddr : pcs[k] - (uintptr_t)info.dli_fbase));
+		} else {
+			snprintf(frame_text, sizeof(frame_text), " %#lx", (unsigned long)pcs[k]);
+		}
+		at += (size_t)snprintf(line + at, sizeof(line) - at, "%s", frame_text);
+		if (at > 110 || k + 1 == n) {
+			lsd_keep("%s", line);
+			at = 0;
+		}
+	}
+}
+
+static void *
+lsd_watch(__unused void *arg)
+{
+	for (int round = 0; round < 6 && !lsd_seed_entered; round++) {
+		thread_act_array_t threads;
+		mach_msg_type_number_t count = 0;
+		thread_t self = mach_thread_self();
+
+		sleep(4);
+		if (lsd_seed_entered) {
+			break;
+		}
+		if (task_threads(mach_task_self(), &threads, &count) == KERN_SUCCESS) {
+			for (mach_msg_type_number_t t = 0; t < count && t < (round ? 1u : 3u); t++) {
+				if (threads[t] != self) {
+					lsd_where(threads[t], t);
+				}
+			}
+		}
+	}
+	return NULL;
+}
+
+static IMP lsd_orig_store, lsd_orig_seed, lsd_orig_builtin, lsd_orig_complete, lsd_orig_upcall, lsd_orig_enum;
+
+static id
+lsd_store_url(id self, SEL command, uintptr_t uid)
+{
+	static bool said;
+	id url = ((id (*)(id, SEL, uintptr_t))lsd_orig_store)(self, command, uid);
+
+	if (!said && url != NULL) {
+		id path = ((id (*)(id, SEL))objc_msgSend)(url, sel_registerName("path"));
+		const char *text = path ? ((const char *(*)(id, SEL))objc_msgSend)(path, sel_registerName("UTF8String")) : NULL;
+
+		said = true;
+		strlcpy(lsd_store, text ? text : "", sizeof(lsd_store));
+		lsd_keep("lsd: store %.150s", lsd_store);
+		lsd_files("at the first query");
+	}
+	return url;
+}
+
+static uintptr_t
+lsd_create_and_seed(id self, SEL command, uint8_t *did_seed)
+{
+	double at = lsd_up();
+	uintptr_t result;
+
+	lsd_seed_entered = 1;
+	lsd_keep("lsd: createAndSeed: entered at %.2f s", at);
+	result = ((uintptr_t (*)(id, SEL, uint8_t *))lsd_orig_seed)(self, command, did_seed);
+	lsd_keep("lsd: createAndSeed: seeded %d in %.3f s (at %.2f s)", did_seed ? *did_seed : -1, lsd_up() - at, lsd_up());
+	return result;
+}
+
+static uintptr_t
+lsd_builtin(id self, SEL command, id block, id *error)
+{
+	double at = lsd_up();
+	uintptr_t result = ((uintptr_t (*)(id, SEL, id, id *))lsd_orig_builtin)(self, command, block, error);
+
+	lsd_keep("lsd: builtin enumeration: ok %d in %.2f s, error %.120s", (int)(result & 1), lsd_up() - at, error ? lsd_text(*error) : "(none)");
+	return result;
+}
+
+static uintptr_t
+lsd_set_complete(id self, SEL command, uintptr_t complete)
+{
+	uintptr_t result = ((uintptr_t (*)(id, SEL, uintptr_t))lsd_orig_complete)(self, command, complete);
+
+	lsd_keep("lsd: setSeedingComplete: %d at %.2f s", (int)(complete & 1), lsd_up());
+	lsd_costs();
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ lsd_files("5 s after"); });
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ lsd_files("30 s after"); });
+	return result;
+}
+
+/* true when no app is installed in the containers (the only case where installd has nothing to register) */
+static bool
+lsd_bundle_dir_empty(int *err)
+{
+	DIR *dir = opendir("/private/var/containers/Bundle/Application");
+	struct dirent *e;
+	bool empty = true;
+
+	if (dir == NULL) {
+		*err = errno;
+		return errno == ENOENT;
+	}
+	*err = 0;
+	while ((e = readdir(dir)) != NULL) {
+		if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0) {
+			empty = false;
+		}
+	}
+	closedir(dir);
+	return empty;
+}
+
+/* R1 (and L6): -[ICLWorkspace triggerRegistrationForContainerizedContentWithOptions:completion:] */
+static void
+lsd_upcall_hook(id self, SEL command, id options, void (^completion)(id))
+{
+	double at = lsd_up();
+	void (^wrapped)(id) = ^(id error) {
+		int err = 0;
+		bool answer = error != NULL && lsd_upcall && lsd_bundle_dir_empty(&err);
+
+		if (lsdiag) {
+			lsd_keep("lsd: containerized upcall: error %.140s after %.3f s%s", lsd_text(error), lsd_up() - at,
+			    answer ? ", answered as success" : (error && lsd_upcall ? ", NOT answered (bundle dir not empty)" : ""));
+		}
+		if (completion != NULL) {
+			completion(answer ? NULL : error);
+		}
+	};
+
+	((void (*)(id, SEL, id, id))lsd_orig_upcall)(self, command, options, (id)Block_copy(wrapped));
+}
+
+/* R3: -[MIFileManager enumerateURLsForItemsInDirectoryAtURL:ignoreSymlinks:withBlock:], /Applications only */
+static uintptr_t
+lsd_enumerate(id self, SEL command, id url, uintptr_t symlinks, BOOL (^block)(id, unsigned char))
+{
+	static unsigned dirs_said;
+	id path = url ? ((id (*)(id, SEL))objc_msgSend)(url, sel_registerName("path")) : NULL;
+	const char *text = path ? ((const char *(*)(id, SEL))objc_msgSend)(path, sel_registerName("UTF8String")) : "";
+	bool apps = strcmp(text, "/Applications") == 0 || strcmp(text, "/Applications/") == 0;
+	__block unsigned seen = 0, hidden = 0;
+	BOOL (^filter)(id, unsigned char) = ^BOOL(id item, unsigned char flag) {
+		id name = item ? ((id (*)(id, SEL))objc_msgSend)(item, sel_registerName("lastPathComponent")) : NULL;
+		const char *leaf = name ? ((const char *(*)(id, SEL))objc_msgSend)(name, sel_registerName("UTF8String")) : "";
+
+		seen++;
+		for (unsigned k = 0; k < sizeof(lsd_hidden) / sizeof(lsd_hidden[0]); k++) {
+			if (strcmp(leaf, lsd_hidden[k]) == 0) {
+				hidden++;
+				return YES;
+			}
+		}
+		return block(item, flag);
+	};
+	uintptr_t result;
+
+	if (lsdiag && dirs_said < 8) {
+		dirs_said++;
+		lsd_keep("lsd: enumerate: %.120s%s", text, apps && lsd_hide ? " (filtered)" : "");
+	}
+	if (!apps || !lsd_hide) {
+		return ((uintptr_t (*)(id, SEL, id, uintptr_t, id))lsd_orig_enum)(self, command, url, symlinks, (id)block);
+	}
+	filter = Block_copy(filter);
+	result = ((uintptr_t (*)(id, SEL, id, uintptr_t, id))lsd_orig_enum)(self, command, url, symlinks, (id)filter);
+	Block_release(filter);
+	lsd_keep("lsd: hide: %u of %u /Applications entries hidden", hidden, seen);
+	return result;
+}
+
+/* one hook: found the method (instance or class), checked its argument count, put ours in; false = classes not there yet */
+static bool
+lsd_hook(const char *class_name, bool meta, const char *selector, int arguments, IMP replacement, IMP *original)
+{
+	Class cls = objc_getClass(class_name);
+	Method method;
+
+	if (cls == NULL) {
+		return false;
+	}
+	method = meta ? class_getClassMethod(cls, sel_registerName(selector)) : class_getInstanceMethod(cls, sel_registerName(selector));
+	if (method == NULL) {
+		lsd_keep("lsd: %s %s: no such method; left alone", class_name, selector);
+		return true;
+	}
+	if ((int)method_getNumberOfArguments(method) != arguments + 2) {
+		lsd_keep("lsd: %s %s: %u arguments, not %d; left alone", class_name, selector, method_getNumberOfArguments(method) - 2, arguments);
+		return true;
+	}
+	if (lsdiag) {
+		lsd_keep("lsd: hooked %s %s %s", class_name, selector, method_getTypeEncoding(method));
+	}
+	*original = method_setImplementation(method, replacement);
+	return true;
+}
+
+static unsigned lsd_hooked;                     /* bit per hook installed (lsd_install) */
+
+static void
+lsd_install(void)
+{
+	static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+	unsigned bit = 0;
+
+	os_unfair_lock_lock(&lock);
+#define LSD_TRY(WANTED, EXPR) do { if ((WANTED) && !(lsd_hooked & (1u << bit)) && (EXPR)) lsd_hooked |= 1u << bit; bit++; } while (0)
+	LSD_TRY(lsdiag, lsd_hook("_LSDefaults", false, "databaseStoreFileURLWithUID:", 1, (IMP)lsd_store_url, &lsd_orig_store));
+	LSD_TRY(lsdiag, lsd_hook("LSDatabaseBuilder", false, "createAndSeedLocalDatabase:", 1, (IMP)lsd_create_and_seed, &lsd_orig_seed));
+	LSD_TRY(lsdiag, lsd_hook("ICLWorkspace", false, "enumerateBuiltInSystemContentWithBlock:error:", 2, (IMP)lsd_builtin, &lsd_orig_builtin));
+	LSD_TRY(lsdiag, lsd_hook("LSDatabaseBuilder", false, "setSeedingComplete:", 1, (IMP)lsd_set_complete, &lsd_orig_complete));
+	LSD_TRY(lsdiag || lsd_upcall, lsd_hook("ICLWorkspace", false, "triggerRegistrationForContainerizedContentWithOptions:completion:", 2,
+	    (IMP)lsd_upcall_hook, &lsd_orig_upcall));
+	LSD_TRY(lsd_hide || lsdiag, lsd_hook("MIFileManager", false, "enumerateURLsForItemsInDirectoryAtURL:ignoreSymlinks:withBlock:", 3,
+	    (IMP)lsd_enumerate, &lsd_orig_enum));
+	LSD_TRY(lsdiag, lsd_hook("MILaunchServicesDatabaseGatherer", true, "entryForBundle:inContainer:withError:", 3, (IMP)lsd_timed0, &lsd_orig[0]));
+	LSD_TRY(lsdiag, lsd_hook("MIExecutableBundle", false,
+	    "codeSigningInfoByValidatingResources:performingOnlineAuthorization:ignoringCachedSigningInfo:checkingTrustCacheIfApplicable:skippingProfileIDValidation:error:",
+	    6, (IMP)lsd_timed1, &lsd_orig[1]));
+	LSD_TRY(lsdiag, lsd_hook("MIExecutableBundle", false, "dataContainerCreatingIfNeeded:makeLive:created:error:", 4, (IMP)lsd_timed2, &lsd_orig[2]));
+	LSD_TRY(lsdiag, lsd_hook("MIBundle", false, "infoPlistSubset", 0, (IMP)lsd_timed3, &lsd_orig[3]));
+	LSD_TRY(lsdiag, lsd_hook("UMXPCServer", false, "fetchListOfPersonasSynchronousWithError:", 1, (IMP)lsd_timed4, &lsd_orig[4]));
+#undef LSD_TRY
+	os_unfair_lock_unlock(&lock);
+}
+
+static void
+lsd_image_added(const struct mach_header *header, intptr_t image_slide)
+{
+	(void)header;
+	(void)image_slide;
+	lsd_install();
+}
+
+static void
+lsd_hooks(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	const char *at;
+
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+		lsdiag = strstr(arguments, "lsdiag=1") != NULL;
+		if ((at = strstr(arguments, "lsd_upcall=")) != NULL) {
+			lsd_upcall = at[11] != '0';
+		}
+		if ((at = strstr(arguments, "lsd_hide=")) != NULL) {
+			lsd_hide = at[9] != '0';
+		}
+	}
+	if (!lsdiag && !lsd_upcall && !lsd_hide) {
+		return;
+	}
+	lsd_install();
+	_dyld_register_func_for_add_image(lsd_image_added);        /* (classes of images mapped later) */
+	if (lsdiag) {
+		pthread_t thread;
+
+		if (pthread_create(&thread, NULL, lsd_watch, NULL) == 0) {
+			pthread_detach(thread);
+		}
+	}
+	lsd_keep("lsd: start pid %d at %.2f s, diag %d upcall %d hide %d, hooks %#x", getpid(), lsd_up(), lsdiag, lsd_upcall, lsd_hide, lsd_hooked);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 
 /*
@@ -3846,6 +4354,8 @@ redwood_init(void)
 		orientation_start();
 	} else if (strncmp(name, "containermanagerd", 17) == 0) {
 		container_manager_fixes();
+	} else if (strcmp(name, "lsd") == 0) {
+		lsd_hooks();
 	} else if (strcmp(name, "bluetoothd") == 0) {
 		char line[80];
 
