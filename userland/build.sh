@@ -13,7 +13,10 @@
 #                      JOBS="..."   labels of the stock iOS launchd jobs to load (default: IOS_JOBS)
 #                      REST=1       ... and the rest of them, started only when asked for (see mkjobs.py)
 #                      WIFID=1      ... and wifid, iOS's Wi-Fi daemon (see below at IOS_JOBS)
-#                      WIDGETS=0    ... without chronod, the widgets' daemon (default: in, see IOS_JOBS)
+#                      WIDGETS=1    ... with chronod, the widgets' daemon (opt-in; out by default, because the two live
+#                                   widget tiles cut home-screen swipe speed from about 21 to about 11-13 swaps per
+#                                   second, docs/STATUS.md; then only the Weather and Calendar widget extensions
+#                                   register, lsd_widgets=0 lifts that; see IOS_JOBS)
 #                      OSLOG="..."  labels of the jobs whose os_log output goes to the console ("all": every
 #                                   one of JOBS; default: only the window server, which says little)
 #                      INJECT="..." the programs started with a library of ours, "LIBRARY NAME..." per line
@@ -115,12 +118,14 @@ IOS_JOBS=${JOBS-"
 "}
 # (not com.apple.analyticsd: it dies 0.2 s after every start and launchd starts it again every 10 s, for ever
 # -- persist3.log; with no server CoreAnalytics' events are dropped. MORE_JOBS=com.apple.analyticsd for it.)
-# chronod too (default; WIDGETS=0 leaves it out), and with it the home screen's two widgets: without it SpringBoard's
-# lookup of com.apple.chronoservices fails and the Weather and Calendar tiles stay white (docs/widgets-spec.md).
+# chronod is OUT by default (opt-in with WIDGETS=1) because the two live widget tiles cut home-screen swipe speed
+# from about 21 to about 11-13 swaps per second (docs/STATUS.md). With WIDGETS=1 chronod is in, and with it the home
+# screen's two widgets: without it SpringBoard's lookup of com.apple.chronoservices fails and the Weather and
+# Calendar tiles stay white (docs/widgets-spec.md).
 # On a fresh /var chronod starts every widget extension at once (two dozen, each drawing with the processor,
 # src/redwoodmetal.m: all four cores busy for minutes, run g1), so lsd hides all but those two (src/inject.c,
 # lsd_widgets=0 turns that off). The job is on demand.
-[ "$WIDGETS" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.chronod"
+[ "$WIDGETS" = 1 ] && IOS_JOBS="$IOS_JOBS com.apple.chronod"
 # (com.apple.mediaremoted: without it SpringBoard's MediaRemote spins in its XPC handler -- two of the four
 # cores on an idle home screen once mediaserverd runs, and the widgets with it; run 328-329, 400% -> 14%)
 # WIFID=1: iOS's own Wi-Fi daemon as well, for Settings to have a Wi-Fi to show: the kernel answers it in
