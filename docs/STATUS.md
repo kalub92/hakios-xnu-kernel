@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-18 18:13 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-18 18:26 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -40,19 +40,19 @@ Last updated: 2026-11-18 18:13 PST. Kept current as work lands; details are in t
 
 ## Open problems
 
-- A shutter tap about 20 s after Camera launches is lost (the app is still opening the photo library, which takes about 8 s); taps from 35 s on work and photos save. Not caused by the encoder, microphone or stabilization fix
-- Camera closed about 5 s after launch in two earlier video test runs; not reproduced in five later runs, cause unknown
+- First Camera launch after a boot: about 5 s to the first picture, and a shutter tap landing within about 0.2 s of that first frame is lost (`camera-launch-spec.md`); the capture session also starts, stops and restarts once on most launches (cause unknown, costs about 1.2 s)
+- Camera showed nothing in two test runs because it was launched while the device was locked with the screen off (a test-scenario fault, confirmed from the log for one run, inferred for the other); a run to confirm how the app behaves then is queued
 - Apple's two built-in software video encoders do not produce frames here; an app that records through AVAssetWriter needs our encoder registered in its own process (not done)
 - Cellular alongside Wi-Fi (Wi-Fi should win) is untested: unattended runs have no Wi-Fi
 - All audio went silent after a speaker was paired (likely the route moved to a Bluetooth output that could not carry sound; not confirmed)
 - Safari audio spins and never plays; a Safari file download would not start (untested unattended: no Wi-Fi in those runs)
-- Camera frames sometimes painted twice after a home swipe (parked)
+- After a home swipe the system renders 2 to 3 frames per camera picture (wasted work, not a visible fault); Open Mapple's presentation method would not fix it
 - Side-button exit and radio-on shutdown of the modem service not yet exercised
 
 ## Not yet done
 
 - Everyday cellular in a normal image: radio-on service (`r1_md=11`, never run), status bar, airplane toggle (stages 4e/4f; needs the remaining decisions in `cellular-stage4.md`)
-- Bluetooth on the saved data store (needs the keybag permanently, and a backup first)
+- Bluetooth on the saved data store: a route that is not one-way is specified (`kernel-keystore-spec.md`) and its first unattended run is in progress; a backup of the data partition comes before any session on saved data
 - Phone calls and SMS (not built; current safety rules forbid dialling and SMS)
 - Bluetooth call audio (HFP)
 - USB while in iOS
