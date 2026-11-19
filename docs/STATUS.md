@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-19 03:46 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-19 04:52 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -54,7 +54,7 @@ Last updated: 2026-11-19 03:46 PST. Kept current as work lands; details are in t
 - Side-button exit and radio-on shutdown of the modem service not yet exercised
 
 
-- Home icons are requested at 3x scale while the screen is 1x, so they are drawn large and shrunk 3:1. The Calendar icon's date was lost that way and is now drawn at the screen's scale (`calfix=0` turns that off); where the 3x comes from is not found, and other icons still use it
+- Home icons: SpringBoardHome's screen type 4 hard-codes 56x56@3, whatever UIScreen says. A hook on `-[SBIconListGridLayoutConfiguration iconImageInfoForGridSizeClass:]` now returns UIScreen's scale (`sb_iconscale=0` turns it off; line `redwood: icon scale: 141x141@3 -> @N`), so the icons are made at the shown scale (verified at fbscale=1 and 2, sc1-sc5). `calfix` is now redundant (asked == screen) and kept. fbscale=2 vs 1 over the same 18 swipes: 6-7 vs 10-11 swaps/s, GL 9.3-10.4 vs 6.1 ms a frame, kernel 2.4 vs 1.7 ms: 2x misses the spec's thresholds; the default stays fbscale=1 (see HANDOFF-2026-11-17-night.md, Screen scale).
 
 ## Not yet done
 

@@ -1006,6 +1006,84 @@ typedef struct { double width, height; } size_2d;
 
 static id (*original_make_layout)(id self, SEL selector, id location);
 
+/*
+ * Home icons at the screen's scale (docs/screen-scale-spec.md, C2). SpringBoardHome's screen type table has no entry for a 375x500 pt phone
+ * and falls to type 4, whose icon image info is 56x56@3, whatever UIScreen and MobileGestalt say. -[SBIconListGridLayoutConfiguration
+ * iconImageInfoForGridSizeClass:] returns that {w, h, scale, radius}; the scale is replaced by UIScreen's, so icons are made at the pixels
+ * they are shown at. Boot-arg sb_iconscale=0: off. scalechk=1: one summary line of the scales, with the icon lists.
+ */
+typedef struct { double w, h, scale, radius; } icon_info;
+static icon_info (*original_icon_info)(id self, SEL selector, id grid_class);
+
+static int
+bootarg_on(const char *word)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	const char *at;
+
+	return sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, word)) != NULL && (at == args || at[-1] == ' ');
+}
+
+static icon_info
+icon_info_for_class(id self, SEL selector, id grid_class)
+{
+	icon_info info = original_icon_info(self, selector, grid_class);
+	id screen = SEND(id, objc_getClass("UIScreen"), "mainScreen");
+	double have = screen ? SEND(double, screen, "scale") : 0.0;
+	static int said;
+
+	if (have >= 1.0 && info.scale != have) {
+		if (!said++) {
+			keep_line("redwood: icon scale: %gx%g@%g -> @%g (UIScreen %g)", info.w, info.h, info.scale, have, have);
+		}
+		info.scale = have;
+	}
+	return info;
+}
+
+/* scalechk=1: what each layer of the stack says the scale is (MobileGestalt as the home screen's own code reads it) */
+static void
+say_scale(id list_view)
+{
+	static int said;
+	id screen = SEND(id, objc_getClass("UIScreen"), "mainScreen");
+	CFTypeRef (*mg)(CFStringRef) = dlsym(RTLD_DEFAULT, "MGCopyAnswer");
+	Class provider = objc_getClass("SBHDefaultIconListLayoutProvider");
+	id layout = SEND(id, list_view, "layout");
+	const char *keys[2] = { "main-screen-scale", "ArtworkDeviceScaleFactor" };
+	char answer[2][64] = { "?", "?" };
+	icon_info info = { 0 };
+
+	if (said++) {
+		return;
+	}
+	for (int i = 0; i < 2 && mg != NULL; i++) {
+		CFStringRef key = CFStringCreateWithCString(NULL, keys[i], kCFStringEncodingUTF8);
+		CFTypeRef value = mg(key);
+		CFStringRef text = value ? CFCopyDescription(value) : NULL;
+		char line[256] = "";
+		const char *v;
+
+		if (text != NULL) {
+			CFStringGetCString(text, line, sizeof(line), kCFStringEncodingUTF8);
+			CFRelease(text);
+			v = strstr(line, "value = ");
+			snprintf(answer[i], sizeof(answer[i]), "%.12s", v ? v + 8 : line);
+			if (strchr(answer[i], ',') != NULL) {
+				*strchr(answer[i], ',') = 0;
+			}
+		}
+		CFRelease(key);
+	}
+	if (layout != NULL && class_respondsToSelector(object_getClass(layout), sel_registerName("iconImageInfo"))) {
+		info = ((icon_info (*)(id, SEL))objc_msgSend)(layout, sel_registerName("iconImageInfo"));
+	}
+	keep_line("redwood: scale: UIScreen %g native %g, MG main-screen-scale %s ArtworkDeviceScaleFactor %s, screen type %ld, icon %gx%g@%g",
+	    screen ? SEND(double, screen, "scale") : 0.0, screen ? SEND(double, screen, "nativeScale") : 0.0, answer[0], answer[1],
+	    provider ? SEND(long, (id)provider, "currentDeviceScreenType") : -1L, info.w, info.h, info.scale);
+}
+
 /* what the icon lists on screen ended up as: rows x columns, insets, and where their first icons are (once, 40 s after the layout) */
 static void
 say_icon_lists_in(id view)
@@ -1020,6 +1098,9 @@ say_icon_lists_in(id view)
 
 		for (long i = 0; i < n && i < 6; i++) {
 			icon[i] = SEND(typeof(frame), SEND1(id, subviews, "objectAtIndex:", long, i), "frame");
+		}
+		if (bootarg_on("scalechk=1")) {
+			say_scale(view);
 		}
 		keep_line("redwood: icon list %s %gx%g: %ldx%ld, insets %g,%g,%g,%g; %ld icons at y %g,%g,%g,%g,%g,%g (%gx%g)",
 		    object_getClassName(view), frame.w, frame.h, SEND(long, view, "iconRowsForCurrentOrientation"),
@@ -2465,6 +2546,10 @@ redwood_springboard_init(void)
 	    0x1c507e0fcUL, (IMP)poster_switcher_allowed);
 	original_switcher_wallpaper_overlay = (void (*)(id, SEL))replace_method("SBAppSwitcherPageView",
 	    "_createOrDestroyWallpaperOverlayView", 0x1c4af7860UL, (IMP)switcher_wallpaper_overlay);
+	if (!bootarg_on("sb_iconscale=0")) {
+		original_icon_info = (icon_info (*)(id, SEL, id))replace_method("SBIconListGridLayoutConfiguration",
+		    "iconImageInfoForGridSizeClass:", 0x1c451e558UL, (IMP)icon_info_for_class);
+	}
 	original_make_layout = (id (*)(id, SEL, id))replace_method("SBHDefaultIconListLayoutProvider", "makeLayoutForIconLocation:",
 	    0x1c4539588UL, (IMP)make_layout);
 	/*

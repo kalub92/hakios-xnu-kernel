@@ -1,0 +1,13 @@
+# Screen-scale check (docs/screen-scale-spec.md section 5). scalechk=1 FIRST in the boot-args. Silent: no camera, no shutter, no sound.
+/redwood/bin/rwtouch ifarg scalechk=1 say sstart wait 73 say s_icons
+/redwood/bin/tolog /redwood/bin/psgrep -sample 2 10 iconservicesagent &
+/redwood/bin/rwtouch ifarg scalechk=1 wait 22 say s_widgets
+/redwood/bin/tolog /redwood/bin/psgrep -sample 3 20 CalendarWidgetExtension &
+/redwood/bin/rwtouch ifarg scalechk=1 wait 15 say s_chrono
+/redwood/bin/tolog /redwood/bin/psgrep -sample 1 16 chronod &
+/redwood/bin/tolog /redwood/bin/mg_test main-screen-scale main-screen-width main-screen-height ArtworkDeviceScaleFactor ArtworkDeviceSubType DeviceClass ProductType
+/redwood/bin/rwtouch ifarg scalechk=1 wait 38 tap 0.5 0.06 wait 1 notify com.redwood.unlock wait 5 say s_swipes
+/redwood/bin/rwtouch ifarg scalechk=1 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35
+/redwood/bin/rwtouch ifarg scalechk=1 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35
+/redwood/bin/rwtouch ifarg scalechk=1 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 swipe 0.85 0.45 0.15 0.45 250 wait 0.35 swipe 0.15 0.45 0.85 0.45 250 wait 0.35 say s_swipes_end
+/redwood/bin/rwtouch ifarg scalechk=1 wait 8 notify com.redwood.wpoke say s_poke wait 10 say end
