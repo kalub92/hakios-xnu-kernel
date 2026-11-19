@@ -1,6 +1,6 @@
 # Rabbit r1 iOS 16 port: status
 
-Last updated: 2026-11-18 19:36 PST. Kept current as work lands; details are in the other files under `docs/`.
+Last updated: 2026-11-18 20:00 PST. Kept current as work lands; details are in the other files under `docs/`.
 
 "Hands-on" means confirmed by a person using the device. "Unattended" means it passed an automated run but nobody has seen it yet.
 
@@ -58,6 +58,8 @@ Last updated: 2026-11-18 19:36 PST. Kept current as work lands; details are in t
 - Bluetooth call audio (HFP)
 - USB while in iOS
 - Sleep / low-power idle
+
+- More memory for iOS (about 2.0 GB today; 2.8 GB specified in `ram-holes-spec.md`, off by default): not built. Memory is not short today (worst free figure seen is about 970 MB)
 
 ## Dropped or nothing to gain
 
